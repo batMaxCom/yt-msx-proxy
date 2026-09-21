@@ -43,6 +43,7 @@ cannot help you if you're hiding part of your screen.
 
 - Be damn well sure you read through this ENTIRE readme, I'll close your issue if you're
 asking for help and I know for a fact you missed something here!
+- 
 
 ## Setup
 

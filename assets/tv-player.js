@@ -8802,20 +8802,35 @@
             this.b.webkitSourceSetDuration && this.b.webkitSourceSetDuration(a)
         };
         
+        function __ytclientlog(ev, extra) {
+            try {
+                var ve = document.querySelector(".html5-main-video");
+                var payload = { ev: ev, t: Math.round(typeof performance !== "undefined" ? performance.now() : Date.now()), ct: ve ? ve.currentTime : -1 };
+                if (extra) {
+                    for (var k in extra) payload[k] = extra[k];
+                }
+                var x = new XMLHttpRequest();
+                x.open("POST", "/api/client-log", true);
+                x.setRequestHeader("Content-Type", "application/json");
+                x.send(JSON.stringify(payload));
+            } catch (e) {}
+        }
+
         function Nr(a, b, c, d, e, mediaLinks) {
             console.log("Nr constructor called with parameters:", a, b, c, d, e, mediaLinks);
             console.log("mediaLinks parameters:", mediaLinks);
             Cm.call(this);
             console.log("Cm constructor called");
-          
+
             this.g = this.b = null;
             this.B = b;
-          
+
             if (!window.MediaSource) {
               console.error("MediaSource API is not supported.");
               return;
             }
-          
+            try { __ytclientlog("NrConstruct", {}); } catch (err) {}
+
             console.log("Using MediaSource API");
             this.o = new MediaSource();
             console.log("Created MediaSource object:", this.o);
@@ -8829,8 +8844,17 @@
             console.log("Assigned MediaSource to video element:", videoElement.src);
           
             this.o.addEventListener("sourceopen", function () {
-              console.log("MediaSource opened");
               var mediaSource = this;
+              if (mediaSource.__ytStreamsActive) {
+                console.warn("MediaSource re-opened; keeping existing streams (dedup).");
+                try {
+                  if (!videoElement.paused) videoElement.play().catch(function () {});
+                } catch (err) {}
+                return;
+              }
+              mediaSource.__ytStreamsActive = true;
+              try { __ytclientlog("sourceopen", { attempt: 1 }); } catch (errE) {}
+              console.log("MediaSource opened");
               if (!mediaSource || mediaSource.readyState !== "open") {
                 console.error("MediaSource is not in the open state");
                 return;
@@ -8844,6 +8868,17 @@
               var videoSourceBuffer = mediaSource.addSourceBuffer(videoData.mimeType);
               var audioSourceBuffer = mediaSource.addSourceBuffer(audioData.mimeType);
               console.log("Created SourceBuffers:", videoData, audioData);
+          
+              if (!videoElement.__ytEventsSubscribed) {
+                videoElement.__ytEventsSubscribed = true;
+                ["loadstart", "emptied", "abort", "pause", "play", "playing", "seeking", "seeked", "ended", "error", "waiting", "canplay", "durationchange"].forEach(function (evName) {
+                  try {
+                    videoElement.addEventListener(evName, function () {
+                      try { __ytclientlog(evName, {}); } catch (errX) {}
+                    });
+                  } catch (errY) {}
+                });
+              }
           
               fetchSegment(videoData.url, videoSourceBuffer, videoElement, 'video');
               fetchSegment(audioData.url, audioSourceBuffer, videoElement, 'audio');
@@ -8861,6 +8896,7 @@
                 var removalMargin = 30;  // seconds to keep behind currentTime
                 var isLoading = false;
                 var pendingAppends = [];
+                var seekAlignUrl = null;
           
                 function loadSegment(retryCount) {
                   // Ensure MediaSource is still open.
@@ -8933,7 +8969,11 @@
           
                   isLoading = true;
                   var xhr = new XMLHttpRequest();
-                  xhr.open('GET', url, true);
+                  var reqUrl = url;
+                  if (seekAlignUrl) {
+                    reqUrl = seekAlignUrl;
+                  }
+                  xhr.open('GET', reqUrl, true);
                   xhr.setRequestHeader('Range', `bytes=${rangeStart}-${rangeEnd}`);
                   xhr.responseType = 'arraybuffer';
           
@@ -8989,6 +9029,7 @@
                       }
                     }
                     sourceBuffer.appendBuffer(data);
+                    seekAlignUrl = null;
                     console.log(`Segment appended: ${rangeStart}-${rangeEnd}`);
                     rangeStart = rangeEnd + 1;
                     rangeEnd = rangeStart + chunkSize;
@@ -9016,13 +9057,15 @@
                   }
                 });
           
-                // Video-specific event handling.
-                if (type === 'video' && videoElement) {
+                // Seek handling applies to both audio and video buffers so that
+                // both tracks jump to the same position after a seek.
+                if (videoElement) {
 
                 videoElement.addEventListener('seeking', () => {
-                    console.log("User seeking detected");
+                    console.log("User seeking detected (" + type + ")");
                     isSeeking = true;
                     pendingAppends = [];
+                    seekAlignUrl = url + '&seek=1';
                 
                     var seekTime = videoElement.currentTime;
                     var videoDuration = videoElement.duration || 0;
@@ -9032,7 +9075,7 @@
                     rangeStart = Math.floor((seekTime / videoDuration) * totalSize);
                     rangeStart = Math.floor(rangeStart / chunkSize) * chunkSize;
                     rangeEnd = rangeStart + chunkSize;
-                    console.log(`Seeking to time ${seekTime}s, starting data fetch from byte ${rangeStart}`);
+                    console.log(`[${type}] Seeking to time ${seekTime}s, starting data fetch from byte ${rangeStart}`);
                     }
                 
                     // Clear buffer around the seek time to avoid conflicts.
@@ -9040,12 +9083,12 @@
                     try {
                         var clearStart = Math.max(0, seekTime - 10);
                         var clearEnd = Math.min(seekTime + 30, videoDuration);
-                        console.log(`Clearing buffer from ${clearStart} to ${clearEnd} due to seek.`);
+                        console.log(`[${type}] Clearing buffer from ${clearStart} to ${clearEnd} due to seek.`);
                         sourceBuffer.remove(clearStart, clearEnd);
                 
                         // Wait for removal to complete before loading new segment.
                         sourceBuffer.addEventListener('updateend', function onSeekBufferClear() {
-                        console.log("Buffer cleared for seeking.");
+                        console.log(`[${type}] Buffer cleared for seeking.`);
                         sourceBuffer.removeEventListener('updateend', onSeekBufferClear);
                         isSeeking = false;
                         loadSegment(5); // Start loading from new position.
@@ -9062,6 +9105,8 @@
                     }
                 });
 
+                if (type === 'video') {
+
                   setInterval(() => {
                     if (sourceBuffer.buffered.length > 0) {
                       var currentTime = videoElement.currentTime;
@@ -9074,6 +9119,7 @@
                       }
                     }
                   }, 1000);
+                }
                 }
                 loadSegment(5);
               }
@@ -9106,7 +9152,7 @@
                   return parseInt(b.resolution.split('x')[1]) - parseInt(a.resolution.split('x')[1]);
                 });
                 console.log('Best video URL found:', sortedVideoLinks[0].url);
-                var proxyVideoUrl = PROXY_URL + '/' + sortedVideoLinks[0].url;
+                var proxyVideoUrl = sortedVideoLinks[0].url;
                 console.log('Proxy Video URL:', proxyVideoUrl);
                 return {
                   url: proxyVideoUrl,
@@ -9138,7 +9184,7 @@
                   return null;
                 }
                 console.log('Audio URL found:', audioLink.url);
-                var proxyAudioUrl = PROXY_URL + '/' + audioLink.url;
+                var proxyAudioUrl = audioLink.url;
                 console.log('Proxy Audio URL:', proxyAudioUrl);
                 var result = {
                   url: proxyAudioUrl,
@@ -15511,14 +15557,11 @@
             this.o = this.A = false;
             this.b = new XMLHttpRequest();
 
-            // Prepend the CORS Anywhere proxy URL to the requested URL
-            var proxyUrl = PROXY_URL + '/';
-
-            // Decode the URL if it's already encoded (to prevent double encoding)
+            // Video streams are served by our own backend; use the URL directly
             var decodedUrl = decodeURIComponent(a);  // Decode the URL to avoid double encoding
 
-            // Add the decoded URL to the proxy URL (without encoding the entire URL)
-            var proxiedUrl = proxyUrl + decodedUrl;  // Use the decoded URL as-is
+            // Use the decoded URL as-is
+            var proxiedUrl = decodedUrl;
 
             console.log("Decoded URL:", decodedUrl);  // Debug log to ensure it's correct
             console.log("Proxied URL:", proxiedUrl);  // Debug log to ensure it's correct
@@ -15688,14 +15731,14 @@
                     console.log("Matching URL - e.g:", e.g);
 
                     if (e.g.match("\\.googlevideo\\.com$")) {
-                        // Redirect to the proxy server for googlevideo.com
+                        // Streams are proxied by our own backend
                         ch(e, "redirector.googlevideo.com");
-                        d = PROXY_URL + '/' + e.toString();  // Add proxy URL here
+                        d = e.toString();
                         console.log("Redirecting to googlevideo proxy:", d);
                     } else if (e.g.match("r[1-9].*\\.c\\.youtube\\.com$")) {
-                        // Redirect to the proxy server for youtube.com
+                        // Streams are proxied by our own backend
                         ch(e, "www.youtube.com");
-                        d = APROXY_URL + '/' + e.toString();  // Add proxy URL here
+                        d = e.toString();
                         console.log("Redirecting to youtube proxy:", d);
                     } else {
                         d = ml(d);  // Use the original method for other URLs
@@ -42375,7 +42418,7 @@
                 mime: "",
                 dash: "no",
                 dropped_frames: e,
-                stream_host: PROXY_URL,
+                stream_host: APP_URL,
                 stream_type: jb || d.Y,
                 dimensions: c.clientWidth + " x " + c.clientHeight + (1 < F ? " * " + F : ""),
                 resolution: c.videoWidth + " x " + c.videoHeight,

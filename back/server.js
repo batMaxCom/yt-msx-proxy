@@ -6,11 +6,13 @@ const cors = require('cors');
 const QRCode = require('qrcode');
 const corsAnywhere = require('cors-anywhere');
 
+const logger = require('./logger');
+
 const { fetchGuideData } = require('./guide_api');
 
 const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
-const { handleGetVideoInfo } = require('./get_video_info');
+const { handleGetVideoInfo, handleStreamRequest } = require('./get_video_info');
 
 // may or may not be used I am just keeping it
 const { fetchLoungeTokenBatch } = require('./lounge_api');
@@ -19,6 +21,7 @@ const bodyParser = require('body-parser');
 const oauthRouter = require('./oauth_api_v3_api.js');
 
 const watchPageInteractions = require('./watch_page_interactions_apis');
+const { registerMsxRoutes, isMsxPath } = require('./msx');
 
 
 const settingsPath = path.join(__dirname, 'settings.json');
@@ -93,7 +96,27 @@ server.listen(8070, serverIp, () => {
 
 
 app.use((req, res, next) => {
-    console.log(`Received ${req.method} request for ${req.originalUrl}`);
+    const started = Date.now();
+    const msx = isMsxPath(req.path);
+    const queryPreview = { ...req.query };
+    for (const key of ['video_id']) {
+        if (queryPreview[key]) queryPreview[key] = String(queryPreview[key]).slice(0, 40);
+    }
+
+    res.on('finish', () => {
+        const durationMs = Date.now() - started;
+        logger.http(req, res, res.statusCode, durationMs, {
+            msx,
+            content_type: res.getHeader('content-type') || '',
+            query: queryPreview,
+            range: req.headers.range || '',
+            seek_align: req.query.seek === '1',
+        });
+        const seekFlag = req.query.seek === '1' ? ' seek=1' : '';
+        const rangeHint = req.headers.range ? ` ${req.headers.range}` : '';
+        const crHint = res.getHeader('content-range') ? ` => ${res.getHeader('content-range')}` : '';
+        console.log(`[${msx ? 'MSX' : 'REQ'}] ${req.method} ${req.path} ${res.statusCode} (${durationMs}ms)${rangeHint}${crHint}${seekFlag}`);
+    });
     next();
 });
 
@@ -103,15 +126,53 @@ if (!fs.existsSync(logsDir)) {
 }
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 
 app.use('/assets', express.static(path.join(__dirname, '../assets')));
 
 app.use('/logs', express.static(path.join(__dirname, '../logs')));
 
+app.post(['/error_204', '/api/stats/atr', '/csi_204'], express.raw({ type: () => true, limit: '2mb' }), (req, res) => {
+    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+    let pretty = '';
+    try {
+        const parsed = JSON.parse(raw);
+        pretty = JSON.stringify(parsed).slice(0, 4000);
+    } catch (e) {
+        pretty = raw.slice(0, 4000);
+    }
+    const entry = { t: Date.now(), path: req.path, bodyLen: raw.length, body: pretty || '(empty)' };
+    try {
+        logger.error({ category: 'echotest', message: 'client telemetry captured: ' + req.path, meta: entry });
+    } catch (e) { /* noop */ }
+    console.log(`[CLIENT-TELEMETRY] ${req.path} len=${raw.length} ${pretty.slice(0, 300)}`);
+    res.status(204).end();
+});
+
+app.post('/api/client-log', express.raw({ type: () => true, limit: '256kb' }), (req, res) => {
+    const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+    let ev = 'raw', ct = -1, payload = raw;
+    try {
+        const parsed = JSON.parse(raw);
+        ev = parsed.ev || 'parsed';
+        ct = parsed.ct !== undefined ? parsed.ct : -1;
+        payload = JSON.stringify(parsed).slice(0, 1200);
+        try { logger.info('client', `beacon ${ev}`, parsed); } catch (eL) {}
+    } catch (e) {}
+    console.log(`[CLIENT] ${ev} ct=${ct} ${String(payload).slice(0, 220)}`);
+    res.status(204).end();
+});
+
+// Media Station X entry points (must be JSON, not HTML)
+registerMsxRoutes(app, { serverIp, port });
 
 app.get('/', (req, res) => {
     console.log('Received request for the root endpoint');
+    res.sendFile(path.join(__dirname, '../index.html'));
+});
+
+app.get('/index.html', (req, res) => {
     res.sendFile(path.join(__dirname, '../index.html'));
 });
 
@@ -178,34 +239,55 @@ app.get('/assets/:filename', (req, res) => {
     });
 });
 
-app.get('/gen_204', async (req, res) => {
-    try {
-        const youtubeUrl = 'https://www.youtube-nocookie.com/gen_204?app_anon_id=a8d9033a-9d84-4178-a37f-8bf49003bc66&firstactive=1456804800&prevactive=1456804800&firstactivegeo=US&loginstate=0&firstlogin=0&prevlogin=0&c=TVHTML5&cver=5.20150715&ctheme=CLASSIC&label=c96c1c11';
-
-        const response = await axios.get(youtubeUrl);
-
-        res.status(response.status).send(response.data);
-    } catch (error) {
-        console.error('Error forwarding request to YouTube:', error);
-        res.status(200).json({ status: 'Failed to fetch data from YouTube' });
-    }
+// Telemetry beacons from the 2016 TV client. They intentionally target APP_URL
+// (this backend). Forwarding them to youtube-nocookie.com is wrong: those
+// legacy paths are gone and produce 404 noise. Acknowledge locally instead.
+app.get('/gen_204', (req, res) => {
+    console.log('[TELEMETRY] /gen_204 acknowledged locally (not forwarded)');
+    res.status(204).end();
 });
 
 app.get(/^\/{0,2}get_video_info$/, (req, res) => {
     handleGetVideoInfo(req, res);
 });
 
-app.get('/device_204', async (req, res) => {
+app.get('/api/stream/:stream_id', handleStreamRequest);
+
+app.get('/api/logs', (req, res) => {
+    const opts = {
+        level: req.query.level,
+        category: req.query.category,
+        grep: req.query.search,
+        since: req.query.since,
+    };
+    const tail = parseInt(req.query.tail, 10);
+    if (!isNaN(tail) && tail > 0) opts.tail = tail;
+
     try {
-        const youtubeUrl = 'https://www.youtube-nocookie.com/device_204?app_anon_id=a8d9033a-9d84-4178-a37f-8bf49003bc66&firstactive=1456804800&prevactive=1456804800&firstactivegeo=US&loginstate=0&firstlogin=0&prevlogin=0&c=TVHTML5&cver=5.20150715&ctheme=CLASSIC&label=c96c1c11';
-
-        const response = await axios.get(youtubeUrl);
-
-        res.status(response.status).send(response.data);
-    } catch (error) {
-        console.error('Error forwarding request to YouTube:', error);
-        res.status(200).json({ status: 'Failed to fetch data from YouTube' });
+        const entries = logger.readEntries(opts);
+        res.json({ count: entries.length, entries });
+    } catch (err) {
+        logger.error('system', 'Failed to read log entries', { message: err.message });
+        res.status(500).json({ error: 'Failed to read log entries', details: err.message });
     }
+});
+
+app.get('/api/logs/errors', (req, res) => {
+    const top = parseInt(req.query.top, 10);
+    try {
+        const summary = logger.errorSummary({ top: isNaN(top) ? 20 : top });
+        res.json({ count: summary.length, buckets: summary });
+    } catch (err) {
+        logger.error('system', 'Failed to build error summary', { message: err.message });
+        res.status(500).json({ error: 'Failed to build error summary', details: err.message });
+    }
+});
+
+app.get('/device_204', (req, res) => {
+    // Frontend sets eh.f = APP_URL + "/device_204" in app-prod.js — this is
+    // supposed to hit our backend, not YouTube. Do not proxy upstream.
+    console.log('[TELEMETRY] /device_204 acknowledged locally (not forwarded)');
+    res.status(204).end();
 });
 
 
@@ -218,6 +300,11 @@ app.get('/api/stats/qoe', (req, res) => {
     if (!event || !fmt || !afmt || !cpn || !ei || !docid || !ns) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
+
+    logger.info('qoe', `QoE ${event} video=${docid} fmt=${fmt}/${afmt}`, {
+        event, fmt, afmt, cpn, ei, el, docid, ns, fexp, c, cver, cplayer, cbrand, cbr, cbrver,
+        ctheme, cmodel, cnetwork, cos, cosver, cplatform, vps, cmt, afs, vfs,
+    });
 
     const logEntry = `
     Event: ${event}, Format: ${fmt}, Audio Format: ${afmt}, CPN: ${cpn}, EI: ${ei}, EL: ${el}, DocID: ${docid}, 
@@ -543,6 +630,22 @@ app.post('/api/next', async (req, res) => {
 
 
 app.post('/api/search', handleSearchRequest);
+
+
+process.on('unhandledRejection', (reason) => {
+    logger.error('process', 'Unhandled promise rejection', {
+        message: reason && reason.message ? String(reason.message) : String(reason),
+        stack: reason && reason.stack ? String(reason.stack).slice(0, 800) : undefined,
+    });
+});
+
+process.on('uncaughtException', (err) => {
+    logger.error('process', 'Uncaught exception', {
+        message: err && err.message ? String(err.message) : String(err),
+        stack: err && err.stack ? String(err.stack).slice(0, 800) : undefined,
+    });
+    process.exit(1);
+});
 
 
 app.listen(port, serverIp, () => {

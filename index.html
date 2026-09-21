@@ -93,6 +93,52 @@
 
     </div>
     <script>
+        // Return to Media Station X when launched via link:?msx=1
+        // Spec: Tips & Tricks → External HTML5 Games/Apps (exitToRootApp)
+        (function () {
+            function exitToRootApp() {
+                window.history.go(1 - window.history.length);
+            }
+            window.exitToRootApp = exitToRootApp;
+
+            var params = {};
+            try {
+                var qs = (window.location.search || "").replace(/^\?/, "").split("&");
+                for (var i = 0; i < qs.length; i++) {
+                    var p = qs[i].split("=");
+                    if (p[0]) params[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || "");
+                }
+            } catch (e) {}
+
+            if (params.msx === "1") {
+                var btn = document.createElement("button");
+                btn.type = "button";
+                btn.id = "msx-exit-btn";
+                btn.textContent = "Exit to MSX";
+                btn.setAttribute("aria-label", "Exit to Media Station X");
+                btn.style.cssText = [
+                    "position:fixed",
+                    "top:12px",
+                    "right:12px",
+                    "z-index:2147483647",
+                    "padding:10px 16px",
+                    "font:600 16px/1.2 sans-serif",
+                    "color:#fff",
+                    "background:#333",
+                    "border:2px solid #fff",
+                    "border-radius:4px",
+                    "cursor:pointer",
+                    "opacity:0.85"
+                ].join(";");
+                btn.onclick = function () { exitToRootApp(); };
+                document.addEventListener("DOMContentLoaded", function () {
+                    document.body.appendChild(btn);
+                });
+                if (document.body) document.body.appendChild(btn);
+            }
+        })();
+    </script>
+    <script>
 
         var currentHost = window.location.hostname;
         var currentPort = window.location.port;
@@ -137,7 +183,7 @@
             "url_v9as2": "https:\/\/web.archive.org\/web\/20160301042623\/https:\/\/s.ytimg.com\/yts\/swfbin\/player-vflWp-Ns-\/cps.swf",
             "assets": {
                 "css": APP_URL + "/assets/www-player-vflz6YThU.css",
-                "js": APP_URL + "/assets/tv-player.js"
+                "js": APP_URL + "/assets/tv-player.js?v=20260923"
             },
             "sts": 16855,
             "params": {
@@ -219,7 +265,7 @@
                 "tv_4k_house_channel": true
             },
             "tv_css": APP_URL + "/assets/app-prod.css",
-            'player_url': APP_URL + "/assets/tv-player.js",
+            'player_url': APP_URL + "/assets/tv-player.js?v=20260923",
             "background": "",
             "server_ua": "Mozilla\/5.0 (compatible; heritrix\/3.3.0-SNAPSHOT-20140702-2247 +http:\/\/archive.org\/details\/archive.org_bot),gzip(gfe)",
             "theme": "cl",

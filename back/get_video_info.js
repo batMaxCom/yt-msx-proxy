@@ -1,9 +1,19 @@
 const fs = require('fs');
 const path = require('path');
-const { title } = require('process');
+const { execFileSync } = require('child_process');
+const axios = require('axios');
 const youtubeDl = require('youtube-dl-exec');
+const logger = require('./logger');
 
 const settingsPath = path.join(__dirname, 'settings.json');
+const bundledYtDlpPath = path.join(
+    __dirname,
+    '..',
+    'node_modules',
+    'youtube-dl-exec',
+    'bin',
+    'yt-dlp'
+);
 
 let settings;
 
@@ -21,6 +31,328 @@ if (!fs.existsSync(settingsPath)) {
 
 const serverIp = settings.serverIp || "localhost";
 
+let bundledYtDlpVersion = 'unknown';
+try {
+    bundledYtDlpVersion = execFileSync(bundledYtDlpPath, ['--version'], {
+        encoding: 'utf8',
+    }).trim();
+    console.log(`[yt-dlp] binary: ${bundledYtDlpPath}`);
+    console.log(`[yt-dlp] version: ${bundledYtDlpVersion}`);
+} catch (err) {
+    console.warn('[yt-dlp] failed to read bundled binary version:', err.message);
+}
+
+const streamMap = new Map();
+
+function isTransientStreamError(err) {
+    if (!err) return false;
+    const transientCodes = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNABORTED', 'EPIPE', 'ECONNREFUSED'];
+    if (transientCodes.includes(err.code)) return true;
+    const message = String(err.message || '');
+    return /socket disconnected|secure TLS|sow outage|Client network socket|maximum redirects/i.test(message);
+}
+
+function storeStreamUrls(videoId, formats) {
+    if (!Array.isArray(formats)) return;
+    formats.forEach(format => {
+        if (format.url && format.format_id) {
+            streamMap.set(`${videoId}_${format.format_id}`, format.url);
+        }
+    });
+}
+
+function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft, delayMs) {
+    if (req.destroyed || req.aborted || res.writableEnded) return;
+
+    axios({
+        method: 'GET',
+        url: targetUrl,
+        headers: proxyHeaders,
+        responseType: 'stream',
+        maxRedirects: 5,
+        validateStatus: () => true,
+        timeout: 60000,
+    })
+        .then(upstream => {
+            res.status(upstream.status);
+
+            const headersToCopy = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+            headersToCopy.forEach(header => {
+                if (upstream.headers[header]) {
+                    res.setHeader(header, upstream.headers[header]);
+                }
+            });
+
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+
+            if (upstream.status >= 300) {
+                logger.warn('stream', `Upstream ${upstream.status} for ${streamId}`, {
+                    stream_id: streamId,
+                    upstream_status: upstream.status,
+                    range: req.headers['range'] || '',
+                    upstream_content_type: upstream.headers['content-type'] || '',
+                    upstream_content_length: upstream.headers['content-length'] || '',
+                });
+            }
+
+            upstream.data.on('error', err => {
+                logger.error('stream', 'Stream pipe error', { stream_id: streamId, message: err.message });
+                console.error(`Error streaming ${streamId}:`, err.message);
+                res.destroy(err);
+            });
+
+            req.on('close', () => {
+                if (!res.writableEnded) {
+                    upstream.data.destroy();
+                }
+            });
+
+            upstream.data.pipe(res);
+        })
+        .catch(err => {
+            if (isTransientStreamError(err) && attemptsLeft > 1) {
+                logger.warn('stream', 'Upstream network error, retrying', {
+                    stream_id: streamId,
+                    message: String(err.message).slice(0, 300),
+                    attempts_left: attemptsLeft - 1,
+                });
+                setTimeout(() => {
+                    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft - 1, delayMs);
+                }, delayMs);
+                return;
+            }
+            logger.error('stream', 'Stream proxy error', {
+                stream_id: streamId,
+                message: String(err.message).slice(0, 400),
+                code: err.code || undefined,
+            });
+            console.error(`Stream proxy error for ${streamId}:`, err.message);
+            if (!res.headersSent && !res.writableEnded) {
+                res.status(502).send('Failed to proxy stream');
+            }
+        });
+}
+
+function proxyStreamWithError(res, status, message) {
+    if (!res.headersSent && !res.writableEnded) {
+        res.status(status).send(message);
+    }
+}
+
+function vintLength(firstByte) {
+    if (firstByte === 0) return -1;
+    let len = 1;
+    let mask = 0x80;
+    while ((firstByte & mask) === 0) {
+        mask >>= 1;
+        len++;
+    }
+    return len;
+}
+
+function lastClusterStartOnOrBefore(buf, scanEnd) {
+    let found = -1;
+    const limit = Math.min(scanEnd, buf.length - 8);
+    for (let i = 0; i <= limit; i++) {
+        if (buf[i] !== 0x1f || buf[i + 1] !== 0x43 || buf[i + 2] !== 0xb6 || buf[i + 3] !== 0x75) continue;
+        // YouTube's muxer often encodes the Cluster size as a 3-byte VINT
+        // (marker at bit 5), so only the "non-zero VINT marker" part of the
+        // byte is guaranteed. WebM's spec requires the Cluster's first child
+        // to be the Timestamp element (0xE7) — validate it to reject
+        // coincidental byte patterns inside media data.
+        const vlen = vintLength(buf[i + 4]);
+        if (vlen < 1) continue;
+        const tsByte = i + 4 + vlen;
+        if (tsByte >= buf.length) continue;
+        if (buf[tsByte] !== 0xe7) continue;
+        found = i;
+    }
+    return found;
+}
+
+const SEEK_ALIGN_WINDOW = 2 * 1024 * 1024;
+
+function collectRangeBuf(targetUrl, proxyHeaders, start, end) {
+    return axios({
+        method: 'GET',
+        url: targetUrl,
+        headers: Object.assign({}, proxyHeaders, { Range: `bytes=${start}-${end}` }),
+        responseType: 'arraybuffer',
+        maxRedirects: 5,
+        validateStatus: () => true,
+        timeout: 60000,
+    });
+}
+
+async function proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, rangeHeader) {
+    const rangeMatch = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    if (!rangeMatch) {
+        return proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700);
+    }
+
+    let rangeStart = parseInt(rangeMatch[1], 10);
+    let rangeEnd = parseInt(rangeMatch[2], 10);
+
+    // Range starting at the beginning of the file is already cluster-aligned
+    // (it begins with the init segment), so just stream it through.
+    if (rangeStart === 0) {
+        return proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700);
+    }
+
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const upstreamStart = Math.max(0, rangeStart - SEEK_ALIGN_WINDOW);
+
+        let up;
+        try {
+            up = await collectRangeBuf(targetUrl, proxyHeaders, upstreamStart, rangeEnd);
+        } catch (err) {
+            if (isTransientStreamError(err) && attempt < maxAttempts) {
+                logger.warn('stream', 'Aligned seek upstream network error, retrying', {
+                    stream_id: streamId,
+                    message: String(err.message).slice(0, 300),
+                    attempts_left: maxAttempts - attempt,
+                });
+                await new Promise(resolve => setTimeout(resolve, 700 * attempt));
+                continue;
+            }
+            logger.error('stream', 'Aligned seek upstream error', {
+                stream_id: streamId,
+                message: String(err.message).slice(0, 300),
+                code: err.code || undefined,
+            });
+            return proxyStreamWithError(res, 502, 'Failed to proxy stream');
+        }
+
+        const upstreamContentType = String(up.headers['content-type'] || 'video/webm').toLowerCase();
+        const upstreamTotalMatch = /^bytes\s+(\d+)-(\d+)\/(\d+)/.exec(String(up.headers['content-range'] || ''));
+        const fileTotal = upstreamTotalMatch ? parseInt(upstreamTotalMatch[3], 10) : null;
+
+        if (up.status === 416) {
+            const totalMatch = /\/(\d+)\s*$/.exec(String(up.headers['content-range'] || ''));
+            if (totalMatch && attempt < maxAttempts) {
+                const fileTotal416 = parseInt(totalMatch[1], 10);
+                rangeEnd = Math.max(rangeStart, fileTotal416 - 1);
+                await new Promise(resolve => setTimeout(resolve, 300));
+                continue;
+            }
+            return proxyStreamWithError(res, 416, 'Range not satisfiable');
+        }
+
+        const raw = Buffer.isBuffer(up.data) ? up.data : Buffer.from(up.data || []);
+
+        // YouTube throttling frequently answers range requests with a short
+        // HTML/plain error page instead of the video bytes. Treat that as a
+        // transient failure so the retry loop can recover.
+        if (/text\/html|text\/plain|application\/json/.test(upstreamContentType) && raw.length < 65536 && attempt < maxAttempts) {
+            logger.warn('stream', 'Upstream returned error page in aligned seek, retrying', {
+                stream_id: streamId,
+                upstream_status: up.status,
+                content_type: upstreamContentType,
+                bytes: raw.length,
+            });
+            await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+            continue;
+        }
+
+        let effectiveStart = rangeStart;
+        const inBufferOffset = rangeStart - upstreamStart;
+        if (inBufferOffset > 0 && inBufferOffset < raw.length) {
+            const scanEnd = inBufferOffset;
+            const clusterIndex = lastClusterStartOnOrBefore(raw, scanEnd);
+            if (clusterIndex >= 0) {
+                effectiveStart = upstreamStart + clusterIndex;
+            }
+        }
+
+        // A valid WebM mid-file region always contains Cluster elements within
+        // a 2 MB window (YouTube clusters are ~200-500 KB apart). When YouTube
+        // throttling answers with a garbage body that still claims
+        // video/webm, the scan finds nothing — treat that as transient and
+        // retry instead of poisoning the MSE decoder with corrupt bytes.
+        if (effectiveStart === rangeStart && attempt < maxAttempts) {
+            logger.warn('stream', 'No cluster boundary found in seek window, retrying', {
+                stream_id: streamId,
+                range: rangeHeader,
+                bytes: raw.length,
+                upstream_status: up.status,
+            });
+            await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+            continue;
+        }
+
+        const payloadEnd = Math.min(rangeEnd, fileTotal !== null ? fileTotal - 1 : rangeEnd);
+        const payloadStartOffset = effectiveStart - upstreamStart;
+        if (payloadEnd < effectiveStart || payloadStartOffset >= raw.length) {
+            return proxyStreamWithError(res, 416, 'Range not satisfiable');
+        }
+        const payload = raw.slice(payloadStartOffset, payloadEnd - upstreamStart + 1);
+        if (payload.length === 0) {
+            return proxyStreamWithError(res, 416, 'Range not satisfiable');
+        }
+
+        const servedEnd = effectiveStart + payload.length - 1;
+        res.status(206);
+        res.setHeader('Content-Type', upstreamContentType);
+        res.setHeader('Content-Length', payload.length);
+        res.setHeader('Content-Range', `bytes ${effectiveStart}-${servedEnd}/${fileTotal !== null ? fileTotal : servedEnd + 1}`);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        logger.info('stream', 'Aligned seek range served', {
+            stream_id: streamId,
+            range: rangeHeader,
+            served_from: effectiveStart,
+            served_to: servedEnd,
+            cluster_adjusted: effectiveStart !== rangeStart,
+        });
+        res.send(payload);
+        return;
+    }
+
+    return proxyStreamWithError(res, 502, 'Failed to proxy stream');
+}
+
+function handleStreamRequest(req, res) {
+    const streamId = req.params.stream_id;
+    const targetUrl = streamMap.get(streamId);
+
+    if (!targetUrl) {
+        logger.error('stream', 'Stream not found', { stream_id: streamId });
+        console.error(`Stream not found for id: ${streamId}`);
+        return res.status(404).send('Stream not found');
+    }
+
+    const proxyHeaders = {
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)',
+    };
+
+    if (req.headers['range']) {
+        proxyHeaders['Range'] = req.headers['range'];
+    }
+
+    // Cluster-aligned middleware: when the player requests a mid-file byte
+    // range right after a seek (&seek=1), serve the bytes starting at the
+    // nearest WebM cluster boundary at/before the requested offset so the
+    // raw data is parseable when appended to MSE (arbitrary offsets corrupt
+    // the decoder and trigger "An error occurred").
+    if (req.query.seek === '1' && req.headers['range']) {
+        proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, req.headers['range'])
+            .catch(err => {
+                logger.error('stream', 'Aligned seek handler error', {
+                    stream_id: streamId,
+                    message: String(err.message).slice(0, 300),
+                });
+                proxyStreamWithError(res, 502, 'Failed to proxy stream');
+            });
+        return;
+    }
+
+    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700);
+}
+
 
 function handleGetVideoInfo(req, res) {
     const videoId = req.query.video_id;
@@ -32,11 +364,64 @@ function handleGetVideoInfo(req, res) {
         return res.status(400).send('Video ID is required');
     }
 
-    youtubeDl(videoId, {
+    console.log('[REQUEST] GET /get_video_info');
+    console.log('[REQUEST] video_id:', videoId);
+    console.log('[yt-dlp] using version:', bundledYtDlpVersion);
+
+    // Prefer embedded TV/Android clients — they return the full adaptive format
+    // set (video-only H264/VP9/AV1 + audio-only m4a/webm/opus) that the TV
+    // player's custom streaming code requires. Plain `tv`, `android` and `web`
+    // currently yield only progressive itag 18 + storyboards, which produce the
+    // "This video format is not supported." error.
+    const ytdlpFlags = {
         dumpSingleJson: true,
         noWarnings: true,
         quiet: true,
-    })
+        noCheckCertificates: true,
+        socketTimeout: 20,
+        retries: 3,
+        extractorArgs: 'youtube:player_client=tv_embedded,android_embedded',
+    };
+
+    // Optional cookies from settings.json:
+    //   "ytDlpCookies": "/path/to/cookies.txt"
+    //   or "ytDlpCookiesFromBrowser": "chrome"
+    if (settings.ytDlpCookies && fs.existsSync(settings.ytDlpCookies)) {
+        ytdlpFlags.cookies = settings.ytDlpCookies;
+        console.log('[yt-dlp] cookies file:', settings.ytDlpCookies);
+    } else if (settings.ytDlpCookiesFromBrowser) {
+        ytdlpFlags.cookiesFromBrowser = settings.ytDlpCookiesFromBrowser;
+        console.log('[yt-dlp] cookiesFromBrowser:', settings.ytDlpCookiesFromBrowser);
+    }
+
+    console.log('[UPSTREAM] yt-dlp', videoId, ytdlpFlags);
+
+    const maxAttempts = typeof settings.ytDlpMaxAttempts === 'number' ? settings.ytDlpMaxAttempts : 3;
+
+    async function extractWithRetry() {
+        let lastErr;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return await youtubeDl(videoId, ytdlpFlags);
+            } catch (err) {
+                lastErr = err;
+                const message = err.stderr || err.message || String(err);
+                logger.warn('video-info', 'yt-dlp attempt failed', {
+                    video_id: videoId,
+                    attempt,
+                    max: maxAttempts,
+                    message: logger.truncateStderr(message),
+                });
+                console.error(`[yt-dlp] attempt ${attempt}/${maxAttempts} failed:`, logger.truncateStderr(message));
+                if (attempt < maxAttempts) {
+                    await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+                }
+            }
+        }
+        throw lastErr;
+    }
+
+    extractWithRetry()
         .then(output => {
             //console.log('Video Info:', output);
 
@@ -58,15 +443,20 @@ function handleGetVideoInfo(req, res) {
             console.log('Video Title:', videoTitle);
             console.log('Video Duration:', videoDuration);
 
+            logger.info('video-info', 'yt-dlp metadata ok', {
+                video_id: videoIdFromOutput,
+                title: videoTitle,
+                duration: videoDuration,
+                formats_total: output.formats ? output.formats.length : 0,
+            });
+
             const adaptiveFmts = [];
             const fmtListArr = [];
             const urlEncodedFmtStreamMapArr = [];
 
             if (output.formats && Array.isArray(output.formats)) {
                 output.formats.forEach(format => {
-                    const skipFormatIds = ["sb1", "sb2", "sb0"];
-                    if (skipFormatIds.includes(format.format_id)) return;
-
+                    if (format.format_id && /^sb/.test(format.format_id)) return;
 
                     if (disableWebM && (format.ext === 'webm' || format.acodec === 'vp9' || format.acodec === 'vp8')) return;
 
@@ -82,15 +472,34 @@ function handleGetVideoInfo(req, res) {
                             mimeType = `application/octet-stream`;
                         }
 
+                        if (mimeType === 'application/octet-stream') {
+                            logger.warn('video-info', 'Skipping unplayable format', {
+                                video_id: videoIdFromOutput,
+                                format_id: format.format_id,
+                                mime: 'application/octet-stream',
+                            });
+                            console.log('Skipping unplayable format:', format.format_id);
+                            return;
+                        }
+
+                        storeStreamUrls(videoIdFromOutput, [format]);
+
+                        const baseMime = mimeType.split(';')[0].trim();
+                        const streamUrl = `/api/stream/${videoIdFromOutput}_${format.format_id}?mime=${encodeURIComponent(baseMime)}&itag=${format.format_id}&size=${format.width ? format.width + 'x' + format.height : '0x0'}`;
+
                         if (format.format_id !== '18') {
 
                             if (format.url.includes('manifest')) {
+                                logger.warn('video-info', 'Skipping manifest URL', {
+                                    video_id: videoIdFromOutput,
+                                    format_id: format.format_id,
+                                });
                                 console.log('Skipping manifest URL:', format.url);
                                 return;
                             }
 
                             const urlParams = new URLSearchParams();
-                            urlParams.append('url', format.url);
+                            urlParams.append('url', streamUrl);
                             urlParams.append('itag', format.format_id);
                             urlParams.append('clen', format.filesize || 'unknown');
                             urlParams.append('lmt', format.lastModified || 'unknown');
@@ -106,6 +515,10 @@ function handleGetVideoInfo(req, res) {
                             const height = format.height || "unknown";
 
                             if (width === "unknown" || height === "unknown") {
+                                logger.warn('video-info', 'Skipping format with unknown width or height', {
+                                    video_id: videoIdFromOutput,
+                                    format_id: format.format_id,
+                                });
                                 console.log('Skipping format with unknown width or height:', format);
                                 return;
                             }
@@ -114,23 +527,39 @@ function handleGetVideoInfo(req, res) {
                                 const fmtString = `${format.format_id}/${width}x${height}`;
                                 fmtListArr.push(fmtString);
                             } else {
+                                logger.warn('video-info', 'Skipping format with missing format_id', {
+                                    video_id: videoIdFromOutput,
+                                    format_id: format.format_id,
+                                });
                                 console.log('Skipping format with missing format_id:', format);
                             }
                         }
 
                         if (format.format_id === '18') {
-                            const fmtString = `itag=${format.itag}&type=${mimeType}&url=${encodeURIComponent(format.url)}&quality=${format.quality || 'unknown'}`;
+                            const fmtString = `itag=${format.itag}&type=${mimeType}&url=${encodeURIComponent(streamUrl)}&quality=${format.quality || 'unknown'}`;
                             urlEncodedFmtStreamMapArr.push(fmtString);
                         }
                     } else {
+                        logger.warn('video-info', 'Skipping format with missing URL or format_id', {
+                            video_id: videoIdFromOutput,
+                            format_id: format.format_id,
+                        });
                         console.log('Skipping format with missing URL or format_id:', format);
                     }
                 });
             }
 
-            if (adaptiveFmts.length === 0) {
-                console.log('No adaptive formats found');
-                return res.status(404).send('No adaptive formats found');
+            logger.info('video-info', 'Formats ready', {
+                video_id: videoIdFromOutput,
+                adaptive_count: adaptiveFmts.length,
+                progressive_count: urlEncodedFmtStreamMapArr.length,
+                fmt_list_count: fmtListArr.length,
+            });
+
+            if (adaptiveFmts.length === 0 && urlEncodedFmtStreamMapArr.length === 0) {
+                logger.error('video-info', 'No playable formats found', { video_id: videoIdFromOutput });
+                console.log('No playable formats found');
+                return res.status(404).send('No playable formats found');
             }
 
 
@@ -188,7 +617,7 @@ function handleGetVideoInfo(req, res) {
         iurl=https%3A%2F%2Fi.ytimg.com%2Fvi%2F0ggR11jYS3A%2Fhqdefault.jpg
         author=%D7%A0%D7%A4%D7%AA%D7%9C%D7%99+%D7%91%D7%A0%D7%98+%7C+Naftali+Bennett
         storyboard_spec=https://i.ytimg.com/sb/OxoOSohmaag/storyboard3_L0/default.jpg?sqp=-oaymwENSDfyq4qpAwVwAcABBqLzl_8DBgjvjc-oBg==&sigh=rs$AOn4CLCM4gaqvsBmP9olCrnqXWONsDTRCQ
-        url_encoded_fmt_stream_map=${encodeURIComponent(adaptiveFmtsResponse)}
+        url_encoded_fmt_stream_map=${encodeURIComponent(urlEncodedFmtStreamMapResponse)}
         adaptive_fmts=${encodeURIComponent(adaptiveFmtsResponse)}
         remarketing_url=https%3A%2F%2Fgoogleads.g.doubleclick.net%2Fpagead%2Fviewthroughconversion%2F962985656%2F%3Flabel%3Dfollowon_view%26cname%3D1%26foc_id%3D4x7LYSzgGH-TMKc9J8pwgQ%26backend%3Dplayer_vars%26cver%3DHTML5%26ptype%3Dno_rmkt%26aid%3DP989_XaxlmI
         idpj=-2
@@ -227,9 +656,22 @@ function handleGetVideoInfo(req, res) {
         })
 
         .catch(err => {
-            console.error('Error fetching video info:', err);
-            res.status(500).send('Failed to fetch video info');
+            const message = err.stderr || err.message || String(err);
+            logger.error('video-info', 'yt-dlp failed', {
+                video_id: videoId,
+                message: logger.truncateStderr(message),
+            });
+            console.error('[get_video_info] yt-dlp failed:', message);
+            console.error(
+                '[get_video_info] tip: update bundled binary with ' +
+                '`npx youtube-dl-exec` reinstall / download latest yt-dlp into ' +
+                'node_modules/youtube-dl-exec/bin/, or set ytDlpCookies in settings.json'
+            );
+            // Do not forward to unrelated telemetry URLs. Fail clearly.
+            res.status(502).send(
+                `Failed to fetch video info via yt-dlp (${bundledYtDlpVersion}): ${message}`
+            );
         });
 }
 
-module.exports = { handleGetVideoInfo };
+module.exports = { handleGetVideoInfo, handleStreamRequest };
