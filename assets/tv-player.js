@@ -14705,7 +14705,7 @@
         };
 
         function ct(a, b, c) {
-            return a.Y + "://i1.ytimg.com/vi/" + b + "/" + (c || "hqdefault.jpg")
+            return APP_URL + "/img/i1.ytimg.com/vi/" + b + "/" + (c || "hqdefault.jpg")
         }
 
         function wv(a) {
@@ -25410,7 +25410,7 @@
         }
 
         function KL(a) {
-            return C(D(a)) ? null : "https://i1.ytimg.com/vi/" + a + "/mqdefault.jpg"
+            return C(D(a)) ? null : APP_URL + "/img/i1.ytimg.com/vi/" + a + "/mqdefault.jpg"
         };
 
         function LL() {

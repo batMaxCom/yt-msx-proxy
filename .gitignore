@@ -2,5 +2,9 @@ node_modules/
 .DS_Store
 .idea/
 /back/logs/
+/back/imgcache/
 /back/token/
 /back/settings.json
+/logs/
+/screenshots/
+.ai/

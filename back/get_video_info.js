@@ -4,6 +4,7 @@ const { execFileSync } = require('child_process');
 const axios = require('axios');
 const youtubeDl = require('youtube-dl-exec');
 const logger = require('./logger');
+const { rewriteString } = require('./image_proxy');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 const bundledYtDlpPath = path.join(
@@ -650,9 +651,13 @@ function handleGetVideoInfo(req, res) {
 
             const encodedResponse = encodedProperties.join('&').replace(/\s+/g, '');
 
+            const rewrittenResponse = rewriteString(encodedResponse, {
+                serverIp,
+                port: 8090,
+                origin: `http://${serverIp}:8090`,
+            });
 
-
-            res.send(encodedResponse);
+            res.send(rewrittenResponse);
         })
 
         .catch(err => {

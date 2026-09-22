@@ -17,6 +17,8 @@ const { handleGetVideoInfo, handleStreamRequest } = require('./get_video_info');
 // may or may not be used I am just keeping it
 const { fetchLoungeTokenBatch } = require('./lounge_api');
 
+const imageProxy = require('./image_proxy');
+
 const bodyParser = require('body-parser');
 const oauthRouter = require('./oauth_api_v3_api.js');
 
@@ -51,6 +53,15 @@ console.log("Loaded Server IP:", serverIp);
 
 const app = express();
 const port = 8090;
+
+// Relay every YouTube CDN image through this backend and rewrite all outgoing
+// JSON so the browser never talks to YouTube/archive.org directly.
+const imageProxyCtx = {
+    serverIp,
+    port,
+    origin: `http://${serverIp}:${port}`,
+};
+imageProxy.installImageProxyRoutes(app, imageProxyCtx);
 
 // Address on which the HTTP server binds. Defaults to the configured server IP.
 // Set BIND_ADDR=0.0.0.0 when running in Docker / behind a NAT so the socket

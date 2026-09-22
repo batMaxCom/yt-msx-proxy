@@ -23478,7 +23478,7 @@
                         metadataType: 0,
                         title: L(this.ea.title),
                         images: [{
-                            url: "https://i.ytimg.com/vi/" + this.h + "/hqdefault.jpg"
+                            url: APP_URL + "/img/i.ytimg.com/vi/" + this.h + "/hqdefault.jpg"
                         }]
                     }, a = !0);
                     1 != this.f.state || this.f.Ea || (c.duration = this.f.If(), b = !0);
@@ -25617,7 +25617,7 @@
             return this.mD(a, "vi", c)
         };
         d.mD = function (a, b, c) {
-            return "http://i1.ytimg.com/" + b + "/" + a + "/" + c + ".jpg"
+            return APP_URL + "/img/i1.ytimg.com/" + b + "/" + a + "/" + c + ".jpg"
         };
         d.KV = function (a) {
             return 24 == a.length ? a.substr(2) : a
