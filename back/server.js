@@ -52,6 +52,11 @@ console.log("Loaded Server IP:", serverIp);
 const app = express();
 const port = 8090;
 
+// Address on which the HTTP server binds. Defaults to the configured server IP.
+// Set BIND_ADDR=0.0.0.0 when running in Docker / behind a NAT so the socket
+// binds to every interface while the client-facing URLs keep using serverIp.
+const bindAddr = process.env.BIND_ADDR || serverIp;
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -65,15 +70,17 @@ app.use((req, res, next) => {
 });
 
 const server = corsAnywhere.createServer({
-    originWhitelist: [`http://${serverIp}:8090`, '*', '""', '', 'null', "null"],
+    originWhitelist: [`http://${serverIp}:8090`, 'null', '""', ''],
     removeHeaders: ['cookie', 'cookie2'],
     handleInitialRequest: (req, res) => {
         const origin = req.headers.origin;
 
-        if (origin === `http://${serverIp}:8090` || origin === '*') {
+        if (origin === `http://${serverIp}:8090` || origin === 'null' || origin === '""' || origin === '') {
             res.setHeader('Access-Control-Allow-Origin', origin);
         } else {
-            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.writeHead(403, 'Forbidden');
+            res.end('Origin not allowed');
+            return true;
         }
 
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -90,7 +97,7 @@ const server = corsAnywhere.createServer({
 });
 
 
-server.listen(8070, serverIp, () => {
+server.listen(8070, bindAddr, () => {
     console.log('CORS Anywhere proxy running on http://' + serverIp + ':8070');
 });
 
@@ -648,6 +655,6 @@ process.on('uncaughtException', (err) => {
 });
 
 
-app.listen(port, serverIp, () => {
+app.listen(port, bindAddr, () => {
     console.log(`Server running at http://` + serverIp + `:` + port);
 });
