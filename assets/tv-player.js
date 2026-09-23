@@ -8887,7 +8887,7 @@
               // --- Begin fetchSegment function ---
               function fetchSegment(url, sourceBuffer, videoElement, type) {
                 var rangeStart = 0;
-                var chunkSize = 2 * 1024 * 1024; // 2 MB per segment
+                var chunkSize = 512 * 1024; // 512 KB per segment (fit slow-hop 30-45s)
                 var rangeEnd = rangeStart + chunkSize;
                 var totalSize = Number.MAX_SAFE_INTEGER;
                 var isPaused = false;
@@ -8996,7 +8996,7 @@ isLoading = true;
                   xhr.open('GET', reqUrl, true);
                   xhr.setRequestHeader('Range', `bytes=${rangeStart}-${rangeEnd}`);
                   xhr.responseType = 'arraybuffer';
-                  xhr.timeout = 30000;
+                  xhr.timeout = 45000;
 
                   xhr.onload = function() {
                     isLoading = false;
@@ -9186,8 +9186,16 @@ isLoading = true;
                 var filteredVideoLinks = validVideoLinks.filter(function (link) {
                   var resolution = link.resolution.split('x');
                   var height = parseInt(resolution[1], 10);
-                  return height <= 720;
+                  return height <= 360;
                 });
+                if (filteredVideoLinks.length === 0) {
+                  console.warn('No video formats found with resolution <= 360p; falling back to <= 720p.');
+                  filteredVideoLinks = validVideoLinks.filter(function (link) {
+                    var resolution = link.resolution.split('x');
+                    var height = parseInt(resolution[1], 10);
+                    return height <= 720;
+                  });
+                }
                 if (filteredVideoLinks.length === 0) {
                   console.error('No video formats found with resolution <= 720p.');
                   return null;
