@@ -43,7 +43,77 @@ try {
     console.warn('[yt-dlp] failed to read bundled binary version:', err.message);
 }
 
-const streamMap = new Map();
+const streamMap = new Map();       // streamId -> { url, expiresAt, videoId, itag }
+const refreshLocks = new Map();    // streamId -> Promise<entry> (single-flight refresh)
+
+function parseExpireSeconds(url) {
+    try {
+        const m = /[?&]expire=(\d+)/.exec(String(url));
+        if (m) return parseInt(m[1], 10);
+    } catch (e) { /* ignore */ }
+    return 0;
+}
+
+function buildYtDlpFlags() {
+    const ytdlpFlags = {
+        dumpSingleJson: true,
+        noWarnings: true,
+        quiet: true,
+        noCheckCertificates: true,
+        socketTimeout: 20,
+        retries: 3,
+        extractorArgs: 'youtube:player_client=tv_embedded,android_embedded',
+    };
+    if (settings.ytDlpCookies && fs.existsSync(settings.ytDlpCookies)) {
+        ytdlpFlags.cookies = settings.ytDlpCookies;
+    } else if (settings.ytDlpCookiesFromBrowser) {
+        ytdlpFlags.cookiesFromBrowser = settings.ytDlpCookiesFromBrowser;
+    }
+    return ytdlpFlags;
+}
+
+async function runYtDlp(videoId) {
+    const ytdlpFlags = buildYtDlpFlags();
+    const maxAttempts = typeof settings.ytDlpMaxAttempts === 'number' ? settings.ytDlpMaxAttempts : 3;
+    let lastErr;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await youtubeDl(videoId, ytdlpFlags);
+        } catch (err) {
+            lastErr = err;
+            const message = err.stderr || err.message || String(err);
+            logger.warn('video-info', 'yt-dlp attempt failed', {
+                video_id: videoId,
+                attempt,
+                max: maxAttempts,
+                message: logger.truncateStderr(message),
+            });
+            if (attempt < maxAttempts) {
+                await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+            }
+        }
+    }
+    throw lastErr;
+}
+
+async function refreshStreamUrl(streamId) {
+    if (refreshLocks.has(streamId)) return refreshLocks.get(streamId);
+    const promise = (async () => {
+        const entry = streamMap.get(streamId);
+        if (!entry) throw new Error('Stream entry missing');
+        const output = await runYtDlp(entry.videoId);
+        storeStreamUrls(entry.videoId, output.formats || []);
+        const fresh = streamMap.get(streamId);
+        if (!fresh) throw new Error('Format disappeared after refresh');
+        return fresh;
+    })();
+    refreshLocks.set(streamId, promise);
+    try {
+        return await promise;
+    } finally {
+        refreshLocks.delete(streamId);
+    }
+}
 
 function isTransientStreamError(err) {
     if (!err) return false;
@@ -57,13 +127,27 @@ function storeStreamUrls(videoId, formats) {
     if (!Array.isArray(formats)) return;
     formats.forEach(format => {
         if (format.url && format.format_id) {
-            streamMap.set(`${videoId}_${format.format_id}`, format.url);
+            const expireSec = parseExpireSeconds(format.url);
+            const expiresAt = expireSec ? expireSec * 1000 : Date.now() + 6 * 60 * 60 * 1000;
+            streamMap.set(`${videoId}_${format.format_id}`, {
+                url: format.url,
+                expiresAt,
+                videoId,
+                itag: String(format.format_id),
+            });
         }
     });
 }
 
-function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft, delayMs) {
+function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft, delayMs, allowUrlRefresh) {
     if (req.destroyed || req.aborted || res.writableEnded) return;
+    if (allowUrlRefresh === undefined) allowUrlRefresh = true;
+
+    const entry = streamMap.get(streamId);
+    const entryMeta = entry
+        ? { video_id: entry.videoId, itag: entry.itag }
+        : { video_id: streamId, itag: undefined };
+    const rangeHeader = req.headers['range'] || '';
 
     axios({
         method: 'GET',
@@ -72,10 +156,65 @@ function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attem
         responseType: 'stream',
         maxRedirects: 5,
         validateStatus: () => true,
-        timeout: 60000,
+        timeout: typeof settings.streamHeaderTimeoutMs === 'number' ? settings.streamHeaderTimeoutMs : 20000,
     })
         .then(upstream => {
-            res.status(upstream.status);
+            const status = upstream.status;
+
+            if (allowUrlRefresh && (status === 403 || status === 416)) {
+                try { upstream.data && upstream.data.destroy(); } catch (e) { /* ignore */ }
+                logger.warn('stream', 'STREAM_URL_EXPIRED', {
+                    event: 'STREAM_URL_EXPIRED',
+                    video_id: entryMeta.video_id,
+                    itag: entryMeta.itag,
+                    range: rangeHeader,
+                    status,
+                    reason: 'upstream_' + status,
+                });
+                refreshStreamUrl(streamId)
+                    .then(fresh => {
+                        logger.info('stream', 'STREAM_URL_REFRESH', {
+                            event: 'STREAM_URL_REFRESH',
+                            video_id: fresh.videoId,
+                            itag: fresh.itag,
+                            status: 'ok',
+                        });
+                        logger.info('stream', 'STREAM_RETRY', {
+                            event: 'STREAM_RETRY',
+                            video_id: fresh.videoId,
+                            itag: fresh.itag,
+                            range: rangeHeader,
+                            retry: true,
+                            attempts_left: attemptsLeft,
+                        });
+                        proxyStreamWithRetry(req, res, streamId, fresh.url, proxyHeaders, attemptsLeft, delayMs, false);
+                    })
+                    .catch(err => {
+                        logger.error('stream', 'STREAM_URL_REFRESH', {
+                            event: 'STREAM_URL_REFRESH',
+                            video_id: entryMeta.video_id,
+                            itag: entryMeta.itag,
+                            status: 'fail',
+                            reason: String(err.message || err).slice(0, 200),
+                        });
+                        logger.error('stream', 'STREAM_FAILED', {
+                            event: 'STREAM_FAILED',
+                            video_id: entryMeta.video_id,
+                            itag: entryMeta.itag,
+                            range: rangeHeader,
+                            status,
+                            retry: false,
+                            reason: 'url_refresh_failed',
+                        });
+                        if (!res.headersSent && !res.writableEnded) {
+                            res.status(status === 416 ? 416 : 502)
+                                .send(status === 416 ? 'Range not satisfiable' : 'Stream URL refresh failed');
+                        }
+                    });
+                return;
+            }
+
+            res.status(status);
 
             const headersToCopy = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
             headersToCopy.forEach(header => {
@@ -86,14 +225,23 @@ function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attem
 
             res.setHeader('Cache-Control', 'no-store');
             res.setHeader('Access-Control-Allow-Origin', '*');
+            if (!res.getHeader('Accept-Ranges')) {
+                res.setHeader('Accept-Ranges', 'bytes');
+            }
 
-            if (upstream.status >= 300) {
-                logger.warn('stream', `Upstream ${upstream.status} for ${streamId}`, {
+            if (status >= 300) {
+                logger.warn('stream', status === 403 || status === 416 ? 'STREAM_FAILED' : 'Upstream non-2xx', {
+                    event: 'STREAM_FAILED',
                     stream_id: streamId,
-                    upstream_status: upstream.status,
-                    range: req.headers['range'] || '',
+                    video_id: entryMeta.video_id,
+                    itag: entryMeta.itag,
+                    upstream_status: status,
+                    range: rangeHeader,
+                    retry: false,
+                    reason: 'upstream_final_' + status,
                     upstream_content_type: upstream.headers['content-type'] || '',
                     upstream_content_length: upstream.headers['content-length'] || '',
+                    allowed_refresh: allowUrlRefresh,
                 });
             }
 
@@ -109,24 +257,77 @@ function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attem
                 }
             });
 
+            // Body idle watchdog: a streamed response that goes quiet for too
+            // long (typical behind a flaky VPN) is treated as transient. If we
+            // have not committed headers yet, retry upstream; otherwise break
+            // the client connection so the player's own bounded XHR timeout
+            // (and retry) can take over instead of hanging forever.
+            let idleTimer = null;
+            const idleTimeoutMs = typeof settings.streamIdleTimeoutMs === 'number' ? settings.streamIdleTimeoutMs : 15000;
+            const armIdle = () => {
+                clearTimeout(idleTimer);
+                idleTimer = setTimeout(onIdleTimeout, idleTimeoutMs);
+            };
+            const onIdleTimeout = () => {
+                clearTimeout(idleTimer);
+                logger.warn('stream', 'STREAM_RETRY', {
+                    event: 'STREAM_RETRY',
+                    stream_id: streamId,
+                    video_id: entryMeta.video_id,
+                    itag: entryMeta.itag,
+                    range: rangeHeader,
+                    retry: true,
+                    attempts_left: Math.max(0, attemptsLeft - 1),
+                    reason: 'upstream_idle_timeout',
+                });
+                try { upstream.data.destroy(); } catch (e) { /* ignore */ }
+                if (!res.headersSent && attemptsLeft > 1) {
+                    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft - 1, delayMs, allowUrlRefresh);
+                } else {
+                    try { req.destroy(); } catch (e) { /* ignore */ }
+                    try { if (!res.writableEnded) res.destroy(); } catch (e) { /* ignore */ }
+                }
+            };
+            upstream.data.on('data', armIdle);
+            armIdle();
+
             upstream.data.pipe(res);
         })
         .catch(err => {
             if (isTransientStreamError(err) && attemptsLeft > 1) {
-                logger.warn('stream', 'Upstream network error, retrying', {
+                logger.warn('stream', 'STREAM_RETRY', {
+                    event: 'STREAM_RETRY',
                     stream_id: streamId,
-                    message: String(err.message).slice(0, 300),
+                    video_id: entryMeta.video_id,
+                    itag: entryMeta.itag,
+                    range: rangeHeader,
+                    retry: true,
                     attempts_left: attemptsLeft - 1,
+                    reason: typeof err.code === 'string' ? err.code : 'transient',
                 });
                 setTimeout(() => {
-                    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft - 1, delayMs);
+                    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attemptsLeft - 1, delayMs, allowUrlRefresh);
                 }, delayMs);
                 return;
             }
-            logger.error('stream', 'Stream proxy error', {
+            logger.error('stream', 'STREAM_ERROR', {
+                event: 'STREAM_ERROR',
                 stream_id: streamId,
+                video_id: entryMeta.video_id,
+                itag: entryMeta.itag,
+                range: rangeHeader,
                 message: String(err.message).slice(0, 400),
                 code: err.code || undefined,
+            });
+            logger.error('stream', 'STREAM_FAILED', {
+                event: 'STREAM_FAILED',
+                stream_id: streamId,
+                video_id: entryMeta.video_id,
+                itag: entryMeta.itag,
+                range: rangeHeader,
+                status: null,
+                retry: false,
+                reason: String(err.code || err.message || 'error').slice(0, 80),
             });
             console.error(`Stream proxy error for ${streamId}:`, err.message);
             if (!res.headersSent && !res.writableEnded) {
@@ -135,9 +336,20 @@ function proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, attem
         });
 }
 
-function proxyStreamWithError(res, status, message) {
+function proxyStreamWithError(res, status, message, meta) {
     if (!res.headersSent && !res.writableEnded) {
         res.status(status).send(message);
+    }
+    if (meta) {
+        logger.error('stream', 'STREAM_FAILED', {
+            event: 'STREAM_FAILED',
+            status,
+            retry: false,
+            reason: message,
+            video_id: meta.video_id,
+            itag: meta.itag,
+            range: meta.range,
+        });
     }
 }
 
@@ -187,13 +399,17 @@ function collectRangeBuf(targetUrl, proxyHeaders, start, end) {
 }
 
 async function proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, rangeHeader) {
-    const rangeMatch = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const rangeMatch = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader);
     if (!rangeMatch) {
         return proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700);
     }
 
     let rangeStart = parseInt(rangeMatch[1], 10);
-    let rangeEnd = parseInt(rangeMatch[2], 10);
+    let rangeEnd = rangeMatch[2] === '' ? rangeStart + SEEK_ALIGN_WINDOW - 1 : parseInt(rangeMatch[2], 10);
+
+    if (rangeStart > rangeEnd) {
+        return proxyStreamWithError(res, 416, 'Range not satisfiable');
+    }
 
     // Range starting at the beginning of the file is already cluster-aligned
     // (it begins with the init segment), so just stream it through.
@@ -318,40 +534,109 @@ async function proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, ran
 
 function handleStreamRequest(req, res) {
     const streamId = req.params.stream_id;
-    const targetUrl = streamMap.get(streamId);
+    const entry = streamMap.get(streamId);
+    const rangeHeader = req.headers['range'] || '';
 
-    if (!targetUrl) {
-        logger.error('stream', 'Stream not found', { stream_id: streamId });
+    if (!entry) {
+        logger.error('stream', 'STREAM_FAILED', {
+            event: 'STREAM_FAILED',
+            stream_id: streamId,
+            status: 404,
+            retry: false,
+            reason: 'stream_not_cached',
+            range: rangeHeader,
+        });
         console.error(`Stream not found for id: ${streamId}`);
         return res.status(404).send('Stream not found');
+    }
+
+    logger.info('stream', 'STREAM_REQUEST', {
+        event: 'STREAM_REQUEST',
+        video_id: entry.videoId,
+        itag: entry.itag,
+        range: rangeHeader || '',
+        has_range: !!rangeHeader,
+        seek: req.query.seek === '1' ? '1' : undefined,
+    });
+
+    if (rangeHeader) {
+        logger.info('stream', 'STREAM_RANGE', {
+            event: 'STREAM_RANGE',
+            video_id: entry.videoId,
+            itag: entry.itag,
+            range: rangeHeader,
+            seek: req.query.seek === '1' ? '1' : undefined,
+        });
     }
 
     const proxyHeaders = {
         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)',
     };
 
-    if (req.headers['range']) {
-        proxyHeaders['Range'] = req.headers['range'];
+    if (rangeHeader) {
+        proxyHeaders['Range'] = rangeHeader;
     }
 
-    // Cluster-aligned middleware: when the player requests a mid-file byte
-    // range right after a seek (&seek=1), serve the bytes starting at the
-    // nearest WebM cluster boundary at/before the requested offset so the
-    // raw data is parseable when appended to MSE (arbitrary offsets corrupt
-    // the decoder and trigger "An error occurred").
-    if (req.query.seek === '1' && req.headers['range']) {
-        proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, req.headers['range'])
-            .catch(err => {
-                logger.error('stream', 'Aligned seek handler error', {
-                    stream_id: streamId,
-                    message: String(err.message).slice(0, 300),
+    const startProxy = (targetUrl, allowRefresh) => {
+        // Cluster-aligned middleware: when the player requests a mid-file byte
+        // range right after a seek (&seek=1), serve the bytes starting at the
+        // nearest WebM cluster boundary at/before the requested offset so the
+        // raw data is parseable when appended to MSE (arbitrary offsets corrupt
+        // the decoder and trigger "An error occurred").
+        if (req.query.seek === '1' && rangeHeader) {
+            proxyAlignedSeek(req, res, streamId, targetUrl, proxyHeaders, rangeHeader)
+                .catch(err => {
+                    logger.error('stream', 'Aligned seek handler error', {
+                        stream_id: streamId,
+                        message: String(err.message).slice(0, 300),
+                    });
+                    proxyStreamWithError(res, 502, 'Failed to proxy stream', {
+                        video_id: entry.videoId,
+                        itag: entry.itag,
+                        range: rangeHeader,
+                    });
                 });
-                proxyStreamWithError(res, 502, 'Failed to proxy stream');
+            return;
+        }
+
+        proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700, allowRefresh);
+    };
+
+    if (Date.now() >= entry.expiresAt - 60000) {
+        logger.warn('stream', 'STREAM_URL_EXPIRED', {
+            event: 'STREAM_URL_EXPIRED',
+            video_id: entry.videoId,
+            itag: entry.itag,
+            range: rangeHeader,
+            status: null,
+            reason: 'locally_expired',
+        });
+        refreshStreamUrl(streamId)
+            .then(fresh => {
+                logger.info('stream', 'STREAM_URL_REFRESH', {
+                    event: 'STREAM_URL_REFRESH',
+                    video_id: fresh.videoId,
+                    itag: fresh.itag,
+                    status: 'ok',
+                });
+                startProxy(fresh.url, true);
+            })
+            .catch(err => {
+                logger.warn('stream', 'STREAM_URL_REFRESH', {
+                    event: 'STREAM_URL_REFRESH',
+                    video_id: entry.videoId,
+                    itag: entry.itag,
+                    status: 'fail',
+                    reason: String(err.message || err).slice(0, 200),
+                });
+                // Fall back to the stale URL; a 403/416 upstream will still be
+                // caught by the reactive refresh inside proxyStreamWithRetry.
+                startProxy(entry.url, true);
             });
         return;
     }
 
-    proxyStreamWithRetry(req, res, streamId, targetUrl, proxyHeaders, 3, 700);
+    startProxy(entry.url, true);
 }
 
 
@@ -360,6 +645,7 @@ function handleGetVideoInfo(req, res) {
     const prettyPrint = req.query.prettyprint === 'true';
     const unurlencode = req.query.unurlencode === 'true';
 
+    // Disable WebM progressive workaround (unused; kept for parity with old rows).
     const disableWebM = false;
     if (!videoId) {
         return res.status(400).send('Video ID is required');
@@ -368,61 +654,9 @@ function handleGetVideoInfo(req, res) {
     console.log('[REQUEST] GET /get_video_info');
     console.log('[REQUEST] video_id:', videoId);
     console.log('[yt-dlp] using version:', bundledYtDlpVersion);
+    console.log('[UPSTREAM] yt-dlp', videoId, buildYtDlpFlags());
 
-    // Prefer embedded TV/Android clients — they return the full adaptive format
-    // set (video-only H264/VP9/AV1 + audio-only m4a/webm/opus) that the TV
-    // player's custom streaming code requires. Plain `tv`, `android` and `web`
-    // currently yield only progressive itag 18 + storyboards, which produce the
-    // "This video format is not supported." error.
-    const ytdlpFlags = {
-        dumpSingleJson: true,
-        noWarnings: true,
-        quiet: true,
-        noCheckCertificates: true,
-        socketTimeout: 20,
-        retries: 3,
-        extractorArgs: 'youtube:player_client=tv_embedded,android_embedded',
-    };
-
-    // Optional cookies from settings.json:
-    //   "ytDlpCookies": "/path/to/cookies.txt"
-    //   or "ytDlpCookiesFromBrowser": "chrome"
-    if (settings.ytDlpCookies && fs.existsSync(settings.ytDlpCookies)) {
-        ytdlpFlags.cookies = settings.ytDlpCookies;
-        console.log('[yt-dlp] cookies file:', settings.ytDlpCookies);
-    } else if (settings.ytDlpCookiesFromBrowser) {
-        ytdlpFlags.cookiesFromBrowser = settings.ytDlpCookiesFromBrowser;
-        console.log('[yt-dlp] cookiesFromBrowser:', settings.ytDlpCookiesFromBrowser);
-    }
-
-    console.log('[UPSTREAM] yt-dlp', videoId, ytdlpFlags);
-
-    const maxAttempts = typeof settings.ytDlpMaxAttempts === 'number' ? settings.ytDlpMaxAttempts : 3;
-
-    async function extractWithRetry() {
-        let lastErr;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                return await youtubeDl(videoId, ytdlpFlags);
-            } catch (err) {
-                lastErr = err;
-                const message = err.stderr || err.message || String(err);
-                logger.warn('video-info', 'yt-dlp attempt failed', {
-                    video_id: videoId,
-                    attempt,
-                    max: maxAttempts,
-                    message: logger.truncateStderr(message),
-                });
-                console.error(`[yt-dlp] attempt ${attempt}/${maxAttempts} failed:`, logger.truncateStderr(message));
-                if (attempt < maxAttempts) {
-                    await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
-                }
-            }
-        }
-        throw lastErr;
-    }
-
-    extractWithRetry()
+    runYtDlp(videoId)
         .then(output => {
             //console.log('Video Info:', output);
 

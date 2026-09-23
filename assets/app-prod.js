@@ -6174,10 +6174,19 @@
         }
 
 
+        var ytTSeekConsumed = "";
         function Mg(a, b, c) {
             var e = Ld(c.Yb());
             if ("play" != e && "pause" != e) return !1;
-            "watch" == a.Ga().getName() && ("play" == e ? b.play() : b.pause(), c.Nc().Eo("t") && b.pf() && b.gj(Sf(c), !0));
+            if ("watch" == a.Ga().getName()) {
+                "play" == e ? b.play() : b.pause();
+                var t = c.Nc().Eo("t"),
+                    v = c.Nc().Eo("v");
+                if ("play" == e && t && b.pf() && v == a.kf("v")) {
+                    var k = v + "@" + t;
+                    ytTSeekConsumed == k || (ytTSeekConsumed = k, b.gj(Sf(c), !0))
+                }
+            }
             return !0
         }
         Mg.inject = ["applicationModel", "playerFacade"];

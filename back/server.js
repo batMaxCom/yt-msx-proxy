@@ -14,8 +14,14 @@ const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
 const { handleGetVideoInfo, handleStreamRequest } = require('./get_video_info');
 
-// may or may not be used I am just keeping it
-const { fetchLoungeTokenBatch } = require('./lounge_api');
+// tv_cast pairing / lounge endpoints
+const {
+    getLoungeTokenBatch,
+    generateScreenId,
+    getPairingCode,
+    registerPairingCode,
+    getLoungeDetails
+} = require('./lounge_api');
 
 const imageProxy = require('./image_proxy');
 
@@ -661,11 +667,18 @@ process.on('uncaughtException', (err) => {
     logger.error('process', 'Uncaught exception', {
         message: err && err.message ? String(err.message) : String(err),
         stack: err && err.stack ? String(err.stack).slice(0, 800) : undefined,
+        code: err && err.code ? String(err.code) : undefined,
     });
-    process.exit(1);
 });
 
-
-app.listen(port, bindAddr, () => {
+const mainServer = app.listen(port, bindAddr, () => {
     console.log(`Server running at http://` + serverIp + `:` + port);
+});
+
+mainServer.on('error', (err) => {
+    logger.error('process', 'Server listen error', {
+        message: err && err.message ? String(err.message) : String(err),
+        code: err && err.code ? String(err.code) : undefined,
+    });
+    console.error(`Server error on :${port}:`, err && err.message ? err.message : err);
 });

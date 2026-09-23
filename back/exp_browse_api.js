@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const logger = require('./logger');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 
@@ -49,23 +50,70 @@ async function fetchBrowseData(browseId, authHeader = null) {
     }
 
     try {
-        console.log('Sending request to YouTube Browse API with payload:', postData);
+        const t0 = Date.now();
+        logger.info('browse', 'BROWSE_REQUEST', {
+            browseId,
+            auth: !!authHeader,
+            clientName: postData.context.client.clientName,
+            clientVersion: postData.context.client.clientVersion,
+            url: apiUrl,
+        });
 
         const response = await axios.post(apiUrl, postData, { headers });
 
-        console.log('Received response from YouTube Browse API:', response.data);
+        const responseBytes = JSON.stringify(response.data).length;
+        logger.info('browse', 'BROWSE_RESPONSE', {
+            browseId,
+            status: response.status,
+            auth: !!authHeader,
+            bytes: responseBytes,
+            durationMs: Date.now() - t0,
+        });
 
         if (response.status !== 200) {
             console.error('Error: Received non-200 status from YouTube API:', response.status);
+            logger.error('browse', 'BROWSE_ERROR', {
+                browseId,
+                status: response.status,
+                reason: 'non-200 upstream status',
+            });
             return { error: `YouTube API returned status code ${response.status}` };
         }
 
-        let updatedData 
+        let updatedData;
 
-        if(browseId == "FEsubscriptions") {
+        if (browseId == "FEsubscriptions") {
             updatedData = convertSubscriptionsToV5(response.data, authHeader);
         } else {
             updatedData = convertToV5(response.data, browseId);
+        }
+
+        const summary = sectionSummaries(updatedData);
+        logger.info('browse', 'BROWSE_ADAPTED', {
+            browseId,
+            auth: !!authHeader,
+            shelves: summary.shelves,
+            cards: summary.cards,
+            kinds: summary.kinds.join(','),
+        });
+
+        const isHomeId = ["home", "FEtopics", "FEwhat_to_watch"].includes(browseId);
+
+        if (!authHeader && isHomeId && summary.shelves === 0) {
+            logger.warn('browse', 'BROWSE_HOME_EMPTY', {
+                browseId,
+                reason: 'unauthenticated home has no shelves',
+                kinds: summary.kinds.join(','),
+            });
+
+            updatedData = await fallbackHomeShelves();
+
+            const fallbackSummary = sectionSummaries(updatedData);
+            logger.info('browse', 'BROWSE_FALLBACK_DONE', {
+                browseId,
+                shelves: fallbackSummary.shelves,
+                cards: fallbackSummary.cards,
+            });
         }
 
         const logsDir = path.join(__dirname, 'logs');
@@ -86,17 +134,340 @@ async function fetchBrowseData(browseId, authHeader = null) {
     } catch (error) {
         console.error('Error fetching browse data:', error.message);
 
+        const isHomeId = ["home", "FEtopics", "FEwhat_to_watch"].includes(browseId);
+
+        if (!authHeader && isHomeId) {
+            logger.error('browse', 'BROWSE_ERROR_FALLBACK', {
+                browseId,
+                reason: error.message,
+            });
+
+            try {
+                const fallbackData = await fallbackHomeShelves();
+                const fallbackSummary = sectionSummaries(fallbackData);
+                logger.info('browse', 'BROWSE_FALLBACK_DONE', {
+                    browseId,
+                    shelves: fallbackSummary.shelves,
+                    cards: fallbackSummary.cards,
+                });
+                return fallbackData;
+            } catch (fallbackError) {
+                logger.error('browse', 'BROWSE_FALLBACK_ERROR', {
+                    browseId,
+                    reason: fallbackError.message,
+                });
+            }
+        }
+
         if (error.response) {
             console.error('Error Response:', error.response.data);
+            logger.error('browse', 'BROWSE_ERROR', {
+                browseId,
+                status: error.response.status,
+                reason: error.message,
+            });
             return { error: `Error from YouTube API: ${error.response.data}` };
         } else if (error.request) {
             console.error('No response received:', error.request);
+            logger.error('browse', 'BROWSE_ERROR', {
+                browseId,
+                reason: 'no response received',
+            });
             return { error: 'No response received from YouTube API.' };
         } else {
             console.error('General error:', error.message);
+            logger.error('browse', 'BROWSE_ERROR', {
+                browseId,
+                reason: error.message,
+            });
             return { error: `Failed to fetch data from YouTube Browse API: ${error.message}` };
         }
     }
+}
+
+const FALLBACK_SHELVES = [
+    ['Trending', 'trending videos'],
+    ['Popular', 'popular videos'],
+    ['Music', 'music videos'],
+    ['Gaming', 'gaming videos'],
+    ['News', 'breaking news'],
+];
+
+function textOf(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (value.simpleText) return value.simpleText;
+    if (value.content) return value.content;
+    if (Array.isArray(value.runs)) return value.runs.map(r => r.text || '').join('');
+    return '';
+}
+
+function thumbnailsFor(videoId) {
+    return [
+        { url: `https://i.ytimg.com/vi/${videoId}/default.jpg`, width: 120, height: 90 },
+        { url: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`, width: 320, height: 180 },
+        { url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, width: 480, height: 360 },
+        { url: `https://i.ytimg.com/vi/${videoId}/sddefault.jpg`, width: 640, height: 480 },
+        { url: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`, width: 1920, height: 1080 }
+    ];
+}
+
+function lockupMetadataParts(lockup) {
+    const rows = lockup?.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
+    let channel = '';
+    let views = '';
+    let published = '';
+
+    if (rows[0]) {
+        channel = textOf(rows[0]?.metadataParts?.[0]?.text) || '';
+    }
+
+    if (rows[1]) {
+        for (const part of rows[1].metadataParts || []) {
+            const t = textOf(part.text);
+            if (!t) continue;
+            if (/view/i.test(t)) {
+                if (!views) views = t;
+            } else if (/ago|yesterday|hour|week|day|month|year|недел|час|день|год/i.test(t)) {
+                published = t;
+            } else if (!views) {
+                views = t;
+            }
+        }
+    }
+
+    if (!channel) {
+        channel = textOf(lockup?.rendererContext?.commandContext?.onLongPress?.innertubeCommand?.showMenuCommand?.subtitle) || 'Unknown Channel';
+    }
+
+    return { channel, views: views || '0 views', published: published || '' };
+}
+
+function lockupLength(lockup) {
+    for (const overlay of lockup?.contentImage?.thumbnailViewModel?.overlays || []) {
+        for (const badge of overlay?.thumbnailBottomOverlayViewModel?.badges || []) {
+            const t = badge?.thumbnailBadgeViewModel?.text;
+            if (t) return t;
+        }
+        const ts = overlay?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText;
+        if (ts) return ts;
+    }
+    return '';
+}
+
+function lockupBrowseId(lockup) {
+    for (const item of lockup?.rendererContext?.commandContext?.onLongPress?.innertubeCommand?.showMenuCommand?.menu?.menuRenderer?.items || []) {
+        const bid = item?.menuNavigationItemRenderer?.navigationEndpoint?.browseEndpoint?.browseId;
+        if (bid) return bid;
+    }
+    return null;
+}
+
+function lockupToGridVideoRenderer(lockup) {
+    if (!lockup) return null;
+
+    const cmd = lockup?.rendererContext?.commandContext?.onTap?.innertubeCommand;
+    const watchVideoId = cmd?.watchEndpoint?.videoId;
+    const videoId = watchVideoId || (lockup.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO' ? lockup.contentId : null);
+    if (!videoId) return null;
+
+    const title = textOf(lockup?.metadata?.lockupMetadataViewModel?.title) ||
+        textOf(lockup?.rendererContext?.commandContext?.onLongPress?.innertubeCommand?.showMenuCommand?.title) ||
+        'Untitled';
+
+    const { channel, views, published } = lockupMetadataParts(lockup);
+    const lengthText = lockupLength(lockup) || '0:00';
+    const browseId = lockupBrowseId(lockup) || `UC_unknown_${videoId}`;
+
+    const watchEndpoint = cmd?.watchEndpoint || { videoId };
+
+    return {
+        videoId,
+        thumbnail: { thumbnails: thumbnailsFor(videoId) },
+        title: { runs: [{ text: title }] },
+        publishedTimeText: { runs: [{ text: published }] },
+        viewCountText: { runs: [{ text: views }] },
+        lengthText: {
+            runs: [{ text: lengthText }],
+            accessibility: { accessibilityData: { label: lengthText } }
+        },
+        navigationEndpoint: {
+            clickTrackingParams: cmd?.clickTrackingParams || '',
+            watchEndpoint: {
+                videoId,
+                params: watchEndpoint.params || '',
+                playerParams: watchEndpoint.playerParams || ''
+            }
+        },
+        shortBylineText: {
+            runs: [{
+                text: channel,
+                navigationEndpoint: {
+                    clickTrackingParams: cmd?.clickTrackingParams || '',
+                    browseEndpoint: {
+                        browseId,
+                        canonicalBaseUrl: `/channel/${browseId}`
+                    }
+                }
+            }]
+        }
+    };
+}
+
+function videoRendererToGridVideoRenderer(vr) {
+    if (!vr || !vr.videoId) return null;
+
+    const runsText = v => (Array.isArray(v?.runs) ? v.runs.map(r => r.text || '').join('') : (v?.simpleText || ''));
+
+    const titleRuns = Array.isArray(vr.title?.runs) ? vr.title.runs : [{ text: vr.title?.simpleText || 'Untitled' }];
+    const bylineRuns = vr.ownerText?.runs || vr.shortBylineText?.runs || [{ text: 'Unknown Channel' }];
+    const lengthText = runsText(vr.lengthText) || '0:00';
+
+    return {
+        videoId: vr.videoId,
+        thumbnail: vr.thumbnail || { thumbnails: thumbnailsFor(vr.videoId) },
+        title: titleRuns,
+        publishedTimeText: vr.publishedTimeText || { runs: [{ text: runsText(vr.publishedTimeText) }] },
+        viewCountText: vr.viewCountText || { runs: [{ text: runsText(vr.viewCountText) }] },
+        lengthText: {
+            runs: [{ text: lengthText }],
+            accessibility: { accessibilityData: { label: lengthText } }
+        },
+        navigationEndpoint: vr.navigationEndpoint || { watchEndpoint: { videoId: vr.videoId } },
+        shortBylineText: { runs: bylineRuns }
+    };
+}
+
+function searchItemToGridVideoRenderer(item) {
+    if (!item || typeof item !== 'object') return null;
+    if (item.adSlotRenderer) return null;
+    if (item.lockupViewModel) return lockupToGridVideoRenderer(item.lockupViewModel);
+    if (item.videoRenderer) return videoRendererToGridVideoRenderer(item.videoRenderer);
+    return null;
+}
+
+function sectionSummaries(data) {
+    const contents = data?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer?.contents;
+    const result = { shelves: 0, cards: 0, kinds: [] };
+    if (!Array.isArray(contents)) return result;
+
+    for (const item of contents) {
+        if (!item || typeof item !== 'object') continue;
+        const kind = Object.keys(item)[0] || '';
+        result.kinds.push(kind);
+
+        const renderer = item.shelfRenderer || item.pivotShelfRenderer;
+        if (!renderer) continue;
+        result.shelves += 1;
+
+        const list = renderer.content?.horizontalListRenderer?.items ||
+            renderer.content?.pivotHorizontalListRenderer?.items ||
+            renderer.content?.tvSubscriptionsListRenderer?.items ||
+            renderer.content?.fakeSubsListRenderer?.items;
+        if (Array.isArray(list)) {
+            result.cards += list.length;
+        }
+    }
+    return result;
+}
+
+async function searchShelves(query) {
+    const apiUrl = 'https://www.googleapis.com/youtubei/v1/search?key=AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
+    const postData = {
+        query,
+        context: {
+            client: {
+                clientName: 'TVHTML5',
+                clientVersion: '7.20250205.16.00',
+                hl: 'en',
+                gl: 'US',
+            }
+        }
+    };
+
+    const response = await axios.post(apiUrl, postData, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 60000
+    });
+
+    if (response.status !== 200) {
+        logger.error('browse', 'BROWSE_FALLBACK_QUERY_ERROR', { query, status: response.status });
+        return [];
+    }
+
+    const sections = response.data?.contents?.sectionListRenderer?.contents || [];
+    const items = [];
+
+    for (const section of sections) {
+        const list = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
+        if (Array.isArray(list)) items.push(...list);
+    }
+
+    const cards = [];
+    for (const item of items) {
+        const card = searchItemToGridVideoRenderer(item);
+        if (card) cards.push({ gridVideoRenderer: card });
+        if (cards.length >= 12) break;
+    }
+
+    logger.info('browse', 'BROWSE_FALLBACK_QUERY_DONE', {
+        query,
+        cards: cards.length,
+    });
+
+    return cards;
+}
+
+async function fallbackHomeShelves() {
+    const results = await Promise.all(FALLBACK_SHELVES.map(async ([label, query]) => {
+        try {
+            const cards = await searchShelves(query);
+            if (cards.length === 0) {
+                logger.warn('browse', 'BROWSE_FALLBACK_EMPTY', { query });
+                return null;
+            }
+            return {
+                shelfRenderer: {
+                    content: {
+                        horizontalListRenderer: {
+                            items: cards,
+                            collapsedItemCount: cards.length,
+                            visibleItemCount: cards.length
+                        }
+                    },
+                    title: { runs: [{ text: label }] }
+                }
+            };
+        } catch (error) {
+            logger.error('browse', 'BROWSE_FALLBACK_QUERY_ERROR', {
+                query,
+                reason: error.message,
+            });
+            return null;
+        }
+    }));
+
+    const shelves = results.filter(Boolean);
+
+    logger.info('browse', 'BROWSE_FALLBACK_DONE', {
+        shelves: shelves.length,
+    });
+
+    return {
+        contents: {
+            tvBrowseRenderer: {
+                content: {
+                    tvSurfaceContentRenderer: {
+                        content: {
+                            sectionListRenderer: {
+                                contents: shelves
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
 }
 
 async function fetchBrowseContinuationsForSubs(continuationCode, authHeader = null) {

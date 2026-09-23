@@ -8840,6 +8840,7 @@
               console.error("Video element not found!");
               return;
             }
+            var nrInstance = this;
             videoElement.src = URL.createObjectURL(this.o);
             console.log("Assigned MediaSource to video element:", videoElement.src);
           
@@ -8895,11 +8896,28 @@
                 var maxBufferAhead = 60; // seconds maximum buffered ahead
                 var removalMargin = 30;  // seconds to keep behind currentTime
                 var isLoading = false;
+                var streamFailed = false;
                 var pendingAppends = [];
                 var seekAlignUrl = null;
+
+                function notifyStreamTerminal(statusCode) {
+                  streamFailed = true;
+                  try {
+                    __ytclientlog("STREAM_FAILED", { type: type, status: statusCode || null, range: String(rangeStart), retry: false, reason: 'retries_exhausted', chunk: chunkSize });
+                  } catch (eLog) {}
+                  try {
+                    if (type === 'video' && nrInstance && !nrInstance.__ytStreamFailedReported) {
+                      nrInstance.__ytStreamFailedReported = true;
+                      if (nrInstance.D) {
+                        nrInstance.D({ name: 'NetworkError', message: 'Stream failed after retries (' + type + ')' });
+                      }
+                    }
+                  } catch (eFail) {}
+                }
           
                 function loadSegment(retryCount) {
                   // Ensure MediaSource is still open.
+                  if (streamFailed) return;
                   if (mediaSource.readyState !== "open") {
                     console.warn("MediaSource is no longer open. Aborting segment load.");
                     return;
@@ -8967,7 +8985,7 @@
                     return;
                   }
           
-                  isLoading = true;
+isLoading = true;
                   var xhr = new XMLHttpRequest();
                   var reqUrl = url;
                   if (seekAlignUrl) {
@@ -8976,9 +8994,11 @@
                   xhr.open('GET', reqUrl, true);
                   xhr.setRequestHeader('Range', `bytes=${rangeStart}-${rangeEnd}`);
                   xhr.responseType = 'arraybuffer';
-          
+                  xhr.timeout = 30000;
+
                   xhr.onload = function() {
                     isLoading = false;
+                    if (streamFailed) return;
                     if (xhr.status >= 200 && xhr.status < 300) {
                       var data = xhr.response;
                       console.log(`Segment received: ${rangeStart}-${rangeEnd}`);
@@ -8986,25 +9006,40 @@
                         appendSegment(data, xhr);
                       } else {
                         console.error(`Invalid data for range: ${rangeStart}-${rangeEnd}`);
-                        if (retryCount > 0) loadSegment(retryCount - 1);
+                        if (retryCount > 0) retrySegmentLoad(retryCount);
+                        else notifyStreamTerminal(xhr.status);
                       }
                     } else {
                       console.error(`Failed to fetch segment, status: ${xhr.status}`);
-                      if (retryCount > 0) setTimeout(() => loadSegment(retryCount - 1), 1000);
+                      if (retryCount > 0) retrySegmentLoad(retryCount);
+                      else notifyStreamTerminal(xhr.status);
                     }
                   };
-          
+
                   xhr.onerror = function() {
                     isLoading = false;
                     console.error("Error fetching segment:", xhr.statusText);
-                    if (retryCount > 0) {
-                      setTimeout(() => loadSegment(retryCount - 1), 2000);
-                    }
+                    if (retryCount > 0) retrySegmentLoad(retryCount);
+                    else notifyStreamTerminal(null);
                   };
-          
+
+                  xhr.ontimeout = function() {
+                    isLoading = false;
+                    console.error("Segment fetch timed out:", rangeStart);
+                    if (retryCount > 0) retrySegmentLoad(retryCount);
+                    else notifyStreamTerminal(null);
+                  };
+
                   xhr.send();
                 }
           
+                function retrySegmentLoad(remaining) {
+                  try {
+                    __ytclientlog("STREAM_RETRY", { type: type, range: String(rangeStart), retry: true, attempts_left: remaining });
+                  } catch (eLogR) {}
+                  setTimeout(() => loadSegment(remaining - 1), 1500);
+                }
+
                 function appendSegment(data, xhr) {
                   // Ensure MediaSource is still open.
                   if (mediaSource.readyState !== "open") {
@@ -9045,7 +9080,10 @@
                     setTimeout(loadSegment, delay);
                   } catch (e) {
                     console.error("Error appending segment:", e);
-                    setTimeout(loadSegment, 1000);
+                    if (!streamFailed) {
+                      if (retryCount > 0) retrySegmentLoad(retryCount);
+                      else notifyStreamTerminal(null);
+                    }
                   }
                 }
           
@@ -9113,7 +9151,7 @@
                       var bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
                       var bufferedAhead = bufferedEnd - currentTime;
                       console.log(`Buffer status: ${bufferedAhead.toFixed(2)} sec ahead`);
-                      if (bufferedAhead < minBufferAhead && !isPaused && !isSeeking && !isLoading) {
+                      if (bufferedAhead < minBufferAhead && !isPaused && !isSeeking && !isLoading && !streamFailed) {
                         console.log("Buffer running low, triggering load");
                         loadSegment(5);
                       }
@@ -9875,6 +9913,7 @@
                 a.spacecastModule = !0);
             c.spacecast_addrs && (a.sa = c.spacecast_addrs.split(","), a.spacecastModule = !0);
             0 < a.startSeconds || (a.startSeconds = lq(a.startSeconds, c.start || c.startSeconds));
+            try { if (0 < a.startSeconds) __ytclientlog("TEMP_DIAG_startSeconds", { s: a.startSeconds, cstart: c.start, cstartSeconds: c.startSeconds, resume: c.resume, hash: (window.location.hash || "").slice(0, 200) }); } catch (err1) {}
             void 0 == c.start || "1" == c.resume || a.ma || (a.clipStart = c.start);
             c.two_stage_token && (a.Ug = c.two_stage_token);
             c.url_encoded_third_party_media && (a.Kd = gj(c.url_encoded_third_party_media));
@@ -17975,10 +18014,15 @@
         function UB(a, meidaLinks) {
             if (!a.H) {
                 try {
+                    var ubfStart = a.b.startSeconds;
                     if (a.B) {
                         a.B.seek(a.getCurrentTime());
                     } else {
                         EB(a);
+                    }
+                    if (0 < ubfStart) {
+                        try { __ytclientlog("TEMP_DIAG_customStartDropped", { s: ubfStart, hash: (window.location.hash || "").slice(0, 200) }); } catch (errSF) {}
+                        a.b.startSeconds = 0;
                     }
 
 
@@ -18324,6 +18368,7 @@
                         this.D.ze();
                         break;
                     case "loadedmetadata":
+                        try { if (this.b.startSeconds) __ytclientlog("TEMP_DIAG_seekToStart", { s: this.b.startSeconds, hash: (window.location.hash || "").slice(0, 200) }); } catch (errD) {}
                         this.b.startSeconds && (0 < (this.g.b.seekable || Px()).length ? this.M.experiments.b("new_ended_replay") ? this.seekTo(this.b.startSeconds, !0) : this.g.b.currentTime = this.b.startSeconds : (this.aa = this.b.startSeconds,
                             this.pauseVideo(!0)));
                     case "loadstart":
