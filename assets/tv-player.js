@@ -8899,9 +8899,11 @@
                 var streamFailed = false;
                 var pendingAppends = [];
                 var seekAlignUrl = null;
+                var bufferWatchdog = null;
 
                 function notifyStreamTerminal(statusCode) {
                   streamFailed = true;
+                  if (bufferWatchdog) { clearInterval(bufferWatchdog); bufferWatchdog = null; }
                   try {
                     __ytclientlog("STREAM_FAILED", { type: type, status: statusCode || null, range: String(rangeStart), retry: false, reason: 'retries_exhausted', chunk: chunkSize });
                   } catch (eLog) {}
@@ -9145,7 +9147,8 @@ isLoading = true;
 
                 if (type === 'video') {
 
-                  setInterval(() => {
+                  bufferWatchdog = setInterval(() => {
+                    try {
                     if (sourceBuffer.buffered.length > 0) {
                       var currentTime = videoElement.currentTime;
                       var bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
@@ -9155,6 +9158,9 @@ isLoading = true;
                         console.log("Buffer running low, triggering load");
                         loadSegment(5);
                       }
+                    }
+                    } catch (eWatchdog) {
+                      if (bufferWatchdog) { clearInterval(bufferWatchdog); bufferWatchdog = null; }
                     }
                   }, 1000);
                 }
