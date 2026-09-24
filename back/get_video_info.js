@@ -825,6 +825,7 @@ function handleGetVideoInfo(req, res) {
                 hlsParams.append('fps', 'unknown');
                 hlsParams.append('size', '640x360');
                 hlsParams.append('bitrate', 'unknown');
+                hlsParams.append('type', 'application/x-mpegURL');
                 adaptiveFmts.push(hlsParams.toString());
                 logger.info('video-info', 'HLS available', {
                     video_id: videoIdFromOutput,
