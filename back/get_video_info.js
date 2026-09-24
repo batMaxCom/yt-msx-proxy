@@ -53,6 +53,9 @@ const hlsMap = new Map();          // videoId -> { video:{url,expiresAt}, audio:
 const STREAM_DIR = path.join(__dirname, 'streams');
 const streamDownloadLocks = new Map(); // streamId -> Promise (single-flight fill)
 const STREAM_CACHE_MAX_MB = 2000;
+const MAX_STREAM_FILLS = 2;         // concurrent background fills (upstream-friendly)
+const fillQueue = [];
+let activeStreamFills = 0;
 try { fs.mkdirSync(STREAM_DIR, { recursive: true }); } catch (e) { }
 
 function pruneStreamCache() {
@@ -76,36 +79,75 @@ function pruneStreamCache() {
 }
 
 function downloadStreamToFile(streamId, url) {
-    if (streamDownloadLocks.has(streamId)) return streamDownloadLocks.get(streamId);
     const dest = path.join(STREAM_DIR, streamId + '.webm');
-    if (fs.existsSync(dest)) {
-        return Promise.resolve();
-    }
+    if (fs.existsSync(dest)) return Promise.resolve(streamId);
+    if (streamDownloadLocks.has(streamId)) return streamDownloadLocks.get(streamId);
     const part = path.join(STREAM_DIR, streamId + '.part');
-    const p = (async () => {
-        const resp = await axios.get(url, {
-            responseType: 'arraybuffer',
-            timeout: 120000,
-            maxRedirects: 5,
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)' },
-        });
-        const buf = Buffer.from(resp.data);
-        if (!buf.length) throw new Error('empty body');
-        fs.writeFileSync(part, buf);
-        try { fs.renameSync(part, dest); } catch (e) { fs.writeFileSync(dest, buf); }
-        logger.info('stream', 'STREAM_CACHE_FILLED', { stream_id: streamId, bytes: buf.length });
-    })().catch(err => {
-        logger.warn('stream', 'STREAM_CACHE_DOWNLOAD_FAIL', {
-            stream_id: streamId,
-            message: String(err.message || err).slice(0, 200),
-        });
-    }).finally(() => {
-        try { fs.unlinkSync(part); } catch (e) { }
-        streamDownloadLocks.delete(streamId);
-        pruneStreamCache();
+    const p = new Promise(resolve => {
+        const start = () => {
+            activeStreamFills += 1;
+            (async () => {
+                const resp = await axios.get(url, {
+                    responseType: 'arraybuffer',
+                    timeout: 120000,
+                    maxRedirects: 5,
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)' },
+                });
+                const buf = Buffer.from(resp.data);
+                if (!buf.length) throw new Error('empty body');
+                fs.writeFileSync(part, buf);
+                try { fs.renameSync(part, dest); } catch (e) { fs.writeFileSync(dest, buf); }
+                logger.info('stream', 'STREAM_CACHE_FILLED', { stream_id: streamId, bytes: buf.length });
+            })().catch(err => {
+                logger.warn('stream', 'STREAM_CACHE_DOWNLOAD_FAIL', {
+                    stream_id: streamId,
+                    message: String(err.message || err).slice(0, 200),
+                });
+            }).finally(() => {
+                try { fs.unlinkSync(part); } catch (e) { }
+                streamDownloadLocks.delete(streamId);
+                activeStreamFills -= 1;
+                pumpStreamFills();
+                pruneStreamCache();
+                resolve(streamId);
+            });
+        };
+        if (activeStreamFills >= MAX_STREAM_FILLS) fillQueue.push(start);
+        else start();
     });
     streamDownloadLocks.set(streamId, p);
     return p;
+}
+
+function pumpStreamFills() {
+    while (activeStreamFills < MAX_STREAM_FILLS && fillQueue.length) {
+        const next = fillQueue.shift();
+        next();
+    }
+}
+
+// Pre-warm the disk cache for the webm formats the player actually uses
+// (smallest itag video + smallest itag audio), so a first click doesn't wait
+// for the upstream-throttled download.
+function warmBestWebm(videoId, formats) {
+    if (!Array.isArray(formats)) return;
+    let bestVideo = null;
+    let bestAudio = null;
+    for (const f of formats) {
+        if (!f || !f.url || !f.format_id) continue;
+        const mime = (f.mime || f.type || '').split(';')[0];
+        if (mime === 'video/webm') {
+            const it = parseInt(f.format_id, 10);
+            if (isNaN(it)) continue;
+            if (!bestVideo || it < parseInt(bestVideo.format_id, 10)) bestVideo = f;
+        } else if (mime === 'audio/webm') {
+            const it = parseInt(f.format_id, 10);
+            if (isNaN(it)) continue;
+            if (!bestAudio || it < parseInt(bestAudio.format_id, 10)) bestAudio = f;
+        }
+    }
+    if (bestVideo) downloadStreamToFile(`${videoId}_${bestVideo.format_id}`, bestVideo.url);
+    if (bestAudio) downloadStreamToFile(`${videoId}_${bestAudio.format_id}`, bestAudio.url);
 }
 
 function parseExpireSeconds(url) {
@@ -787,6 +829,10 @@ function handleGetVideoInfo(req, res) {
                 duration: videoDuration,
                 formats_total: output.formats ? output.formats.length : 0,
             });
+
+            // Kick the disk-cache fill for the webm formats the player will
+            // request, so a first play doesn't wait on the throttled upstream.
+            try { warmBestWebm(videoId, output.formats); } catch (e) { }
 
             const adaptiveFmts = [];
             const fmtListArr = [];

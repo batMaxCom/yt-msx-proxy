@@ -52,7 +52,10 @@
     }
 
     function nativeHlsOk(el) {
-        if (isTV) return true;
+        // On TV prefer MSE-webm whenever the (Chromium-based) WAM supports it,
+        // because the synthesized LL-HLS media playlists are flaky upstream.
+        // Fall back to native HLS only when MediaSource is unavailable.
+        if (isTV) return !mseOk('video/webm; codecs="vp9"');
         try {
             if (el.canPlayType('application/vnd.apple.mpegurl') === 'probably') return true;
             if (el.canPlayType('application/x-mpegurl') === 'probably') return true;
@@ -146,8 +149,8 @@
             var el = self.conf.el;
             var rs = el.readyState;
             try { beacon('WEBM_KICK', { rs: rs, t: Math.round((el.currentTime || 0) * 10) / 10, b: el.buffered && el.buffered.length ? +el.buffered.end(el.buffered.length - 1).toFixed(1) : -1 }); } catch (e) { }
-            // once the decoder actually opened, stop kicking
-            if (rs >= 2) return;
+            // once the decoder actually opened, stop kicking and hide the extra element
+            if (rs >= 2) { hideFrameworkEl(); return; }
             var p = el.play();
             if (p && p.catch) p.catch(function () { });
             if (tries++ < 10) setTimeout(kick, 2500);
@@ -240,11 +243,17 @@
         var parent = (host && host.parentElement) || (global.document && global.document.body);
         var vid = global.document.createElement('video');
         vid.setAttribute('playsinline', '');
-        vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:20;background:#000;';
-        if (host) { try { host.style.visibility = 'hidden'; } catch (e) { } }
+        // Transparent until the first frame decodes, so the framework's own
+        // bootstrap (poster/spinner) stays visible below instead of a black box.
+        vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:2147483000;pointer-events:none;background:transparent;';
         if (parent) { try { parent.appendChild(vid); } catch (e) { } }
         beacon('CP_OWNEL', {});
         return vid;
+    }
+
+    function hideFrameworkEl() {
+        var host = global.document && global.document.querySelector('.html5-main-video');
+        if (host) { try { host.style.visibility = 'hidden'; } catch (e) { } }
     }
 
     function dropOwnEl(ownEl) {
