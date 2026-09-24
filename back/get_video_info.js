@@ -814,9 +814,10 @@ function handleGetVideoInfo(req, res) {
             const hlsEntry = buildHlsEntry(videoIdFromOutput, output.formats);
             if (hlsEntry) {
                 hlsMap.set(videoIdFromOutput, hlsEntry);
-                hlsUrl = `/api/hls/${videoIdFromOutput}`;
+                hlsUrl = hlsPathFor(videoIdFromOutput, req);
                 const hlsParams = new URLSearchParams();
                 hlsParams.append('url', hlsUrl);
+                hlsParams.append('mime', 'application/x-mpegURL');
                 hlsParams.append('itag', 'hls');
                 hlsParams.append('clen', 'unknown');
                 hlsParams.append('lmt', 'unknown');
@@ -824,7 +825,6 @@ function handleGetVideoInfo(req, res) {
                 hlsParams.append('fps', 'unknown');
                 hlsParams.append('size', '640x360');
                 hlsParams.append('bitrate', 'unknown');
-                hlsParams.append('type', 'application/x-mpegURL');
                 adaptiveFmts.push(hlsParams.toString());
                 logger.info('video-info', 'HLS available', {
                     video_id: videoIdFromOutput,
@@ -958,6 +958,11 @@ function handleGetVideoInfo(req, res) {
                 `Failed to fetch video info via yt-dlp (${bundledYtDlpVersion}): ${message}`
             );
         });
+}
+
+function hlsPathFor(videoId, req) {
+    const host = (req && req.headers && req.headers.host) || `${serverIp}:8090`;
+    return `http://${host}/api/hls/${videoId}?mime=application/x-mpegURL&itag=hls`;
 }
 
 function buildHlsEntry(videoId, formats) {

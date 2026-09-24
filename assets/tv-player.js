@@ -8813,6 +8813,11 @@
                 x.open("POST", "/api/client-log", true);
                 x.setRequestHeader("Content-Type", "application/json");
                 x.send(JSON.stringify(payload));
+                try {
+                    var g = new XMLHttpRequest();
+                    g.open("GET", "/gen_204?cl=" + encodeURIComponent(JSON.stringify(payload).slice(0, 700)), true);
+                    g.send();
+                } catch (eG) {}
             } catch (e) {}
         }
 
@@ -8835,7 +8840,7 @@
               }
               if (!progLink) {
                 for (var pj = 0; pj < mediaLinks.length; pj++) {
-                  if (mediaLinks[pj] && mediaLinks[pj].url && mediaLinks[pj].type === 'application/x-mpegURL') {
+                  if (mediaLinks[pj] && mediaLinks[pj].url && (mediaLinks[pj].type === 'application/x-mpegURL' || /\/api\/hls\//.test(mediaLinks[pj].url))) {
                     progLink = mediaLinks[pj];
                     break;
                   }
@@ -10058,7 +10063,40 @@ isLoading = true;
         };
 
         function Ns(a) {
-            Rs(a) || (a.adaptiveFormats && !a.ma ? (a.b = ap(Ss(a, a.adaptiveFormats), a.Rg, a.lengthSeconds), L(a, a.b), Zo(a.b) && (a.L = !0)) : a.F && (a.N = !0))
+            var noMse = Rs(a);
+            var hlsOnly = false;
+            if (noMse) {
+                hlsOnly = !!(a.adaptiveFormats && !a.ma && /x-mpegURL/.test(String(a.adaptiveFormats)));
+                try {
+                    __ytclientlog("NS_DIAG", { ms: !!window.MediaSource, hlsOnly: hlsOnly, af: !!(a.adaptiveFormats && String(a.adaptiveFormats).length), forced: noMse });
+                } catch (eNs) {}
+            }
+            if ((!noMse || hlsOnly) && a.adaptiveFormats && !a.ma) {
+                a.b = ap(Ss(a, a.adaptiveFormats), a.Rg, a.lengthSeconds);
+                if (hlsOnly) {
+                    try {
+                        // No MediaSource (e.g. WebOS). Synthesize a minimal format container so the
+                        // framework's Ps()/videoInfos gates pass and our custom Nr player drives
+                        // native <video> playback through the /api/hls proxy instead of Flash.
+                        a.b.g = {
+                            videoInfos: [{ mimeType: "application/x-mpegURL", video: { projectionType: 0 }, audioTrack: null }],
+                            b: [{ qb: { id: "aac", name: "audio" }, name: "audio" }],
+                            audioTracks: [],
+                            g: null
+                        };
+                        a.b.b = a.b.b || {};
+                        if (!Object.keys(a.b.b).length) {
+                            a.b.b["0"] = { info: { id: "hls", mimeType: "application/x-mpegURL", video: null, audio: null } };
+                        }
+                    } catch (eNs2) {
+                        try { __ytclientlog("NS_SYNTH_FAIL", { m: String(eNs2.message || eNs2) }); } catch (eNs3) {}
+                    }
+                }
+                L(a, a.b);
+                Zo(a.b) && (a.L = !0)
+            } else if (noMse) {
+                a.F && (a.N = !0)
+            }
         }
 
         function Ts(a) {
