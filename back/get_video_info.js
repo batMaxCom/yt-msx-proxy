@@ -97,12 +97,37 @@ async function runYtDlp(videoId) {
     throw lastErr;
 }
 
+// ---- yt-dlp metadata cache: never hammer YouTube with duplicate lookups ----
+const gviCache = new Map();      // videoId -> { output, fetchedAt }
+const gviInflight = new Map();   // videoId -> Promise (single-flight)
+const GVI_TTL_MS = 20 * 60 * 1000; // 20 min
+
+async function getVideoInfoCached(videoId) {
+    const hit = gviCache.get(videoId);
+    if (hit && Date.now() - hit.fetchedAt < GVI_TTL_MS) {
+        return hit.output;
+    }
+    if (gviInflight.has(videoId)) return gviInflight.get(videoId);
+    const p = runYtDlp(videoId)
+        .then(output => {
+            gviCache.set(videoId, { output, fetchedAt: Date.now() });
+            gviInflight.delete(videoId);
+            return output;
+        })
+        .catch(err => {
+            gviInflight.delete(videoId);
+            throw err;
+        });
+    gviInflight.set(videoId, p);
+    return p;
+}
+
 async function refreshStreamUrl(streamId) {
     if (refreshLocks.has(streamId)) return refreshLocks.get(streamId);
     const promise = (async () => {
         const entry = streamMap.get(streamId);
         if (!entry) throw new Error('Stream entry missing');
-        const output = await runYtDlp(entry.videoId);
+        const output = await getVideoInfoCached(entry.videoId);
         storeStreamUrls(entry.videoId, output.formats || []);
         const fresh = streamMap.get(streamId);
         if (!fresh) throw new Error('Format disappeared after refresh');
@@ -657,7 +682,7 @@ function handleGetVideoInfo(req, res) {
     console.log('[yt-dlp] using version:', bundledYtDlpVersion);
     console.log('[UPSTREAM] yt-dlp', videoId, buildYtDlpFlags());
 
-    runYtDlp(videoId)
+    getVideoInfoCached(videoId)
         .then(output => {
             //console.log('Video Info:', output);
 
@@ -1045,7 +1070,7 @@ async function handleHlsRequest(req, res) {
         let entry = hlsMap.get(videoId);
         if (!entry || (entry.expiresAt && Date.now() > entry.expiresAt)) {
             logger.warn('hls', 'refreshing yt-dlp for HLS', { video_id: videoId });
-            const output = await runYtDlp(videoId);
+            const output = await getVideoInfoCached(videoId);
             const fresh = buildHlsEntry(videoId, output.formats || []);
             if (!fresh) {
                 return res.status(404).send('No HLS variants available');

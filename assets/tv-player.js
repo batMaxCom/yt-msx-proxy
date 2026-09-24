@@ -8849,6 +8849,30 @@
                   console.log("Progressive itag 18 missing; using proxied HLS playlist.");
                 }
               }
+
+              // ===== CustomVideoPlayer takeover =====
+              // We own playback: delegate to the standalone player module and
+              // stop the built-in MSE/progressive logic entirely.
+              if (window.YTCustomPlayer) {
+                try {
+                    var customVideoElement = document.querySelector('.html5-main-video');
+                    var customVideoId = (window.location.hash.match(/v=([\w-]{6,16})/) || [])[1] || "";
+                    var customStarted = window.YTCustomPlayer.start({
+                      id: customVideoId,
+                      el: customVideoElement,
+                      mediaLinks: mediaLinks || [],
+                      progLink: progLink || null,
+                      hlsUrl: customVideoId ? (window.location.origin + "/api/hls/" + customVideoId) : (progLink && progLink.url ? progLink.url : null)
+                    });
+                    if (customStarted) {
+                      console.log("CustomVideoPlayer took over playback for", customVideoId);
+                      return;
+                    }
+                  } catch (errCP) {
+                    console.error("CustomVideoPlayer failed to start, falling back:", errCP);
+                  }
+              }
+              // ======================================
             }
             var msePlayable;
             try {
@@ -10073,11 +10097,12 @@ isLoading = true;
             }
             if ((!noMse || hlsOnly) && a.adaptiveFormats && !a.ma) {
                 a.b = ap(Ss(a, a.adaptiveFormats), a.Rg, a.lengthSeconds);
-                if (hlsOnly) {
+                if (hlsOnly || window.YTCustomPlayer) {
                     try {
-                        // No MediaSource (e.g. WebOS). Synthesize a minimal format container so the
-                        // framework's Ps()/videoInfos gates pass and our custom Nr player drives
-                        // native <video> playback through the /api/hls proxy instead of Flash.
+                        // CustomVideoPlayer present (or no MediaSource e.g. WebOS):
+                        // synth a minimal format container so framework gates
+                        // (Ps()/videoInfos and a.b.g.b) pass and our Nr
+                        // delegation drives playback instead of Flash/empty-MSE.
                         a.b.g = {
                             videoInfos: [{ mimeType: "application/x-mpegURL", video: { projectionType: 0 }, audioTrack: null }],
                             b: [{ qb: { id: "aac", name: "audio" }, name: "audio" }],
@@ -17780,6 +17805,16 @@ isLoading = true;
         }
 
         function Lu(a, b, c, d) {
+            // CustomVideoPlayer: the Flash-era fallback effectively never shows.
+            // Swallow every "Flash required / no formats" error so the built-in
+            // error dialog + player reset is skipped; our own player handles it.
+            try {
+                var __luKey = String(c || '');
+                if (-1 !== __luKey.indexOf('FLASH') || -1 !== __luKey.indexOf('noneavailable') || 'fmt.unplayable' === String(b)) {
+                    try { __ytclientlog("CP_FLASH_SWALLOWED", { key: __luKey.slice(0, 60), hash: (window.location.hash || "").slice(0, 160) }); } catch (eS1) {}
+                    return;
+                }
+            } catch (eS0) {}
             var e, f;
             Yb(Ct, c) ? e = c : c ? f = c : e = "YTP_ERROR_GENERIC_WITHOUT_LINK";
             b = {
