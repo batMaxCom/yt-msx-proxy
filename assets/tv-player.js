@@ -8861,10 +8861,18 @@
                 return;
               }
           
+              var __ytMp4Mode = false;
               var videoData = getBestVideoUrl(mediaLinks);
               var audioData = getAudioUrl(mediaLinks);
+              if (!videoData || !audioData) {
+                console.error("No playable media formats available on this device; skipping custom playback.");
+                try { __ytclientlog("STREAM_NOMEDIA", { video: videoData ? 'ok' : 'null', audio: audioData ? 'ok' : 'null' }); } catch (eNM) {}
+                return;
+              }
+              __ytMp4Mode = videoData.mimeType.indexOf('mp4') !== -1;
               console.log("Video MIME:", videoData.mimeType);
               console.log("Audio MIME:", audioData.mimeType);
+              try { __ytclientlog("STREAM_MODE", { mime: videoData.mimeType, audio: audioData.mimeType, mp4: __ytMp4Mode }); } catch (eMode) {}
           
               var videoSourceBuffer = mediaSource.addSourceBuffer(videoData.mimeType);
               var audioSourceBuffer = mediaSource.addSourceBuffer(audioData.mimeType);
@@ -8904,6 +8912,16 @@
                 function notifyStreamTerminal(statusCode) {
                   streamFailed = true;
                   if (bufferWatchdog) { clearInterval(bufferWatchdog); bufferWatchdog = null; }
+                  try {
+                    // Break the "resume poison": after a fatal seek/stream error, clear the persisted
+                    // playhead and reset the shared media element so subsequent videos start clean.
+                    if (type === 'video') {
+                      try { aj("yt-player-restore-playhead"); } catch (eClearKey) {}
+                      if (videoElement) {
+                        try { if (videoElement.currentTime !== 0) { videoElement.currentTime = 0; } } catch (eReset) {}
+                      }
+                    }
+                  } catch (eReset2) {}
                   try {
                     __ytclientlog("STREAM_FAILED", { type: type, status: statusCode || null, range: String(rangeStart), retry: false, reason: 'retries_exhausted', chunk: chunkSize });
                   } catch (eLog) {}
@@ -9110,7 +9128,14 @@ isLoading = true;
                     var seekTime = videoElement.currentTime;
                     var videoDuration = videoElement.duration || 0;
                 
-                    if (videoDuration > 0 && totalSize !== Number.MAX_SAFE_INTEGER) {
+                    if (__ytMp4Mode) {
+                    // MP4 streams have no WebM cluster boundaries; byte-aligned seeks are unsafe
+                    // and would corrupt the MSE decoder. Restart the stream from byte 0 instead.
+                    console.log(`[${type}] MP4 stream: no cluster alignment for MP4, seeking from byte 0.`);
+                    seekAlignUrl = null;
+                    rangeStart = 0;
+                    rangeEnd = rangeStart + chunkSize;
+                    } else if (videoDuration > 0 && totalSize !== Number.MAX_SAFE_INTEGER) {
                     // Calculate the new range based on seek position.
                     rangeStart = Math.floor((seekTime / videoDuration) * totalSize);
                     rangeStart = Math.floor(rangeStart / chunkSize) * chunkSize;
@@ -9170,13 +9195,25 @@ isLoading = true;
               // --- End fetchSegment function ---
           
               function getBestVideoUrl(mediaLinks) {
-                var validVideoLinks = mediaLinks.filter(function (link) {
-                  return link.type && link.type === 'video/webm';
-                });
-                if (validVideoLinks.length === 0) {
-                  console.log("No 'video/webm' found, searching for 'video/mp4'...");
+                var preferWebm;
+                try {
+                  preferWebm = !!(window.MediaSource && window.MediaSource.isTypeSupported && window.MediaSource.isTypeSupported('video/webm; codecs="vp9"'));
+                } catch (e) { preferWebm = true; }
+                console.log("Codec probe: preferWebm=" + preferWebm);
+                var validVideoLinks;
+                if (preferWebm) {
+                  validVideoLinks = mediaLinks.filter(function (link) {
+                    return link.type && link.type === 'video/webm';
+                  });
+                } else {
                   validVideoLinks = mediaLinks.filter(function (link) {
                     return link.type && link.type === 'video/mp4';
+                  });
+                }
+                if (validVideoLinks.length === 0) {
+                  console.log("Preferred video codec not available, searching other container...");
+                  validVideoLinks = mediaLinks.filter(function (link) {
+                    return link.type && (link.type === 'video/webm' || link.type === 'video/mp4');
                   });
                   if (validVideoLinks.length === 0) {
                     console.error('No valid video formats found.');
@@ -9216,19 +9253,30 @@ isLoading = true;
               
               function getAudioUrl(mediaLinks) {
                 console.log('Received media links:', mediaLinks);
-                var audioLink = mediaLinks.find(function (link) {
-                  return link.type && link.type === 'audio/webm' && link.url;
-                });
+                var preferOpus;
+                try {
+                  preferOpus = !!(window.MediaSource && window.MediaSource.isTypeSupported && window.MediaSource.isTypeSupported('audio/webm; codecs="opus"'));
+                } catch (e) { preferOpus = true; }
+                var audioLink;
+                if (preferOpus) {
+                  audioLink = mediaLinks.find(function (link) {
+                    return link.type && link.type === 'audio/webm' && link.url;
+                  });
+                } else {
+                  audioLink = mediaLinks.find(function (link) {
+                    return link.type && (link.type === 'audio/mp4' || link.type === 'audio/m4a') && link.url;
+                  });
+                }
                 if (audioLink) {
-                  console.log("Found 'audio/webm' format:", audioLink);
+                  console.log("Found preferred audio format:", audioLink);
                 }
                 if (!audioLink) {
-                  console.log("No 'audio/webm' found, searching for 'audio/mp4'...");
+                  console.log("Preferred audio codec not available, searching others...");
                   audioLink = mediaLinks.find(function (link) {
-                    return link.type && link.type === 'audio/mp4' && link.url;
+                    return link.type && (link.type === 'audio/webm' || link.type === 'audio/mp4' || link.type === 'audio/m4a') && link.url;
                   });
                   if (audioLink) {
-                    console.log("Found 'audio/mp4' format:", audioLink);
+                    console.log("Found fallback audio format:", audioLink);
                   }
                 }
                 if (!audioLink) {
