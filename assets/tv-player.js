@@ -8825,17 +8825,53 @@
             this.g = this.b = null;
             this.B = b;
 
+            var progLink = null;
+            if (mediaLinks && mediaLinks.length) {
+              for (var pi = 0; pi < mediaLinks.length; pi++) {
+                if (mediaLinks[pi] && mediaLinks[pi].url && /itag=18/.test(mediaLinks[pi].url)) {
+                  progLink = mediaLinks[pi];
+                  break;
+                }
+              }
+            }
+            var msePlayable;
+            try {
+              var ytIsWebos = /(?:lgwebostv|webos|lynx|smarttv)/i.test(navigator.userAgent || "");
+              msePlayable = !ytIsWebos
+                && !!(window.MediaSource && window.MediaSource.isTypeSupported)
+                && (window.MediaSource.isTypeSupported('video/mp4')
+                    || window.MediaSource.isTypeSupported('video/mp4; codecs="avc1.4d401e"')
+                    || window.MediaSource.isTypeSupported('video/webm; codecs="vp9"'));
+            } catch (eMse) { msePlayable = false; }
+            console.log("MSE usable on this device:", msePlayable);
+
+            var videoElement = document.querySelector(".html5-main-video");
+
+            if (!msePlayable) {
+              if (progLink) {
+                try { __ytclientlog("PROGRESSIVE_MODE", { url: progLink.url }); } catch (errP) {}
+                this.__ytProgressive = true;
+                if (videoElement) {
+                  videoElement.src = progLink.url;
+                  try { videoElement.play().catch(function () {}); } catch (errPlay) {}
+                } else {
+                  console.error("Video element not found for progressive mode.");
+                }
+                return;
+              }
+              console.error("MediaSource unusable and no progressive MP4 (itag 18) available.");
+              return;
+            }
             if (!window.MediaSource) {
               console.error("MediaSource API is not supported.");
               return;
             }
-            try { __ytclientlog("NrConstruct", {}); } catch (err) {}
+            try { __ytclientlog("NrConstruct", { mse: msePlayable }); } catch (err) {}
 
             console.log("Using MediaSource API");
             this.o = new MediaSource();
             console.log("Created MediaSource object:", this.o);
-          
-            var videoElement = document.querySelector(".html5-main-video");
+
             if (!videoElement) {
               console.error("Video element not found!");
               return;
@@ -18045,7 +18081,10 @@ isLoading = true;
             b = H(a.X, "spacecast") || a.na;
             d = a.xj();
             d = d.qb.isDefault ? void 0 : d;
-            a.B.initialize(a.b.startSeconds, ZB(a), b, d);
+            // Force 0 so the framework never jumps a (possibly stale) startSeconds left over from a
+            // previous video onto the newly loaded element ("resume poison" across videos).
+            a.b.startSeconds = 0;
+            a.B.initialize(0, ZB(a), b, d);
             a.b.probeUrl && (a.B.P = a.b.probeUrl);
             if (a.X.length || a.na) a.B.H = !0;
             a.na && QB(a);

@@ -773,6 +773,18 @@ function handleGetVideoInfo(req, res) {
                         if (format.format_id === '18') {
                             const fmtString = `itag=${format.itag}&type=${mimeType}&url=${encodeURIComponent(streamUrl)}&quality=${format.quality || 'unknown'}`;
                             urlEncodedFmtStreamMapArr.push(fmtString);
+
+                            const progParams = new URLSearchParams();
+                            progParams.append('url', streamUrl);
+                            progParams.append('itag', format.format_id);
+                            progParams.append('clen', format.filesize || 'unknown');
+                            progParams.append('lmt', format.lastModified || 'unknown');
+                            progParams.append('dur', format.duration || 'unknown');
+                            progParams.append('fps', format.fps || 'unknown');
+                            progParams.append('size', `${format.width || 0}x${format.height || 0}`);
+                            progParams.append('bitrate', format.tbr || 'unknown');
+                            progParams.append('type', mimeType);
+                            adaptiveFmts.push(progParams.toString());
                         }
                     } else {
                         logger.warn('video-info', 'Skipping format with missing URL or format_id', {
