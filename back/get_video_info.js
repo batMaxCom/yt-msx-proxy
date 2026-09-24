@@ -47,6 +47,67 @@ const streamMap = new Map();       // streamId -> { url, expiresAt, videoId, ita
 const refreshLocks = new Map();    // streamId -> Promise<entry> (single-flight refresh)
 const hlsMap = new Map();          // videoId -> { video:{url,expiresAt}, audio:{url,expiresAt}, expiresAt, videoId }
 
+// ---- full-file stream cache: upstream throttles sustained downloads from a
+// datacenter IP, so we download each webm once in the background and then serve
+// it from local disk (instant, no throttling). ----
+const STREAM_DIR = path.join(__dirname, 'streams');
+const streamDownloadLocks = new Map(); // streamId -> Promise (single-flight fill)
+const STREAM_CACHE_MAX_MB = 2000;
+try { fs.mkdirSync(STREAM_DIR, { recursive: true }); } catch (e) { }
+
+function pruneStreamCache() {
+    let total = 0;
+    const files = [];
+    try {
+        for (const f of fs.readdirSync(STREAM_DIR)) {
+            if (f.endsWith('.part')) continue;
+            const p = path.join(STREAM_DIR, f);
+            const s = fs.statSync(p);
+            total += s.size;
+            files.push({ p, mtime: s.mtimeMs, size: s.size });
+        }
+    } catch (e) { return; }
+    if (total <= STREAM_CACHE_MAX_MB * 1024 * 1024) return;
+    files.sort((a, b) => a.mtime - b.mtime);
+    for (const f of files) {
+        try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { }
+        if (total <= STREAM_CACHE_MAX_MB * 1024 * 1024) break;
+    }
+}
+
+function downloadStreamToFile(streamId, url) {
+    if (streamDownloadLocks.has(streamId)) return streamDownloadLocks.get(streamId);
+    const dest = path.join(STREAM_DIR, streamId + '.webm');
+    if (fs.existsSync(dest)) {
+        return Promise.resolve();
+    }
+    const part = path.join(STREAM_DIR, streamId + '.part');
+    const p = (async () => {
+        const resp = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 120000,
+            maxRedirects: 5,
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)' },
+        });
+        const buf = Buffer.from(resp.data);
+        if (!buf.length) throw new Error('empty body');
+        fs.writeFileSync(part, buf);
+        try { fs.renameSync(part, dest); } catch (e) { fs.writeFileSync(dest, buf); }
+        logger.info('stream', 'STREAM_CACHE_FILLED', { stream_id: streamId, bytes: buf.length });
+    })().catch(err => {
+        logger.warn('stream', 'STREAM_CACHE_DOWNLOAD_FAIL', {
+            stream_id: streamId,
+            message: String(err.message || err).slice(0, 200),
+        });
+    }).finally(() => {
+        try { fs.unlinkSync(part); } catch (e) { }
+        streamDownloadLocks.delete(streamId);
+        pruneStreamCache();
+    });
+    streamDownloadLocks.set(streamId, p);
+    return p;
+}
+
 function parseExpireSeconds(url) {
     try {
         const m = /[?&]expire=(\d+)/.exec(String(url));
@@ -603,6 +664,22 @@ function handleStreamRequest(req, res) {
         proxyHeaders['Range'] = rangeHeader;
     }
 
+    // Serve a fully-cached copy from local disk when available (fast, avoids
+    // the upstream sustained-download throttle). Otherwise kick off a
+    // background fill and proxy live as before.
+    const cachedPath = path.join(STREAM_DIR, streamId + '.webm');
+    if (fs.existsSync(cachedPath)) {
+        logger.info('stream', 'STREAM_CACHE_HIT', {
+            event: 'STREAM_CACHE_HIT',
+            video_id: entry.videoId,
+            itag: entry.itag,
+            range: rangeHeader || '',
+        });
+        res.set('Cache-Control', 'public, max-age=86400');
+        return res.sendFile(cachedPath);
+    }
+    downloadStreamToFile(streamId, entry.url);
+
     const startProxy = (targetUrl, allowRefresh) => {
         // Cluster-aligned middleware: when the player requests a mid-file byte
         // range right after a seek (&seek=1), serve the bytes starting at the
@@ -1026,7 +1103,20 @@ function buildHlsEntry(videoId, formats) {
 }
 
 async function fetchHlsPlaylist(absUrl, videoId) {
-    const resp = await axios.get(absUrl, { responseType: 'text', timeout: 90000, maxRedirects: 5 });
+    let resp;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            resp = await axios.get(absUrl, { responseType: 'text', timeout: 90000, maxRedirects: 5 });
+        } catch (err) {
+            if (attempt === 3) throw err;
+            await new Promise(r => setTimeout(r, 500 * attempt));
+            continue;
+        }
+        if (resp.data && String(resp.data).trim()) break;
+        if (attempt === 3) break;
+        logger.warn('hls', 'empty playlist, retrying', { video_id: videoId, attempt });
+        await new Promise(r => setTimeout(r, 500 * attempt));
+    }
     const prefix = `/api/hls/${videoId}/p/`;
     const rewritten = String(resp.data)
         .split(/\r?\n/)

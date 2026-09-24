@@ -116,43 +116,50 @@
     EngineMseWebm.prototype.constructor = EngineMseWebm;
 
     EngineMseWebm.prototype._loadStream = function (url, sb, done, onFirst) {
-        var self = this, firstFired = false, appendCount = 0;
-        var fireFirst = function () { if (!firstFired) { firstFired = true; beacon('WEBM_FIRST_APPEND', { len: sb.buffered && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : -1 }); if (onFirst) onFirst(); } };
+        var self = this, firstFired = false;
+        var fireFirst = function () {
+            if (firstFired) return;
+            firstFired = true;
+            beacon('WEBM_FIRST_APPEND', { len: sb.buffered && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : -1 });
+            if (onFirst) onFirst();
+        };
         var finish = function () { if (done) done(); };
-        var append = function (chunk, next) {
+        var append = function (buf) {
             if (self.stopped) { finish(); return; }
             var go = function () {
-                try { sb.appendBuffer(chunk); }
-                catch (e) { beacon('WEBM_APPEND_FAIL', { e: String(e) }); finish(); return; }
-                if ((++appendCount % 20) === 0) beacon('WEBM_APPEND_N', { n: appendCount, b: sb.buffered && sb.buffered.length ? +sb.buffered.end(sb.buffered.length - 1).toFixed(1) : -1, d: self.conf.el.duration, rs: self.conf.el.readyState, ms: self._ms.readyState, conn: self.conf.el.isConnected });
+                try { sb.appendBuffer(buf); }
+                catch (e) { beacon('WEBM_APPEND_FAIL', { e: String(e), bytes: buf.byteLength }); finish(); return; }
+                beacon('WEBM_FULL', { bytes: buf.byteLength, b: sb.buffered && sb.buffered.length ? +sb.buffered.end(sb.buffered.length - 1).toFixed(1) : -1, rs: self.conf.el.readyState });
                 fireFirst();
-                sb.addEventListener('updateend', function h() { sb.removeEventListener('updateend', h); next(); });
+                if (done) done();
             };
             if (sb.updating) sb.addEventListener('updateend', function h() { sb.removeEventListener('updateend', h); go(); });
             else go();
         };
-        if (global.fetch) {
-            global.fetch(url).then(function (r) {
-                if (!r.ok || !r.body || !r.body.getReader) { beacon('WEBM_FETCH_FAIL', { s: r.status }); finish(); return; }
-                var reader = r.body.getReader();
-                var pump = function () {
-                    reader.read().then(function (res) {
-                        if (self.stopped) { finish(); return; }
-                        if (res.done) { finish(); return; }
-                        append(res.value, pump);
-                    }).catch(function (e) { beacon('WEBM_READ_FAIL', { e: String(e) }); finish(); });
-                };
-                pump();
-            }).catch(function (e) { beacon('WEBM_FETCH_FAIL', { e: String(e) }); finish(); });
-        } else {
-            xhrArray(url, function (buf) { append(buf, finish); }, function (st) { beacon('WEBM_FETCH_FAIL', { s: st }); finish(); });
-        }
+        xhrArray(url, append, function (st) { beacon('WEBM_FETCH_FAIL', { s: st }); finish(); });
     };
     EngineMseWebm.prototype._boot = function () {
         if (this.stopped) return;
-        try { beacon('WEBM_BOOT', { err: this.conf.el.error ? this.conf.el.error.code : 0, ns: this.conf.el.networkState, rs: this.conf.el.readyState }); } catch (e) { }
-        var p = this.conf.el.play();
-        if (p && p.catch) p.catch(function () { });
+        var self = this, tries = 0;
+        var kick = function () {
+            if (self.stopped) return;
+            var el = self.conf.el;
+            var rs = el.readyState;
+            try { beacon('WEBM_KICK', { rs: rs, t: Math.round((el.currentTime || 0) * 10) / 10, b: el.buffered && el.buffered.length ? +el.buffered.end(el.buffered.length - 1).toFixed(1) : -1 }); } catch (e) { }
+            // once the decoder actually opened, stop kicking
+            if (rs >= 2) return;
+            var p = el.play();
+            if (p && p.catch) p.catch(function () { });
+            if (tries++ < 10) setTimeout(kick, 2500);
+            else {
+                // decoder wedged: remount a fresh engine on the same element
+                try { beacon('WEBM_REMOUNT', { t: Math.round((el.currentTime || 0) * 10) / 10, rs: rs }); } catch (e) { }
+                if (window.YTCustomPlayer && window.YTCustomPlayer._remount) {
+                    window.YTCustomPlayer._remount(self.conf.el);
+                }
+            }
+        };
+        kick();
     };
 
     function EngineNoop() { Engine.call(this); }
@@ -225,19 +232,42 @@
     var active = null;
     var onSeekHandler = onSeek;
 
+    /* The framework's element gets wedged by the 2016 app's own load()/error cycles
+       and then buffers into MSE forever without decoding (rs:0). For MSE engines we
+       use a fresh element of our own; nativehls (TV) keeps the framework element. */
+    function makeOwnEl() {
+        var host = global.document && global.document.querySelector('.html5-main-video');
+        var parent = (host && host.parentElement) || (global.document && global.document.body);
+        var vid = global.document.createElement('video');
+        vid.setAttribute('playsinline', '');
+        vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:20;background:#000;';
+        if (host) { try { host.style.visibility = 'hidden'; } catch (e) { } }
+        if (parent) { try { parent.appendChild(vid); } catch (e) { } }
+        beacon('CP_OWNEL', {});
+        return vid;
+    }
+
+    function dropOwnEl(ownEl) {
+        if (!ownEl) return;
+        try { ownEl.remove(); } catch (e) { }
+        var host = global.document && global.document.querySelector('.html5-main-video');
+        if (host) { try { host.style.visibility = ''; } catch (e) { } }
+    }
+
     function stopActive() {
-        if (active && active.el) {
-            try { unbindSeek(active.el); } catch (e) { }
+        if (active && active.engEl) {
+            try { unbindSeek(active.engEl); } catch (e) { }
         }
         if (active) {
             try { if (active.engine && active.engine.close) active.engine.close(); } catch (e) { }
+            dropOwnEl(active.ownEl);
         }
         active = null;
     }
 
     function onSeek() {
-        if (active && active.engine && active.engine.seek && active.el) {
-            try { active.engine.seek(active.el.currentTime || 0); } catch (e) { }
+        if (active && active.engine && active.engine.seek && active.engEl) {
+            try { active.engine.seek(active.engEl.currentTime || 0); } catch (e) { }
         }
     }
 
@@ -254,7 +284,7 @@
         if (!el) return false;
         var id = conf.id || getVideoId();
         if (!id) return false;
-        if (active && active.id === id && active.el === el && !el.paused) return true;
+        if (active && active.id === id && active.el === el && active.engEl && !active.engEl.paused) return true;
 
         stopActive();
         active = { id: id, el: el, engine: null };
@@ -265,6 +295,7 @@
         beacon('CP_START', { id: id, engine: null, hlsUrl: hlsUrl.slice(0, 80) });
 
         var eng = null;
+        var engEl = el;
         var links = conf.mediaLinks || [];
 
         if (nativeHlsOk(el)) {
@@ -274,8 +305,9 @@
             var v = bestVideo(links);
             var au = bestAudio(links);
             if (v) {
+                engEl = makeOwnEl();
                 eng = new EngineMseWebm({
-                    el: el,
+                    el: engEl,
                     video: { url: absUrl(v.url), mime: mseMime(v, 'video') },
                     audio: au ? { url: absUrl(au.url), mime: mseMime(au, 'audio') } : null
                 });
@@ -292,7 +324,8 @@
         if (eng && eng.constructor === EngineNoop) {
             var mu = conf.progLink && conf.progLink.url && !/api\/hls/.test(conf.progLink.url) ? conf.progLink.url : muxedUrl(links);
             if (mu) {
-                eng = new EngineProgressive({ el: el, url: absUrl(mu) });
+                engEl = makeOwnEl();
+                eng = new EngineProgressive({ el: engEl, url: absUrl(mu) });
                 beacon('CP_ENGINE', { k: 'progressive', id: id });
             } else {
                 // last resort: hand the master playlist to the element (works only on real HLS browsers)
@@ -301,10 +334,12 @@
             }
         }
 
+        active.engEl = engEl;
+        active.ownEl = (engEl === el) ? null : engEl;
         active.engine = eng;
         onSeekHandler = onSeek;
-        bindSeek(el);
-        try { el.addEventListener('seeked', function () { beacon('CP_SEEKED', {}); }); } catch (e) { }
+        bindSeek(engEl);
+        try { engEl.addEventListener('seeked', function () { beacon('CP_SEEKED', {}); }); } catch (e) { }
         return true;
     }
 
@@ -360,7 +395,10 @@
             if (!id || !el) { lastCandidate = 0; poll(); return; }
             if (active) {
                 var owned = active.el;
-                var lost = (owned !== el) || (el.readyState === 0 && !/^blob:/.test(el.currentSrc || el.src || ''));
+                var lost = (owned !== el);
+                if (!lost && !active.ownEl) {
+                    lost = (el.readyState === 0 && !/^blob:/.test(el.currentSrc || el.src || ''));
+                }
                 if (!lost) { lastCandidate = 0; poll(); return; }
                 stopActive();
             }
@@ -379,13 +417,23 @@
         }, 1000);
     }
 
+    function remount(el) {
+        try { stopActive(); } catch (e) { }
+        var id = getVideoId();
+        if (id && el) {
+            beacon('CP_REMOUNT', { id: id });
+            startById(id, el);
+        }
+    }
+
     /* be visible before tv-player.js uses us */
     var Api = {
         start: start,
         startById: startById,
         isActive: function () { return !!active; },
         activeVideo: function () { return active ? active.id : null; },
-        stop: stopActive
+        stop: stopActive,
+        _remount: remount
     };
 
     global.YTCustomPlayer = Api;
