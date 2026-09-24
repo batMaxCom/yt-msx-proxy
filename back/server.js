@@ -12,7 +12,7 @@ const { fetchGuideData } = require('./guide_api');
 
 const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
-const { handleGetVideoInfo, handleStreamRequest } = require('./get_video_info');
+const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest } = require('./get_video_info');
 
 // tv_cast pairing / lounge endpoints
 const {
@@ -276,6 +276,10 @@ app.get(/^\/{0,2}get_video_info$/, (req, res) => {
 });
 
 app.get('/api/stream/:stream_id', handleStreamRequest);
+
+app.get(/^\/{0,2}api\/hls\//, (req, res) => {
+    handleHlsRequest(req, res);
+});
 
 app.get('/api/logs', (req, res) => {
     const opts = {

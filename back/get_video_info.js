@@ -45,6 +45,7 @@ try {
 
 const streamMap = new Map();       // streamId -> { url, expiresAt, videoId, itag }
 const refreshLocks = new Map();    // streamId -> Promise<entry> (single-flight refresh)
+const hlsMap = new Map();          // videoId -> { video:{url,expiresAt}, audio:{url,expiresAt}, expiresAt, videoId }
 
 function parseExpireSeconds(url) {
     try {
@@ -693,6 +694,12 @@ function handleGetVideoInfo(req, res) {
                 output.formats.forEach(format => {
                     if (format.format_id && /^sb/.test(format.format_id)) return;
 
+                    // HLS (m3u8) formats are handled separately via /api/hls proxy
+                    // (synthesized master playlist). Keep them out of /api/stream adaptive_fmts.
+                    if (format.protocol === 'm3u8_native' && format.url && format.url.includes('m3u8')) {
+                        return;
+                    }
+
                     if (disableWebM && (format.ext === 'webm' || format.acodec === 'vp9' || format.acodec === 'vp8')) return;
 
                     if (format.url && format.format_id) {
@@ -803,6 +810,33 @@ function handleGetVideoInfo(req, res) {
                 fmt_list_count: fmtListArr.length,
             });
 
+            let hlsUrl = '';
+            const hlsEntry = buildHlsEntry(videoIdFromOutput, output.formats);
+            if (hlsEntry) {
+                hlsMap.set(videoIdFromOutput, hlsEntry);
+                hlsUrl = `/api/hls/${videoIdFromOutput}`;
+                const hlsParams = new URLSearchParams();
+                hlsParams.append('url', hlsUrl);
+                hlsParams.append('itag', 'hls');
+                hlsParams.append('clen', 'unknown');
+                hlsParams.append('lmt', 'unknown');
+                hlsParams.append('dur', videoDuration || 'unknown');
+                hlsParams.append('fps', 'unknown');
+                hlsParams.append('size', '640x360');
+                hlsParams.append('bitrate', 'unknown');
+                hlsParams.append('type', 'application/x-mpegURL');
+                adaptiveFmts.push(hlsParams.toString());
+                logger.info('video-info', 'HLS available', {
+                    video_id: videoIdFromOutput,
+                    hls: hlsUrl,
+                });
+            } else {
+                logger.warn('video-info', 'HLS unavailable (need both video and audio HLS variants)', {
+                    video_id: videoIdFromOutput,
+                    formats: output.formats ? output.formats.length : 0,
+                });
+            }
+
             if (adaptiveFmts.length === 0 && urlEncodedFmtStreamMapArr.length === 0) {
                 logger.error('video-info', 'No playable formats found', { video_id: videoIdFromOutput });
                 console.log('No playable formats found');
@@ -866,6 +900,7 @@ function handleGetVideoInfo(req, res) {
         storyboard_spec=https://i.ytimg.com/sb/OxoOSohmaag/storyboard3_L0/default.jpg?sqp=-oaymwENSDfyq4qpAwVwAcABBqLzl_8DBgjvjc-oBg==&sigh=rs$AOn4CLCM4gaqvsBmP9olCrnqXWONsDTRCQ
         url_encoded_fmt_stream_map=${encodeURIComponent(urlEncodedFmtStreamMapResponse)}
         adaptive_fmts=${encodeURIComponent(adaptiveFmtsResponse)}
+        hls_url=${encodeURIComponent(hlsUrl)}
         remarketing_url=https%3A%2F%2Fgoogleads.g.doubleclick.net%2Fpagead%2Fviewthroughconversion%2F962985656%2F%3Flabel%3Dfollowon_view%26cname%3D1%26foc_id%3D4x7LYSzgGH-TMKc9J8pwgQ%26backend%3Dplayer_vars%26cver%3DHTML5%26ptype%3Dno_rmkt%26aid%3DP989_XaxlmI
         idpj=-2
         cbrver=41.0.2272.89
@@ -925,4 +960,135 @@ function handleGetVideoInfo(req, res) {
         });
 }
 
-module.exports = { handleGetVideoInfo, handleStreamRequest };
+function buildHlsEntry(videoId, formats) {
+    if (!Array.isArray(formats)) return null;
+    const candidates = formats.filter(
+        f => f.protocol === 'm3u8_native' && f.url && f.url.includes('m3u8')
+    );
+    const videoCandidates = candidates.filter(f => f.vcodec && f.vcodec !== 'none');
+    const audioCandidates = candidates.filter(f => !f.vcodec || f.vcodec === 'none');
+
+    let videoChosen = null;
+    const heightPref = [360, 240, 480, 144, 720];
+    for (const h of heightPref) {
+        videoChosen =
+            videoCandidates.find(f => (f.height || 0) === h && String(f.vcodec || '').toLowerCase().includes('avc')) ||
+            videoCandidates.find(f => (f.height || 0) === h);
+        if (videoChosen) break;
+    }
+    if (!videoChosen) videoChosen = videoCandidates[0];
+    const audioChosen = audioCandidates.find(f => String(f.format_id || '').includes('aac')) || audioCandidates[0];
+
+    if (!videoChosen || !audioChosen) return null;
+
+    const videoExp = parseExpireSeconds(videoChosen.url);
+    const audioExp = parseExpireSeconds(audioChosen.url);
+    return {
+        video: { url: videoChosen.url, expiresAt: videoExp ? videoExp * 1000 : Date.now() + 6 * 60 * 60 * 1000 },
+        audio: { url: audioChosen.url, expiresAt: audioExp ? audioExp * 1000 : Date.now() + 6 * 60 * 60 * 1000 },
+        expiresAt: Math.max(
+            videoExp ? videoExp * 1000 : Date.now() + 6 * 60 * 60 * 1000,
+            audioExp ? audioExp * 1000 : Date.now() + 6 * 60 * 60 * 1000
+        ),
+        videoId,
+    };
+}
+
+async function fetchHlsPlaylist(absUrl, videoId) {
+    const resp = await axios.get(absUrl, { responseType: 'text', timeout: 90000, maxRedirects: 5 });
+    const prefix = `/api/hls/${videoId}/p/`;
+    const rewritten = String(resp.data)
+        .split(/\r?\n/)
+        .map(line => {
+            const trimmed = String(line).trim();
+            if (!trimmed) return line;
+            if (trimmed.charAt(0) === '#') {
+                if (trimmed.includes('URI="')) {
+                    return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+                        let absolute;
+                        try {
+                            absolute = new URL(uri, absUrl).href;
+                        } catch (e) {
+                            return match;
+                        }
+                        return `URI="${prefix}${encodeURIComponent(absolute)}"`;
+                    });
+                }
+                return line;
+            }
+            let absolute;
+            try {
+                absolute = new URL(trimmed, absUrl).href;
+            } catch (e) {
+                return line;
+            }
+            return `${prefix}${encodeURIComponent(absolute)}`;
+        })
+        .join('\n');
+    return rewritten;
+}
+
+async function handleHlsRequest(req, res) {
+    try {
+        const urlPath = (req.path || req.url.split('?')[0]).replace(/^\/+/, '/');
+        const m = /\/api\/hls\/([^/]+)(?:\/p\/(.+))?$/.exec(urlPath);
+        if (!m) return res.status(400).send('Bad HLS path');
+        const videoId = m[1];
+        const sub = m[2] ? decodeURIComponent(m[2]) : null;
+
+        let entry = hlsMap.get(videoId);
+        if (!entry || (entry.expiresAt && Date.now() > entry.expiresAt)) {
+            logger.warn('hls', 'refreshing yt-dlp for HLS', { video_id: videoId });
+            const output = await runYtDlp(videoId);
+            const fresh = buildHlsEntry(videoId, output.formats || []);
+            if (!fresh) {
+                return res.status(404).send('No HLS variants available');
+            }
+            hlsMap.set(videoId, fresh);
+            entry = fresh;
+        }
+
+        if (!sub) {
+            const base = `http://${req.headers.host || `${serverIp}:8090`}`;
+            const encVideo = encodeURIComponent(entry.video.url);
+            const encAudio = encodeURIComponent(entry.audio.url);
+            const master =
+                `#EXTM3U\n` +
+                `#EXT-X-VERSION:3\n` +
+                `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="aac",DEFAULT=YES,AUTOSELECT=YES,URI="${base}/api/hls/${videoId}/p/${encAudio}"\n` +
+                `#EXT-X-STREAM-INF:BANDWIDTH=900000,AVERAGE-BANDWIDTH=700000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="audio"\n` +
+                `${base}/api/hls/${videoId}/p/${encVideo}\n`;
+            res.set('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.send(master);
+        }
+
+        const absolute = sub;
+        // Media playlists end with ".m3u8"; YouTube segment URLs only contain a
+        // "/playlist/index.m3u8/" path segment mid-string, so anchor to the end.
+        if (/\.m3u8(\?|#|$)/i.test(absolute)) {
+            const text = await fetchHlsPlaylist(absolute, videoId);
+            res.set('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.send(text);
+        }
+
+        // Binary segment (TS / fMP4 / AAC).
+        const headers = {
+            'User-Agent': 'Mozilla/5.0',
+        };
+        if (req.headers.range) headers.Range = req.headers.range;
+        const resp = await axios.get(absolute, { responseType: 'arraybuffer', timeout: 90000, maxRedirects: 5, headers });
+        res.status(resp.status || 200);
+        if (resp.headers['content-type']) res.set('Content-Type', resp.headers['content-type']);
+        if (resp.headers['content-length']) res.set('Content-Length', resp.headers['content-length']);
+        if (resp.headers['content-range']) res.set('Content-Range', resp.headers['content-range']);
+        if (resp.headers['accept-ranges']) res.set('Accept-Ranges', resp.headers['accept-ranges']);
+        return res.send(Buffer.from(resp.data));
+    } catch (err) {
+        logger.error('hls', 'proxy failed', {
+            message: logger.truncateStderr(String(err.message || err)),
+        });
+        if (!res.headersSent) res.status(502).send('HLS proxy error');
+    }
+}
+
+module.exports = { handleGetVideoInfo, handleStreamRequest, handleHlsRequest };

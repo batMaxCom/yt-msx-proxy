@@ -8833,6 +8833,17 @@
                   break;
                 }
               }
+              if (!progLink) {
+                for (var pj = 0; pj < mediaLinks.length; pj++) {
+                  if (mediaLinks[pj] && mediaLinks[pj].url && mediaLinks[pj].type === 'application/x-mpegURL') {
+                    progLink = mediaLinks[pj];
+                    break;
+                  }
+                }
+                if (progLink) {
+                  console.log("Progressive itag 18 missing; using proxied HLS playlist.");
+                }
+              }
             }
             var msePlayable;
             try {
