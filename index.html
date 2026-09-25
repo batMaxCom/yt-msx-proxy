@@ -5,6 +5,19 @@
 <head>
     <meta http-equiv="content-type" content="text/html; charset=UTF-8">
 
+    <script>
+        // Installed as the very first script on purpose. app-prod.js binds its own
+        // capture-phase keydown handlers on window/document, and whichever listener
+        // is registered first wins the event. Parking it here (before any other
+        // script parses) is what lets the custom player own the remote keys, so the
+        // quality dropdown can be walked with up/down.
+        window.__ytCpKeydown = null;
+        window.addEventListener('keydown', function (e) {
+            var h = window.__ytCpKeydown;
+            if (h) { try { h(e); } catch (err) { } }
+        }, true);
+    </script>
+
  
     <script>
         (function () {

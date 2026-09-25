@@ -78,6 +78,34 @@ Settings are in ./back/settings.json!
 
 - chainPlayback: when a video ends, automatically start the next related video instead of stopping [default: true]
 
+## Player buttons
+
+- Rewind / Forward (the two arrows) seek -10s / +10s, like the original client.
+
+- Skip backward / Skip forward change video. Forward first walks back through what
+you already played, then continues down YouTube's up-next ranking; backward walks the
+session history. Both work even with chainPlayback off (that switch only controls
+whether the next video starts by itself at the end).
+
+- Quality opens a picker: Auto (highest available) plus every rendition, walked with
+the remote's up/down keys.
+
+- Auto is a request for the best rendition, so a weak TV or a busy network can end up
+unplayable. The player watches the real decoder numbers (dropped frames, rebuffer
+events) and steps Auto down one rung at a time when the device demonstrably cannot keep
+up, down to three rungs. Anything you pick by hand is never touched, and choosing Auto
+again re-arms the guard. Every drop is announced on screen so it is never a mystery.
+
+- The transport panel stays on screen for 5 seconds after the last keypress.
+
+- Going back out of a video (Back key, or back to browse) stops playback instead of
+letting it run off-screen.
+
+- As soon as a video starts, the up-next ranking and the next video's stream links are
+downloaded in the background, so both the auto roll-over and Skip forward switch without
+a visible stall. The server keeps every resolved video for 20 minutes, and the client
+holds one preloaded payload, so switching twice in a row reuses it too.
+
 Be careful with your token folder, this has device ids and also has oauth tokens, I had issues when I didn't save it to a json file, luckly had no issues with refreshing so it doesn't save when you refresh. Just don't leak it or anything,
 it should expire anyways.
 

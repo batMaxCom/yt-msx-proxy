@@ -13123,6 +13123,8 @@
             this.Ne()
         };
         d.PR = function () {
+            var p = window.YTCustomPlayer;
+            if (p && p.skipPrev) { p.skipPrev(); return; }
             this.Fc("transport-controls", this)
         };
         d.pT = function () {
@@ -13138,6 +13140,8 @@
             this.g.Zr(10)
         };
         d.$P = function () {
+            var p = window.YTCustomPlayer;
+            if (p && p.skipNext) { p.skipNext(); return; }
             this.Dd("transport-controls", this)
         };
         d.PG = function () {

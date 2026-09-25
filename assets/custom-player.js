@@ -107,10 +107,19 @@
     EngineNativeHls.prototype = Object.create(Engine.prototype);
     EngineNativeHls.prototype.constructor = EngineNativeHls;
     EngineNativeHls.prototype.setQuality = function (h) {
+        var el = this.conf && this.conf.el;
+        // the src is rebuilt from scratch, so the position has to be carried over
+        // by hand - a quality change mid-playback must not jump back to 0:00
+        var keep = 0, wasPlaying = false;
+        if (el) {
+            try { keep = el.currentTime || 0; wasPlaying = !el.paused; } catch (e) { }
+        }
         this._q = h || 0;
+        this._keepTime = keep;
+        this._keepPlaying = wasPlaying;
         this.conf.hlsUrl = this._hlsUrlFor(h);
         this.adopt(this.conf.el);
-        beacon('CP_Q_RESTART', { h: h || 0 });
+        beacon('CP_Q_RESTART', { h: h || 0, t: Math.round(keep) });
     };
     EngineNativeHls.prototype._hlsUrlFor = function (h) {
         var baseUrl = String(this.conf.hlsUrl || '').split('?')[0];
@@ -121,11 +130,25 @@
         if (!conf) return;
         if (el) conf.el = el;
         if (!conf.el || this.stopped) return;
+        // only restore on a deliberate quality switch; a framework element swap
+        // (adoptElement) must keep whatever position the new node reports
+        var keep = this._keepTime || 0;
+        var wantPlay = this._keepPlaying;
+        this._keepTime = 0; this._keepPlaying = false;
         conf.el.src = this._hlsUrlFor(this._q);
         try { conf.el.load(); } catch (e) { }
         var self = this;
-        var p = conf.el.play();
-        if (p && p.catch) p.catch(function () { setTimeout(function () { if (!self.stopped && conf.el && conf.el.paused) { var q = conf.el.play(); if (q && q.catch) q.catch(function () { }); } }, 400); });
+        var restore = function () {
+            if (self.stopped || !conf.el) return;
+            if (keep > 0) { try { if (isFinite(conf.el.duration) && keep < conf.el.duration) conf.el.currentTime = keep; } catch (e2) { } }
+            if (wantPlay !== false && conf.el.paused) {
+                var p = conf.el.play();
+                if (p && p.catch) p.catch(function () { setTimeout(function () { if (!self.stopped && conf.el && conf.el.paused) { var q = conf.el.play(); if (q && q.catch) q.catch(function () { }); } }, 400); });
+            }
+        };
+        // the new manifest has to be parsed before currentTime can be set
+        try { conf.el.addEventListener('loadedmetadata', restore, false); } catch (e3) { }
+        setTimeout(restore, 1200);
     };
 
     function EngineHlsJs(conf) {
@@ -876,11 +899,17 @@
         bindSeek(engEl);
         try { engEl.addEventListener('seeked', function () { beacon('CP_SEEKED', {}); }); } catch (e) { }
         try { engEl.addEventListener('ended', chainOnEnded); } catch (e2) { }
-        if (chainEnabled()) {
-            loadChain(id);
-            if (chainPlayed.length > 60) chainPlayed.shift();
-            if (chainPlayed.indexOf(id) < 0) chainPlayed.push(id);
-        }
+        // a "waiting" event during playback means the device could not sustain the
+        // stream, which is the signal the quality guard reacts to
+        try { engEl.addEventListener('waiting', function () { noteStall(); }); } catch (e5) { }
+        resetHealth();
+        chainAdvanceTo({ id: id, title: (conf.title || '') });
+        // the up-next ranking is resolved as soon as the video starts, not when it
+        // ends: the skip button needs a target straight away, and the toggle only
+        // decides whether playback rolls over on its own
+        loadChain(id);
+        if (chainPlayed.length > 60) chainPlayed.shift();
+        if (chainPlayed.indexOf(id) < 0) chainPlayed.push(id);
         if (qualityMode === 'hls') loadQualityList(id, wantH);
         else applyQuality();
         return true;
@@ -917,16 +946,25 @@
         return out;
     }
 
-    function startById(id, el, cb) {
-        xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function (t) {
-            if (!t || !el || active) { if (cb) cb(false); return; }
-            var links = parseAdaptive(t);
-            var hls = null, i;
-            for (i = 0; i < links.length; i++) { if (links[i].url && /itag=hls/.test(links[i].url)) { hls = links[i].url; break; } }
-            var ok = start({ id: id, el: el, mediaLinks: links, hlsUrl: hls || (base + '/api/hls/' + id) });
-            if (cb) cb(ok);
-        });
-    }
+ function startById(id, el, cb) {
+     // the up-next payload was already resolved when the previous video started,
+     // so the common case is an instant switch with no request at all
+     var pre = takeChainPrefetch(id);
+     if (pre) { startFromInfo(id, el, pre, cb); return; }
+     xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function (t) {
+         startFromInfo(id, el, t, cb);
+     });
+ }
+
+ function startFromInfo(id, el, t, cb) {
+     if (!t || !el || active) { if (cb) cb(false); return; }
+     var links = parseAdaptive(t);
+     var hls = null, i;
+     for (i = 0; i < links.length; i++) { if (links[i].url && /itag=hls/.test(links[i].url)) { hls = links[i].url; break; } }
+     var ok = start({ id: id, el: el, mediaLinks: links, hlsUrl: hls || (base + '/api/hls/' + id) });
+     if (cb) cb(ok);
+ }
+
 
     var lastCandidate = 0;
     var takeoverBusy = false;
@@ -946,8 +984,27 @@
         quitUntil = Date.now() + QUIT_COOLDOWN_MS;
     }
 
+    function onWatchRoute() {
+        try { return String((global.location && global.location.hash) || '').indexOf('/watch') >= 0; }
+        catch (e) { return false; }
+    }
+
+    /* Leaving the watch screen must silence the player. The app handles its own
+       Back key and just swaps the route, so without this our element keeps
+       playing off-screen and the user hears a video they already left behind.
+       poll() is the backstop for clients whose Back never reaches our handler. */
+    function stopIfLeftWatch(why) {
+        if (!active || onWatchRoute()) return false;
+        var id = active.id;
+        beacon('CP_LEFT_WATCH', { id: id, via: why });
+        stopActive();
+        lastCandidate = 0;
+        return true;
+    }
+
     function poll() {
         setTimeout(function () {
+            stopIfLeftWatch('poll');
             var id = getVideoId();
             var el = global.document && global.document.querySelector('.html5-main-video');
             if (!id || !el) { lastCandidate = 0; poll(); return; }
@@ -1014,7 +1071,7 @@
        TV's own system if any). Keys are only intercepted while the watch
        surface exists and is not snapped into grid browsing. */
 
-    var TR_HIDE_MS = 3000;
+    var TR_HIDE_MS = 5000;
     var SEEK_STEP = 10;
     var trSeen = false;
     var trVisible = false;
@@ -1134,6 +1191,19 @@
     var qualityRequest = 0;
     var storedHeight = 0;
 
+    /* ---- adaptive quality guard ----
+       "Auto" means the highest rendition, which is what we always asked for. On a
+       weak TV or a congested network that choice is simply unplayable, so we watch
+       the real decode numbers and step down one rung when the device clearly cannot
+       keep up. Only ever touches Auto, and only a few times per video, so a single
+       busy scene cannot talk us down a whole ladder. */
+    var health = { at: 0, dropped: 0, total: 0, stalls: 0, bad: 0, steps: 0, id: '', own: false };
+    var HEALTH_MS = 3000;          // sampling window
+    var HEALTH_WARMUP_S = 8;       // ignore startup buffering
+    var HEALTH_DROP_RATIO = 0.08;  // >8% dropped frames counts as "cannot keep up"
+    var HEALTH_STALLS = 2;         // or this many rebuffer events in one window
+    var HEALTH_MAX_STEPS = 3;      // never walk more than 3 rungs down on our own
+
     /* ---- continuous ("endless") playback state ---- */
     var chainOn = true;
     var chainItems = [];
@@ -1145,6 +1215,12 @@
     var chainToastTimer = 0;
     var chainLoadingFor = '';
     var chainPrefetchedFor = '';
+    var chainPrefetched = null;   // {id, text, at} - resolved up-next payload
+    var chainWaiters = [];        // callbacks parked on an in-flight ranking request
+    var chainEmptyFor = '';       // video we already asked about and got nothing back
+    var PREFETCH_TTL_MS = 10 * 60 * 1000;
+    var chainPath = [];        // [{id,title}] in visit order
+    var chainPathPos = -1;     // index of the video currently playing
 
     function readStoredQuality() {
         storedHeight = 0;
@@ -1250,6 +1326,8 @@
             if (next < 0) return false;
         }
         qualityIdx = next;
+        health.own = false;                          // a hand-made choice outranks the guard
+        if (next < 0) { health.steps = 0; health.bad = 0; }   // back to Auto: allow the guard again
         saveQuality();
         applyQuality();
         updateQualityLabel();
@@ -1266,6 +1344,8 @@
         if (qualityIdx < 0) qualityIdx = 0;
         else if (qualityIdx >= qualityList.length - 1) qualityIdx = -1;
         else qualityIdx += 1;
+        health.own = false;
+        if (qualityIdx < 0) { health.steps = 0; health.bad = 0; }
         saveQuality();
         applyQuality();
         updateQualityLabel();
@@ -1279,6 +1359,76 @@
         } else {
             beacon('CP_Q_NOTSUP', { e: eng && eng.constructor ? eng.constructor.name : 'none' });
         }
+    }
+
+    /* Reads the decoder counters. getVideoPlaybackQuality() is the standard, the
+       webkit_ prefixed pair is what old webOS exposes, and when neither exists we
+       fall back on rebuffer events alone. */
+    function playbackCounters(el) {
+        var dropped = -1, total = -1;
+        try {
+            if (el.getVideoPlaybackQuality) {
+                var q = el.getVideoPlaybackQuality();
+                dropped = q.droppedVideoFrames; total = q.totalVideoFrames;
+            }
+        } catch (e) { }
+        if (dropped < 0) {
+            try { if (typeof el.webkitDroppedFrameCount === 'number') dropped = el.webkitDroppedFrameCount; } catch (e2) { }
+            try { if (typeof el.webkitDecodedFrameCount === 'number') total = el.webkitDecodedFrameCount; } catch (e3) { }
+        }
+        return { dropped: dropped < 0 ? 0 : dropped, total: total < 0 ? 0 : total, known: dropped >= 0 && total > 0 };
+    }
+
+    function resetHealth() {
+        health.at = 0; health.dropped = 0; health.total = 0;
+        health.stalls = 0; health.bad = 0; health.steps = 0; health.own = false;
+        health.id = active ? active.id : '';
+    }
+
+    function noteStall() {
+        if (active) health.stalls++;
+    }
+
+    /* Called from the 250ms UI tick, but only does real work every HEALTH_MS. */
+    function samplePlaybackHealth() {
+        if (!active || !active.engEl || qualityList.length < 2) return;
+        if (health.id !== active.id) resetHealth();
+        var el = active.engEl;
+        var now = Date.now();
+        if (!health.at) { health.at = now; return; }
+        if (now - health.at < HEALTH_MS) return;
+
+        var played = 0;
+        try { played = el.currentTime || 0; } catch (e) { }
+        if (el.paused || played < HEALTH_WARMUP_S) { health.at = now; health.stalls = 0; return; }
+
+        var c = playbackCounters(el);
+        var dTotal = c.total - health.total;
+        var dDrop = c.dropped - health.dropped;
+        var stalls = health.stalls;
+        health.at = now; health.dropped = c.dropped; health.total = c.total; health.stalls = 0;
+
+        var ratio = dTotal > 0 ? dDrop / dTotal : 0;
+        var bad = (c.known && dTotal > 0 && ratio > HEALTH_DROP_RATIO) || (!c.known && stalls >= HEALTH_STALLS) ||
+            (c.known && stalls >= HEALTH_STALLS * 2);
+        if (!bad) { health.bad = 0; return; }
+        if (++health.bad < 2) return;                 // one bad window is just a busy scene
+        health.bad = 0;
+
+        // only ever touch Auto, or a rung this guard lowered itself; a level the
+        // user picked by hand is off limits
+        if (health.steps >= HEALTH_MAX_STEPS) return;
+        if (qualityIdx >= 0 && !health.own) return;
+        var target = qualityList.length - 2 - health.steps;
+        if (target < 0) return;
+        health.steps++;
+        health.own = true;
+        qualityIdx = target;
+        applyQuality();
+        updateQualityLabel();
+        if (qMenuOpen()) renderQualityMenu();
+        chainNotice('Quality lowered to ' + qualityList[target] + 'p - device cannot keep up');
+        beacon('CP_Q_DOWNGRADE', { h: qualityList[target], steps: health.steps, ratio: Math.round(ratio * 100), stalls: stalls });
     }
 
     function updateQualityLabel() {
@@ -1388,9 +1538,13 @@
             if (rows[i].type === 'sep') {
                 row.className = 'yt-cp-row yt-cp-sep';
                 row.style.cssText = 'height:1px;margin:8px 0;background:#5a5a5a;';
-            } else {
-                row.className = 'yt-cp-row';
-                row.style.cssText = 'padding:6px 20px;white-space:nowrap;';
+              } else {
+                  row.className = 'yt-cp-row';
+                  row.style.cssText = 'padding:6px 20px;white-space:nowrap;';
+                  // the row itself must be focusable, otherwise the app's own focus
+                  // model keeps the remote and up/down never reaches the menu
+                  try { row.setAttribute('tabindex', '-1'); } catch (e3) { }
+
                 var text = rows[i].label;
                 if (rows[i].type === 'chain') text += ': ' + (chainEnabled() ? 'on' : 'off');
                 if (rows[i].on) text += '  \u2713';
@@ -1411,13 +1565,21 @@
             n = nodes[i];
             if (!n.className || n.className.indexOf('yt-cp-row') < 0) continue;
             var idx = parseInt(n.getAttribute('data-idx'), 10);
-            var row = qMenuRows[idx];
-            var on = (idx === qMenuIdx);
-            n.style.background = on ? '#3d3d3d' : 'transparent';
-            n.style.color = (!row || row.type === 'sep') ? '#9a9a9a' : '#fff';
-            if (on && n.scrollIntoView) { try { n.scrollIntoView({ block: 'nearest' }); } catch (e) { } }
-        }
-    }
+              var row = qMenuRows[idx];
+              var on = (idx === qMenuIdx);
+              n.style.background = on ? '#3d3d3d' : 'transparent';
+
+              n.style.color = (!row || row.type === 'sep') ? '#9a9a9a' : '#fff';
+              if (on) {
+                  // hold the DOM focus on the highlighted row: the app listens for
+                  // keydown on the focused element and would otherwise walk its own
+                  // focus tree while our cursor sits still
+                  if (n.focus) { try { n.focus(); } catch (e2) { } }
+                  if (n.scrollIntoView) { try { n.scrollIntoView({ block: 'nearest' }); } catch (e3) { } }
+              }
+          }
+      }
+
 
     function positionQualityMenu() {
         if (!qMenu) return;
@@ -1455,7 +1617,8 @@
         renderQualityMenu();
         el.style.display = 'block';
         positionQualityMenu();
-        if (qMenuAnchor && qMenuAnchor.focus && qMenuAnchor.focus) { try { qMenuAnchor.focus(); } catch (e) { } }
+        // renderQualityMenu() already moved the DOM focus onto the active row
+        if (qMenuAnchor && qMenuAnchor.blur) { try { qMenuAnchor.blur(); } catch (e4) { } }
         pokeTransport();
         beacon('CP_QMENU', { open: true, levels: qualityList.join(',') });
         return true;
@@ -1485,10 +1648,11 @@
     }
 
     function movableRow(dir) {
-        var rows = qualityRows(), i, j;
-        if (!rows.length) return;
-        for (i = 0; i < rows.length; i++) {
-            j = (i + dir + rows.length) % rows.length;
+        var rows = qualityRows(), i, j, n = rows.length;
+        if (!n) return;
+        // walk away from the cursor, not from a fixed offset, and wrap around
+        for (i = 1; i <= n; i++) {
+            j = (qMenuIdx + dir * i + n) % n;      // +n keeps the modulo positive
             if (rows[j].type !== 'sep') { qMenuIdx = j; return; }
         }
     }
@@ -1535,16 +1699,38 @@
        watch screen follows along, and the next video's metadata is warmed up
        while the current one is still playing. */
 
+    /* Warming the next video up front: this hits /get_video_info, which both
+       fills the server's 20 minute yt-dlp cache and hands us the payload back so
+       the switch can start instantly instead of waiting on a fresh yt-dlp run. */
     function chainPrefetch(id) {
         if (!id) return;
-        // warms the server-side yt-dlp cache so the switch has no visible stall
-        xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function () { });
+        if (chainPrefetched && chainPrefetched.id === id) return;
+        chainPrefetched = { id: id, text: '', at: Date.now() };
+        xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function (t) {
+            if (!t || !chainPrefetched || chainPrefetched.id !== id) return;
+            chainPrefetched.text = t;
+        });
     }
 
-    function loadChain(id) {
+    function takeChainPrefetch(id) {
+        var pre = chainPrefetched;
+        if (!pre || pre.id !== id || !pre.text) return '';
+        if (Date.now() - pre.at > PREFETCH_TTL_MS) return '';
+        chainPrefetched = null;
+        return pre.text;
+    }
+
+    function loadChain(id, cb) {
         if (!id) return;
-        if (chainFor === id && (chainItems.length || chainLoadingFor === id)) return;
+        if (chainFor === id) {
+            // a request is already on its way: hold the caller until it lands,
+            // firing back with [] right now would make it re-enter chainNext()
+            if (chainLoadingFor === id) { if (cb) chainWaiters.push(cb); return; }
+            if (chainItems.length) { if (cb) cb(chainItems); return; }
+        }
+        chainWaiters = [];
         chainFor = id;
+        chainEmptyFor = '';
         chainItems = [];
         chainLoadingFor = id;
         var req = ++chainRequest;
@@ -1552,11 +1738,26 @@
             if (req !== chainRequest) return;
             chainLoadingFor = '';
             var data = null;
-            try { data = JSON.parse(res); } catch (e) { beacon('CP_CHAIN_BADJSON', {}); return; }
-            if (!data || !data.items || !data.items.length) { beacon('CP_CHAIN_EMPTY', { id: id, src: data && data.source }); return; }
+            try { data = JSON.parse(res); } catch (e) { beacon('CP_CHAIN_BADJSON', {}); chainFlushWaiters(null); return; }
+            if (!data || !data.items || !data.items.length) {
+                beacon('CP_CHAIN_EMPTY', { id: id, src: data && data.source });
+                chainEmptyFor = id;          // don't keep re-asking for the same video
+                chainFlushWaiters(null);
+                return;
+            }
             chainItems = data.items;
             beacon('CP_CHAIN_LIST', { id: id, n: chainItems.length, src: data.source });
+            // resolve the up-next target right now, while the current video plays
+            var first = pickChainItem(id);
+            if (first) chainPrefetch(first.id);
+            chainFlushWaiters(chainItems);
         });
+    }
+
+    function chainFlushWaiters(items) {
+        var w = chainWaiters;
+        chainWaiters = [];
+        for (var i = 0; i < w.length; i++) { try { w[i](items); } catch (e) { } }
     }
 
     function pickChainItem(currentId) {
@@ -1584,7 +1785,42 @@
         } catch (e) { beacon('CP_CHAIN_NAV_FAIL', { id: id, e: String(e) }); }
     }
 
-    function chainToast(item) {
+    /* Session history drives "skip backward": every video we start is appended
+       here, so pressing it again returns to the one we came from. A target that
+       is already in the path just moves the cursor instead of duplicating it. */
+    function chainAdvanceTo(entry) {
+        if (!entry || !entry.id) return;
+        var i, cur = chainPath[chainPathPos];
+        if (cur && cur.id === entry.id) return;
+        for (i = 0; i < chainPath.length; i++) {
+            if (chainPath[i].id === entry.id) {
+                chainPathPos = i;
+                if (entry.title && !chainPath[i].title) chainPath[i].title = entry.title;
+                return;
+            }
+        }
+        // entered from the outside (typed hash, app navigation): drop whatever
+        // "forward" entries we had, this is a new branch
+        if (chainPathPos < chainPath.length - 1) chainPath = chainPath.slice(0, chainPathPos + 1);
+        chainPath.push({ id: entry.id, title: entry.title || '' });
+        chainPathPos = chainPath.length - 1;
+        while (chainPath.length > 80) { chainPath.shift(); chainPathPos--; }
+    }
+
+    function chainPrevItem() {
+        return (chainPathPos > 0 && chainPath[chainPathPos - 1]) ? chainPath[chainPathPos - 1] : null;
+    }
+
+    function chainNextItem() {
+        if (chainPathPos < 0) return null;
+        return chainPath[chainPathPos + 1] || null;
+    }
+
+    function chainNotice(text) {
+        chainToast({ id: '', title: text }, 0);
+    }
+
+    function chainToast(item, dir) {
         var doc = global.document;
         if (!doc || !item) return;
         var host = menuHost();
@@ -1597,7 +1833,8 @@
                 'pointer-events:none;opacity:0;transition:opacity .4s;';
             host.appendChild(el);
         }
-        el.textContent = '\u25b6 ' + (item.title || item.id);
+        var mark = dir < 0 ? '\u25c0 ' : (dir > 0 ? '\u25b6 ' : '');
+        el.textContent = mark + (item.title || item.id);
         try { el.style.opacity = '1'; } catch (e) { }
         if (chainToastTimer) clearTimeout(chainToastTimer);
         chainToastTimer = setTimeout(function () {
@@ -1605,35 +1842,77 @@
         }, 4000);
     }
 
-    function chainNext(currentId) {
-        if (!chainEnabled() || chainBusy) return false;
-        if (getVideoId() !== currentId) return false;      // app is already navigating
-        if (!chainItems.length) { loadChain(currentId); return false; }
-        var next = pickChainItem(currentId);
-        if (!next) {
-            // ranking exhausted: look for a fresh list before giving up
-            if (chainFor !== currentId) { loadChain(currentId); return false; }
-            beacon('CP_CHAIN_DONE', { id: currentId });
-            return false;
-        }
+    /* One place that actually switches video: rewrites the hash (so the app's
+       watch screen follows), drops the finished session and starts the target.
+       dir is +1 for forward, -1 for backward. */
+    function chainGo(entry, dir, manual) {
+        if (!entry || !entry.id || chainBusy) return false;
+        var cur = active ? active.id : getVideoId();
+        if (!manual && cur && getVideoId() !== cur) return false;   // app is navigating on its own
         chainBusy = true;
-        chainItems.shift();
-        chainPlayed.push(next.id);
-        var ahead = chainItems.length ? chainItems[0].id : '';
-        beacon('CP_CHAIN_GO', { from: currentId, to: next.id, title: next.title });
-        chainNavigate(next.id);
-        var el = global.document && global.document.querySelector('.html5-main-video');
-        stopActive();                       // clears chainItems, so read `ahead` first
-        if (ahead) chainPrefetch(ahead);
-        if (el) {
-            startById(next.id, el, function (ok) {
+        chainPendingFor = '';
+        chainAdvanceTo(entry);
+        beacon(dir < 0 ? 'CP_CHAIN_PREV' : 'CP_CHAIN_NEXT', { from: cur, to: entry.id, title: entry.title });
+          chainNavigate(entry.id);
+          var el = global.document && global.document.querySelector('.html5-main-video');
+          stopActive();                     // clears chainItems and chainBusy, so set it again
+          chainBusy = true;
+          // no manual warm-up here: start() -> loadChain() resolves the following
+          // link itself, and prefetching first would evict the payload we are
+          // about to consume for entry.id
+          if (el) {
+
+            startById(entry.id, el, function (ok) {
                 chainBusy = false;
-                if (ok) chainToast(next);
+                if (ok) chainToast(entry, dir);
             });
         } else {
             chainBusy = false;
         }
         return true;
+    }
+
+    function chainNext(currentId, manual) {
+        if (chainBusy) return false;
+        if (!manual && !chainEnabled()) return false;
+        var cur = currentId || (active ? active.id : getVideoId());
+        if (!cur) return false;
+        if (!chainItems.length) {
+            if (chainEmptyFor === cur) {
+                if (!manual) return false;         // nothing to roll over to
+                return true;                        // manual: swallow, do not retry
+            }
+            if (manual) { loadChain(cur, function () { chainNext(cur, true); }); return true; }
+            loadChain(cur);
+            return false;
+        }
+        var next = pickChainItem(cur);
+        if (!next) {
+            // ranking exhausted: look for a fresh list before giving up
+            if (chainFor !== cur) { loadChain(cur, manual ? function () { chainNext(cur, true); } : null); return manual === true; }
+            beacon('CP_CHAIN_DONE', { id: cur });
+            return false;
+        }
+        chainItems.shift();
+        if (chainPlayed.indexOf(next.id) < 0) chainPlayed.push(next.id);
+        return chainGo({ id: next.id, title: next.title }, 1, manual);
+    }
+
+    /* Transport "skip forward" / "skip backward". Forward walks back through
+       visited videos first, then continues down the up-next ranking; backward
+       walks the session history. Both work even with endless playback off. */
+    function chainSkipNext() {
+        if (!active || chainBusy) return false;
+        var hist = chainNextItem();
+        if (hist) return chainGo(hist, 1, true);
+        return chainNext(active.id, true);
+    }
+
+    function chainSkipPrev() {
+        if (!active || chainBusy) return false;
+        var hist = chainPrevItem();
+        if (!hist) { beacon('CP_CHAIN_PREV_NONE', { id: active.id }); return false; }
+        return chainGo(hist, -1, true);
     }
 
     function chainCheck() {
@@ -1684,6 +1963,8 @@
         if (!b) return false;
         var cl = typeof b.className === 'string' ? b.className : '';
         if (/icon-player-play/.test(cl)) { trTogglePlay(); return true; }
+        if (/icon-player-next/.test(cl)) { return chainSkipNext(); }
+        if (/icon-player-prev/.test(cl)) { return chainSkipPrev(); }
         if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
         if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
         if (/yt-cp-quality|icon-player-settings/.test(cl)) { return toggleQualityMenu(b); }
@@ -1696,6 +1977,7 @@
         try {
             bindInputElements();
             updateQualityLabel();
+            samplePlaybackHealth();
             var tc = trEl();
             if (!tc) { trSeen = false; return; }
             if (!trSeen) {
@@ -1734,7 +2016,9 @@
                 if (et) { et.textContent = fmtTime(ct); try { et.classList.remove('no-model'); } catch (err) { } }
                 if (tt) tt.textContent = live ? '' : fmtTime(dur);
                 try { tc.classList.toggle('live-playback', !!live); } catch (err) { }
-                var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff');
+                // the app renders skip/rewind/forward greyed out because its own
+                // player model never reports a state, we drive all of them
+                var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff, #button-list .icon-player-next, #button-list .icon-player-prev');
                 for (i = 0; i < sb.length; i++) try { sb[i].classList.remove('disabled'); } catch (err) { }
                 // the 2016 app keeps its loading spinner forever because its own
                 // player model never reports "started" — hide it once we actually play
@@ -1908,6 +2192,8 @@
                     var cl = typeof b.className === 'string' ? b.className : '';
                     var handled = false;
                     if (/icon-player-play/.test(cl)) { trTogglePlay(); handled = true; }
+                    else if (/icon-player-next/.test(cl)) { chainSkipNext(); handled = true; }
+                    else if (/icon-player-prev/.test(cl)) { chainSkipPrev(); handled = true; }
                     else if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); handled = true; }
                     else if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); handled = true; }
                     else if (/yt-cp-quality|icon-player-settings/.test(cl)) { toggleQualityMenu(b); handled = true; }
@@ -1986,7 +2272,9 @@
         var nm = dupeKeyName(code, e.key || '');
         var st = e.timeStamp ||
             (global.performance && global.performance.now ? global.performance.now() : Date.now());
-        if (nm && nm === lastKeyName && !e.repeat && (st - lastKeyAt) > 0 && (st - lastKeyAt) < KEY_DUP_MS) {
+        // the quality list is exempt: walking a list has no side effects, and
+        // swallowing a fast press there just looks like broken navigation
+        if (!qMenuOpen() && nm && nm === lastKeyName && !e.repeat && (st - lastKeyAt) > 0 && (st - lastKeyAt) < KEY_DUP_MS) {
             if (e.preventDefault) e.preventDefault();
             if (e.stopImmediatePropagation) e.stopImmediatePropagation();
             return;
@@ -2064,15 +2352,23 @@
                 if (stopId2) suppressQuit(stopId2);
                 break;
             case 'MediaRewind':
-            case 'MediaPrevTrack':
                 showTransport();
                 trSeek(-SEEK_STEP);
                 eat();
                 break;
+            case 'MediaPrevTrack':
+                showTransport();
+                chainSkipPrev();
+                eat();
+                break;
             case 'MediaFastForward':
-            case 'MediaNextTrack':
                 showTransport();
                 trSeek(SEEK_STEP);
+                eat();
+                break;
+            case 'MediaNextTrack':
+                showTransport();
+                chainSkipNext();
                 eat();
                 break;
             case 'ArrowLeft':
@@ -2110,7 +2406,22 @@
         }
     }
 
-    try { global.document.addEventListener('keydown', keydownRoot, true); } catch (e) { }
+    /* Keys must be seen before the app's own capture-phase handlers run, and
+       app-prod.js binds those on window/document long after us. index.html
+       installs a window-capture listener as its very first script and parks the
+       event here; without that bootstrap we fall back to the document. */
+    function bindKeydown() {
+        if (global.__ytCpKeydown) { global.__ytCpKeydown = keydownRoot; return true; }
+        return false;
+    }
+
+    try {
+        if (!bindKeydown()) global.document.addEventListener('keydown', keydownRoot, true);
+    } catch (e) { }
+
+    try {
+        global.addEventListener('hashchange', function () { stopIfLeftWatch('hashchange'); }, false);
+    } catch (e2) { }
 
     /* be visible before tv-player.js uses us */
     var Api = {
@@ -2127,8 +2438,12 @@
         getChainEnabled: chainEnabled,
         setChainEnabled: setChainEnabled,
         playRelated: chainNext,
+        skipNext: chainSkipNext,
+        skipPrev: chainSkipPrev,
+        getHistory: function () { return chainPath.slice(); },
         stop: stopActive,
-        _remount: remount
+        _remount: remount,
+        _engineEl: function () { return active ? active.engEl : null; }
     };
 
     global.YTCustomPlayer = Api;
