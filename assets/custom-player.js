@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261016';
+    global.__CUSTOM_PLAYER_VERSION = '20261017';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -963,6 +963,10 @@
         var w = watchSurface();
         var tc = trEl();
         if (!w || !tc) return;                     // only own keys while the watch surface exists
+        var hash = '';
+        try { hash = global.location && global.location.hash || ''; } catch (err) { }
+        if (hash.indexOf('/watch') === -1) return; // non-watch screens: let the app handle its own nav
+        if (!active) return;                       // no running session: let the app drive the screen
         var snapped = false;
         try { snapped = w.classList.contains('snapped'); } catch (err) { }
         if (snapped) return;                       // let the app navigate the behind grid
