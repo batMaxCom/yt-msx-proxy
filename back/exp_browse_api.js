@@ -99,10 +99,10 @@ async function fetchBrowseData(browseId, authHeader = null) {
 
         const isHomeId = ["home", "FEtopics", "FEwhat_to_watch"].includes(browseId);
 
-        if (!authHeader && isHomeId && summary.shelves === 0) {
+        if (isHomeId && summary.shelves === 0) {
             logger.warn('browse', 'BROWSE_HOME_EMPTY', {
                 browseId,
-                reason: 'unauthenticated home has no shelves',
+                reason: 'no usable shelves returned',
                 kinds: summary.kinds.join(','),
             });
 
@@ -136,7 +136,7 @@ async function fetchBrowseData(browseId, authHeader = null) {
 
         const isHomeId = ["home", "FEtopics", "FEwhat_to_watch"].includes(browseId);
 
-        if (!authHeader && isHomeId) {
+        if (isHomeId) {
             logger.error('browse', 'BROWSE_ERROR_FALLBACK', {
                 browseId,
                 reason: error.message,

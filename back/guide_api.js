@@ -2,6 +2,13 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
+function guideTitleText(formattedTitle) {
+    if (!formattedTitle) return '';
+    if (Array.isArray(formattedTitle.runs)) return formattedTitle.runs.map(r => r.text || '').join('');
+    if (formattedTitle.simpleText) return formattedTitle.simpleText;
+    return '';
+}
+
 function replaceBrowseId(obj) {
     if (Array.isArray(obj)) {
         obj.forEach(item => replaceBrowseId(item)); 
@@ -44,7 +51,7 @@ async function fetchGuideData(authToken = null) {
         context: {
             client: {
                 clientName: 'TVHTML5',
-                clientVersion: '6.90240701.16.00',
+                clientVersion: '7.20250205.16.00',
                 hl: 'en',
                 gl: 'US',
             }
@@ -71,8 +78,8 @@ async function fetchGuideData(authToken = null) {
             response.data.items.forEach(section => {
                 if (section.guideSectionRenderer && Array.isArray(section.guideSectionRenderer.items)) {
                     section.guideSectionRenderer.items = section.guideSectionRenderer.items.filter(item => {
-                        return !(item.guideEntryRenderer && item.guideEntryRenderer.formattedTitle &&
-                            item.guideEntryRenderer.formattedTitle.runs.some(run => run.text === "More"));
+                        return !(item.guideEntryRenderer &&
+                            guideTitleText(item.guideEntryRenderer.formattedTitle) === "More");
                     });
 
                     /*
@@ -130,14 +137,21 @@ async function fetchGuideData(authToken = null) {
 
                     */
 
-                    if (!section.guideSectionRenderer.items.some(item => item.guideEntryRenderer && 
-                        item.guideEntryRenderer.formattedTitle.runs.some(run => run.text === "Settings"))) {
+                    if (!section.guideSectionRenderer.items.some(item => item.guideEntryRenderer &&
+                        guideTitleText(item.guideEntryRenderer.formattedTitle) === "Settings")) {
                         section.guideSectionRenderer.items.push(settingsItem);
                     }
 
                     
 
                     section.guideSectionRenderer.items.forEach(item => {
+
+                        if (item.guideEntryRenderer) {
+                            const ft = item.guideEntryRenderer.formattedTitle;
+                            if (ft && typeof ft.simpleText === 'string' && !Array.isArray(ft.runs)) {
+                                item.guideEntryRenderer.formattedTitle = { runs: [{ text: ft.simpleText }] };
+                            }
+                        }
 
                         if (item.guideEntryRenderer && !item.guideEntryRenderer.icon) {
                             item.guideEntryRenderer.icon = {
@@ -169,19 +183,6 @@ async function fetchGuideData(authToken = null) {
             });
         }
 
-        if (response.data && Array.isArray(response.data.items)) {
-            if (!Array.isArray(response.data.stuff)) {
-                response.data.stuff = []; 
-            }
-
-            const firstGuideSectionIndex = response.data.items.findIndex(section => section.guideSectionRenderer);
-            if (firstGuideSectionIndex !== -1) {
-                const firstGuideSection = response.data.items[firstGuideSectionIndex].guideSectionRenderer;
-                response.data.stuff.push(firstGuideSection);
-                response.data.items.splice(firstGuideSectionIndex, 1);
-            }
-        }
-
         replaceBrowseId(response.data);
 
         const timestamp = Math.floor(Date.now() / 1000);
@@ -191,7 +192,16 @@ async function fetchGuideData(authToken = null) {
         return response.data;
     } catch (error) {
         console.error('Error fetching guide data:', error.message);
-        throw new Error('Failed to fetch data from YouTube Guide API.');
+
+        try {
+            const rawData = fs.readFileSync(filePath, 'utf-8');
+            const guideData = JSON.parse(rawData);
+            console.log('Guide API failed, falling back to fixed guide data.');
+            return guideData;
+        } catch (fallbackError) {
+            console.error('Error reading fixed guide data:', fallbackError.message);
+            throw new Error('Failed to fetch data from YouTube Guide API.');
+        }
     }
 }
 

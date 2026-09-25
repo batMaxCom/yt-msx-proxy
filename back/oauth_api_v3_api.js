@@ -84,6 +84,15 @@ async function requestToken(client_id, device_code, client_secret, grant_type, r
             throw new Error('Unexpected error during token request: ' + response.data.error_description);
         }
     } catch (error) {
+        const data = error.response && error.response.data;
+
+        if (data && (data.error === 'authorization_pending' || data.error === 'slow_down')) {
+            const e = new Error(`Token not ready yet: ${data.error}`);
+            e.passThrough = true;
+            e.data = data;
+            throw e;
+        }
+
         console.error('Error during token request:', error.message);
 
         if (error.response) {
@@ -211,13 +220,14 @@ const oauthRouter = (app) => {
         }
 
         try {
-            const { device_code, user_code, verification_url, expires_in } = await requestDeviceCode(client_id, scope);
+            const deviceData = await requestDeviceCode(client_id, scope);
 
             res.json({
-                device_code,
-                user_code,
-                verification_url,
-                expires_in
+                device_code: deviceData.device_code,
+                user_code: deviceData.user_code,
+                verification_url: deviceData.verification_url,
+                expires_in: deviceData.expires_in,
+                interval: deviceData.interval
             });
         } catch (error) {
             const errorMessage = `Error during device code request: ${error.message}`;
@@ -269,6 +279,11 @@ const oauthRouter = (app) => {
                 logErrorToFile(errorMessage);
             }
         } catch (error) {
+            if (error.passThrough) {
+                res.status(200).json(error.data);
+                return;
+            }
+
             console.error('Error during token request:', error.message);
     
             // Handle specific errors based on response status
