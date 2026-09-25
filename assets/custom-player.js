@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261017';
+    global.__CUSTOM_PLAYER_VERSION = '20261018';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -955,6 +955,33 @@
     try { bindInputDocument(); } catch (e) { }
     try { bindInputElements(); } catch (e) { }
 
+    /* webOS/LG can deliver one physical remote press as TWO keydowns with the
+       same (or logically-equivalent) keyCode ~50ms apart. Deduplicate by logical
+       key so a single press steps once — in the player AND in the app's own page
+       navigation. Held auto-repeat (e.repeat) is kept for continuous seek/scroll. */
+    var lastKeyName = null;
+    var lastKeyAt = 0;
+    var KEY_DUP_MS = 150;
+    function dupeKeyName(code, k) {
+        if (code === 8 || code === 27 || code === 461 || code === 462) return 'back';
+        if (code === 178 || code === 179 || code === 415 || code === 19) return 'play';
+        return k === ' ' ? 'space' : code;
+    }
+    function keydownRoot(e) {
+        var code = e.keyCode || e.which || 0;
+        var nm = dupeKeyName(code, e.key || '');
+        var st = e.timeStamp ||
+            (global.performance && global.performance.now ? global.performance.now() : Date.now());
+        if (nm && nm === lastKeyName && !e.repeat && (st - lastKeyAt) > 0 && (st - lastKeyAt) < KEY_DUP_MS) {
+            if (e.preventDefault) e.preventDefault();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+            return;
+        }
+        lastKeyName = nm;
+        lastKeyAt = st;
+        handleKey(e);
+    }
+
     function handleKey(e) {
         var tgt = e.target;
         var tag = (tgt && (tgt.tagName || '')) || '';
@@ -1062,7 +1089,7 @@
         }
     }
 
-    try { global.document.addEventListener('keydown', handleKey, true); } catch (e) { }
+    try { global.document.addEventListener('keydown', keydownRoot, true); } catch (e) { }
 
     /* be visible before tv-player.js uses us */
     var Api = {
