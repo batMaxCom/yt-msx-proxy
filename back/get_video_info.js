@@ -47,108 +47,9 @@ const streamMap = new Map();       // streamId -> { url, expiresAt, videoId, ita
 const refreshLocks = new Map();    // streamId -> Promise<entry> (single-flight refresh)
 const hlsMap = new Map();          // videoId -> { video:{url,expiresAt}, audio:{url,expiresAt}, expiresAt, videoId }
 
-// ---- full-file stream cache: upstream throttles sustained downloads from a
-// datacenter IP, so we download each webm once in the background and then serve
-// it from local disk (instant, no throttling). ----
-const STREAM_DIR = path.join(__dirname, 'streams');
-const streamDownloadLocks = new Map(); // streamId -> Promise (single-flight fill)
-const STREAM_CACHE_MAX_MB = 2000;
-const MAX_STREAM_FILLS = 2;         // concurrent background fills (upstream-friendly)
-const fillQueue = [];
-let activeStreamFills = 0;
-try { fs.mkdirSync(STREAM_DIR, { recursive: true }); } catch (e) { }
-
-function pruneStreamCache() {
-    let total = 0;
-    const files = [];
-    try {
-        for (const f of fs.readdirSync(STREAM_DIR)) {
-            if (f.endsWith('.part')) continue;
-            const p = path.join(STREAM_DIR, f);
-            const s = fs.statSync(p);
-            total += s.size;
-            files.push({ p, mtime: s.mtimeMs, size: s.size });
-        }
-    } catch (e) { return; }
-    if (total <= STREAM_CACHE_MAX_MB * 1024 * 1024) return;
-    files.sort((a, b) => a.mtime - b.mtime);
-    for (const f of files) {
-        try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { }
-        if (total <= STREAM_CACHE_MAX_MB * 1024 * 1024) break;
-    }
-}
-
-function downloadStreamToFile(streamId, url) {
-    const dest = path.join(STREAM_DIR, streamId + '.webm');
-    if (fs.existsSync(dest)) return Promise.resolve(streamId);
-    if (streamDownloadLocks.has(streamId)) return streamDownloadLocks.get(streamId);
-    const part = path.join(STREAM_DIR, streamId + '.part');
-    const p = new Promise(resolve => {
-        const start = () => {
-            activeStreamFills += 1;
-            (async () => {
-                const resp = await axios.get(url, {
-                    responseType: 'arraybuffer',
-                    timeout: 120000,
-                    maxRedirects: 5,
-                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 2016YouTubeTV/1.0)' },
-                });
-                const buf = Buffer.from(resp.data);
-                if (!buf.length) throw new Error('empty body');
-                fs.writeFileSync(part, buf);
-                try { fs.renameSync(part, dest); } catch (e) { fs.writeFileSync(dest, buf); }
-                logger.info('stream', 'STREAM_CACHE_FILLED', { stream_id: streamId, bytes: buf.length });
-            })().catch(err => {
-                logger.warn('stream', 'STREAM_CACHE_DOWNLOAD_FAIL', {
-                    stream_id: streamId,
-                    message: String(err.message || err).slice(0, 200),
-                });
-            }).finally(() => {
-                try { fs.unlinkSync(part); } catch (e) { }
-                streamDownloadLocks.delete(streamId);
-                activeStreamFills -= 1;
-                pumpStreamFills();
-                pruneStreamCache();
-                resolve(streamId);
-            });
-        };
-        if (activeStreamFills >= MAX_STREAM_FILLS) fillQueue.push(start);
-        else start();
-    });
-    streamDownloadLocks.set(streamId, p);
-    return p;
-}
-
-function pumpStreamFills() {
-    while (activeStreamFills < MAX_STREAM_FILLS && fillQueue.length) {
-        const next = fillQueue.shift();
-        next();
-    }
-}
-
-// Pre-warm the disk cache for the webm formats the player actually uses
-// (smallest itag video + smallest itag audio), so a first click doesn't wait
-// for the upstream-throttled download.
-function warmBestWebm(videoId, formats) {
-    if (!Array.isArray(formats)) return;
-    let bestVideo = null;
-    let bestAudio = null;
-    for (const f of formats) {
-        if (!f || !f.url || !f.format_id) continue;
-        const mime = (f.mime || f.type || '').split(';')[0];
-        if (mime === 'video/webm') {
-            const it = parseInt(f.format_id, 10);
-            if (isNaN(it)) continue;
-            if (!bestVideo || it < parseInt(bestVideo.format_id, 10)) bestVideo = f;
-        } else if (mime === 'audio/webm') {
-            const it = parseInt(f.format_id, 10);
-            if (isNaN(it)) continue;
-            if (!bestAudio || it < parseInt(bestAudio.format_id, 10)) bestAudio = f;
-        }
-    }
-    if (bestVideo) downloadStreamToFile(`${videoId}_${bestVideo.format_id}`, bestVideo.url);
-    if (bestAudio) downloadStreamToFile(`${videoId}_${bestAudio.format_id}`, bestAudio.url);
-}
+// ---- streaming proxy mode ----
+// /api/stream is a pure relay: the server receives bytes from YouTube and
+// proxies them to the client. No full-file downloads, no on-disk caching.
 
 function parseExpireSeconds(url) {
     try {
@@ -706,22 +607,7 @@ function handleStreamRequest(req, res) {
         proxyHeaders['Range'] = rangeHeader;
     }
 
-    // Serve a fully-cached copy from local disk when available (fast, avoids
-    // the upstream sustained-download throttle). Otherwise kick off a
-    // background fill and proxy live as before.
-    const cachedPath = path.join(STREAM_DIR, streamId + '.webm');
-    if (fs.existsSync(cachedPath)) {
-        logger.info('stream', 'STREAM_CACHE_HIT', {
-            event: 'STREAM_CACHE_HIT',
-            video_id: entry.videoId,
-            itag: entry.itag,
-            range: rangeHeader || '',
-        });
-        res.set('Cache-Control', 'public, max-age=86400');
-        return res.sendFile(cachedPath);
-    }
-    downloadStreamToFile(streamId, entry.url);
-
+    // Pure relay: always proxy live from YouTube. No disk cache.
     const startProxy = (targetUrl, allowRefresh) => {
         // Cluster-aligned middleware: when the player requests a mid-file byte
         // range right after a seek (&seek=1), serve the bytes starting at the
@@ -829,10 +715,6 @@ function handleGetVideoInfo(req, res) {
                 duration: videoDuration,
                 formats_total: output.formats ? output.formats.length : 0,
             });
-
-            // Kick the disk-cache fill for the webm formats the player will
-            // request, so a first play doesn't wait on the throttled upstream.
-            try { warmBestWebm(videoId, output.formats); } catch (e) { }
 
             const adaptiveFmts = [];
             const fmtListArr = [];
@@ -1148,23 +1030,46 @@ function buildHlsEntry(videoId, formats) {
     };
 }
 
+const BROWSER_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// Small in-memory cache for HLS media playlists (a few dozen KB of text) so
+// repeated client requests don't re-fetch the upstream manifest every time and
+// TV/desktop start instantly. This is metadata, not media bytes.
+const hlsMediaCache = new Map(); // absUrl -> { text, ts }
+
+function cacheHlsMedia(url, text) {
+    try { if (hlsMediaCache.size > 64) hlsMediaCache.clear(); } catch (e) { }
+    hlsMediaCache.set(url, { text, ts: Date.now() });
+}
+
 async function fetchHlsPlaylist(absUrl, videoId) {
+    const cached = hlsMediaCache.get(absUrl);
+    if (cached && Date.now() - cached.ts < 150000) return cached.text;
     let resp;
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            resp = await axios.get(absUrl, { responseType: 'text', timeout: 90000, maxRedirects: 5 });
+            resp = await axios.get(absUrl, {
+                responseType: 'text',
+                timeout: 60000,
+                maxRedirects: 5,
+                headers: { 'User-Agent': BROWSER_UA },
+            });
         } catch (err) {
             if (attempt === 3) throw err;
             await new Promise(r => setTimeout(r, 500 * attempt));
             continue;
         }
-        if (resp.data && String(resp.data).trim()) break;
+        const data = String(resp.data || '');
+        if (data.trim().startsWith('#EXTM3U') || data.trim().length > 20) {
+            break;
+        }
+        logger.warn('hls', 'playlist not usable, retrying', { video_id: videoId, attempt, len: data.length });
         if (attempt === 3) break;
-        logger.warn('hls', 'empty playlist, retrying', { video_id: videoId, attempt });
         await new Promise(r => setTimeout(r, 500 * attempt));
     }
     const prefix = `/api/hls/${videoId}/p/`;
-    const rewritten = String(resp.data)
+    const rewritten = String(resp.data || '')
         .split(/\r?\n/)
         .map(line => {
             const trimmed = String(line).trim();
@@ -1192,6 +1097,7 @@ async function fetchHlsPlaylist(absUrl, videoId) {
             return `${prefix}${encodeURIComponent(absolute)}`;
         })
         .join('\n');
+    if (rewritten.trim().startsWith('#EXTM3U')) cacheHlsMedia(absUrl, rewritten);
     return rewritten;
 }
 

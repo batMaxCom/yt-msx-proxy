@@ -4,8 +4,9 @@
  * server proxy (/get_video_info, /api/hls, /api/stream) and never asks
  * for Flash. Strategy per environment:
  *   1. nativehls   — video element plays the master m3u8 (WebOS WAM, Safari...)
- *   2. msewebm     — MediaSource with whole VP9/Opus WebM streams (Chrome/desktop)
- *   3. progressive — single muxed MP4 (itag=18) served with Range support
+ *   2. hlsjs       — hls.js transmux on desktop (per-segment proxy, no throttle)
+ *   3. msewebm     — MediaSource with whole VP9/Opus WebM streams (Chromium)
+ *   4. progressive — single muxed MP4 (itag=18) served with Range support
  */
 (function (global) {
     'use strict';
@@ -92,6 +93,48 @@
     }
     EngineNativeHls.prototype = Object.create(Engine.prototype);
     EngineNativeHls.prototype.constructor = EngineNativeHls;
+
+    function EngineHlsJs(conf) {
+        this.conf = conf;
+        Engine.call(this);
+        var self = this;
+        var Hls = global.Hls;
+        if (!Hls || !Hls.isSupported || !Hls.isSupported()) { this._ok = false; return; }
+        this._ok = true;
+        var hls = new Hls({
+            enableWorker: true,
+            manifestLoadingTimeOut: 20000,
+            manifestLoadingMaxRetry: 4,
+            manifestLoadingRetryDelay: 1000,
+            levelLoadingTimeOut: 20000,
+            fragLoadingTimeOut: 30000,
+            fragLoadingMaxRetry: 6
+        });
+        this._hls = hls;
+        hls.attachMedia(conf.el);
+        hls.on(Hls.Events.MANIFEST_PARSED, function () {
+            if (self.stopped) return;
+            beacon('HLSJS_READY', { levels: hls.levels ? hls.levels.length : -1 });
+            hideFrameworkEl();
+            if (conf.el.paused) {
+                var p = conf.el.play();
+                if (p && p.catch) p.catch(function () { });
+            }
+        });
+        hls.on(Hls.Events.ERROR, function (evt, data) {
+            beacon('HLSJS_ERROR', { type: data && data.type, details: data && data.details, fatal: data && data.fatal });
+            if (data && data.fatal) {
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) try { hls.startLoad(); } catch (e) { }
+            }
+        });
+        hls.loadSource(conf.hlsUrl);
+    }
+    EngineHlsJs.prototype = Object.create(Engine.prototype);
+    EngineHlsJs.prototype.constructor = EngineHlsJs;
+    EngineHlsJs.prototype.close = function () {
+        Engine.prototype.close.call(this);
+        try { if (this._hls) this._hls.destroy(); } catch (e) { }
+    };
 
     function EngineMseWebm(conf) {
         this.conf = conf;
@@ -233,20 +276,44 @@
     /* ---------------- main API ---------------- */
 
     var active = null;
+    var ownElTimer = 0;
     var onSeekHandler = onSeek;
 
     /* The framework's element gets wedged by the 2016 app's own load()/error cycles
        and then buffers into MSE forever without decoding (rs:0). For MSE engines we
        use a fresh element of our own; nativehls (TV) keeps the framework element. */
+    function fitOwnEl(vid) {
+        var host = global.document && global.document.querySelector('.html5-main-video');
+        if (!host || !vid || vid.parentNode !== global.document.body) return;
+        try {
+            var r = host.getBoundingClientRect();
+            if (!r || !(r.width > 0) || !(r.height > 0) || isNaN(r.left) || isNaN(r.top)) return;
+            vid.style.position = 'fixed';
+            vid.style.left = r.left + 'px';
+            vid.style.top = r.top + 'px';
+            vid.style.width = r.width + 'px';
+            vid.style.height = r.height + 'px';
+            try { vid.style.objectFit = global.getComputedStyle(host).objectFit || 'contain'; } catch (e) { }
+        } catch (e) { }
+    }
+
     function makeOwnEl() {
         var host = global.document && global.document.querySelector('.html5-main-video');
-        var parent = (host && host.parentElement) || (global.document && global.document.body);
+        var body = global.document && global.document.body;
         var vid = global.document.createElement('video');
         vid.setAttribute('playsinline', '');
-        // Transparent until the first frame decodes, so the framework's own
-        // bootstrap (poster/spinner) stays visible below instead of a black box.
-        vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:2147483000;pointer-events:none;background:transparent;';
-        if (parent) { try { parent.appendChild(vid); } catch (e) { } }
+        // Transparent until the first frame decodes, and pinned to the framework
+        // video's exact on-screen box (fixed positioning + rect from
+        // getBoundingClientRect) so it never spills over the navigation/title UI.
+        vid.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483000;pointer-events:none;background:transparent;';
+        try { if (body) body.appendChild(vid); } catch (e) { }
+        fitOwnEl(vid);
+        if (!ownElTimer) {
+            ownElTimer = setInterval(function () {
+                if (active && active.ownEl) fitOwnEl(active.ownEl);
+            }, 800);
+        }
+        try { global.addEventListener('resize', function () { if (active && active.ownEl) fitOwnEl(active.ownEl); }); } catch (e) { }
         beacon('CP_OWNEL', {});
         return vid;
     }
@@ -310,6 +377,12 @@
         if (nativeHlsOk(el)) {
             eng = new EngineNativeHls({ el: el, hlsUrl: hlsUrl });
             beacon('CP_ENGINE', { k: 'nativehls', id: id });
+        } else if (global.Hls && global.Hls.isSupported && global.Hls.isSupported()) {
+            // hls.js on desktop: every TS segment is a small, fresh upstream
+            // request proxied by /api/hls — no sustained-download throttling.
+            engEl = makeOwnEl();
+            eng = new EngineHlsJs({ el: engEl, hlsUrl: hlsUrl });
+            beacon('CP_ENGINE', { k: 'hlsjs', id: id });
         } else if (mseOk('video/webm; codecs="vp9"')) {
             var v = bestVideo(links);
             var au = bestAudio(links);
@@ -408,6 +481,13 @@
                 if (!lost && !active.ownEl) {
                     lost = (el.readyState === 0 && !/^blob:/.test(el.currentSrc || el.src || ''));
                 }
+                if (!lost && active.id !== id) {
+                    beacon('CP_NAV', { from: active.id, to: id });
+                    stopActive();
+                    lastCandidate = 0;
+                    poll();
+                    return;
+                }
                 if (!lost) { lastCandidate = 0; poll(); return; }
                 stopActive();
             }
@@ -434,6 +514,63 @@
             startById(id, el);
         }
     }
+
+    /* ---- keyboard control: Esc quit, arrows volume/seek, space play/pause ---- */
+
+    function handleKey(e) {
+        if (!active || !active.engEl) return;
+        var tgt = e.target;
+        var tag = (tgt && (tgt.tagName || '')) || '';
+        if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (tgt && tgt.isContentEditable)) return;
+        var k = e.key || '';
+        var code = e.keyCode || e.which || 0;
+        var key = k === ' ' ? 'space' : (k || String.fromCharCode(code));
+        var engEl = active.engEl;
+        switch (key) {
+            case ' ':
+            case 'space':
+                if (e.repeat) break;
+                try {
+                    if (engEl.paused) { var p = engEl.play(); if (p && p.catch) p.catch(function () { }); }
+                    else engEl.pause();
+                } catch (err) { }
+                beacon('CP_KBD', { k: 'space', t: Math.round((engEl.currentTime || 0) * 10) / 10 });
+                if (e.preventDefault) e.preventDefault();
+                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                break;
+            case 'ArrowUp':
+            case 'ArrowDown':
+                try {
+                    var v = Math.max(0, Math.min(1, (engEl.volume || 0) + (key === 'ArrowUp' ? 0.1 : -0.1)));
+                    engEl.volume = v;
+                    var fw = global.document && global.document.querySelector('.html5-main-video');
+                    if (fw && fw !== engEl) fw.volume = v;
+                    beacon('CP_KBD', { k: key, v: Math.round(v * 100) / 100 });
+                } catch (err) { }
+                if (e.preventDefault) e.preventDefault();
+                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                break;
+            case 'ArrowLeft':
+            case 'ArrowRight':
+                try {
+                    var dur = engEl.duration;
+                    var max = isFinite(dur) && dur > 0 ? dur : Number.MAX_SAFE_INTEGER;
+                    var nt = Math.max(0, Math.min(max, (engEl.currentTime || 0) + (key === 'ArrowRight' ? 10 : -10)));
+                    engEl.currentTime = nt;
+                    beacon('CP_KBD', { k: key, t: Math.round(nt * 10) / 10 });
+                } catch (err) { }
+                if (e.preventDefault) e.preventDefault();
+                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                break;
+            case 'Escape':
+                try { beacon('CP_KBD', { k: 'esc', id: active.id }); } catch (err) { }
+                stopActive();
+                // do NOT swallow: the TV app handles Esc (27) itself and navigates back
+                break;
+        }
+    }
+
+    try { global.document.addEventListener('keydown', handleKey, true); } catch (e) { }
 
     /* be visible before tv-player.js uses us */
     var Api = {
