@@ -1019,6 +1019,31 @@ function buildHlsEntry(videoId, formats) {
 
     const videoExp = parseExpireSeconds(videoChosen.url);
     const audioExp = parseExpireSeconds(audioChosen.url);
+
+    // All usable video renditions (deduped by height, AVC preferred) so the
+    // client can offer a quality picker. Heights ascend for stable ordering.
+    const byHeight = new Map(); // height -> candidate
+    for (const f of videoCandidates) {
+        const h = f.height || 0;
+        if (!h) continue;
+        const prev = byHeight.get(h);
+        if (!prev) { byHeight.set(h, f); continue; }
+        const prevAvc = String(prev.vcodec || '').toLowerCase().includes('avc');
+        const curAvc = String(f.vcodec || '').toLowerCase().includes('avc');
+        if (!prevAvc && curAvc) byHeight.set(h, f);
+    }
+    const variants = Array.from(byHeight.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([h, f]) => ({
+            height: h,
+            width: f.width || 0,
+            itag: String(f.format_id || ''),
+            url: f.url,
+            codec: String(f.vcodec || '').split('.')[0] || 'avc1',
+            tbr: Number(f.tbr) || 0,
+            expiresAt: parseExpireSeconds(f.url) ? parseExpireSeconds(f.url) * 1000 : Date.now() + 6 * 60 * 60 * 1000,
+        }));
+
     return {
         video: { url: videoChosen.url, expiresAt: videoExp ? videoExp * 1000 : Date.now() + 6 * 60 * 60 * 1000 },
         audio: { url: audioChosen.url, expiresAt: audioExp ? audioExp * 1000 : Date.now() + 6 * 60 * 60 * 1000 },
@@ -1026,6 +1051,7 @@ function buildHlsEntry(videoId, formats) {
             videoExp ? videoExp * 1000 : Date.now() + 6 * 60 * 60 * 1000,
             audioExp ? audioExp * 1000 : Date.now() + 6 * 60 * 60 * 1000
         ),
+        variants,
         videoId,
     };
 }
@@ -1123,14 +1149,46 @@ async function handleHlsRequest(req, res) {
 
         if (!sub) {
             const base = `http://${req.headers.host || `${serverIp}:8090`}`;
-            const encVideo = encodeURIComponent(entry.video.url);
             const encAudio = encodeURIComponent(entry.audio.url);
+            const qH = parseInt(req.query && req.query.q, 10) || 0;
+
+            const chosen = [];
+            if (qH > 0 && Array.isArray(entry.variants)) {
+                const hit = entry.variants.find(v => v.height === qH) ||
+                    entry.variants.reduce((best, v) => {
+                        if (!best) return v;
+                        return Math.abs(v.height - qH) < Math.abs(best.height - qH) ? v : best;
+                    }, null);
+                if (hit) chosen.push(hit);
+                else for (const v of entry.variants) chosen.push(v);
+            } else if (Array.isArray(entry.variants) && entry.variants.length) {
+                for (const v of entry.variants) chosen.push(v);
+            } else {
+                const fall = {
+                    height: (decodeURIComponent(entry.video.url).match(/itag=(\d+)/) || [])[1] || '',
+                    width: 0, itag: '', url: entry.video.url, codec: '', tbr: 0, expiresAt: entry.video.expiresAt,
+                };
+                chosen.push(fall);
+            }
+
+            const bwOf = v => {
+                if (v.tbr > 0) return Math.round(v.tbr * 1000);
+                return ({ 144: 120000, 240: 350000, 360: 800000, 480: 1300000, 720: 2500000, 1080: 5000000 })[v.height] || 900000;
+            };
+            const streams = chosen.map(v => {
+                const encV = encodeURIComponent(v.url);
+                const bw = bwOf(v);
+                const vcodec = v.codec && /^[a-z0-9.]+$/i.test(v.codec) ? v.codec : 'avc1.4d401e';
+                const codecs = `${vcodec},mp4a.40.2`;
+                return `#EXT-X-STREAM-INF:BANDWIDTH=${bw},AVERAGE-BANDWIDTH=${Math.round(bw * 0.8)},RESOLUTION=${(v.width || 1280)}x${v.height || 360},CODECS="${codecs}",AUDIO="audio"\n` +
+                    `${base}/api/hls/${videoId}/p/${encV}\n`;
+            }).join('');
+
             const master =
                 `#EXTM3U\n` +
                 `#EXT-X-VERSION:3\n` +
                 `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="aac",DEFAULT=YES,AUTOSELECT=YES,URI="${base}/api/hls/${videoId}/p/${encAudio}"\n` +
-                `#EXT-X-STREAM-INF:BANDWIDTH=900000,AVERAGE-BANDWIDTH=700000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="audio"\n` +
-                `${base}/api/hls/${videoId}/p/${encVideo}\n`;
+                streams;
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(master);
         }
