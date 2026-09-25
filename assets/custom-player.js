@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261015';
+    global.__CUSTOM_PLAYER_VERSION = '20261016';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -762,6 +762,10 @@
                 if (tray) tray.style.display = 'none';
                 var pvt = global.document.querySelector('.player-video-text');
                 if (pvt) pvt.style.display = 'none';
+                var info = global.document.querySelectorAll('#html5-video-info-panel, .html5-video-info-panel, #movie_player .html5-video-info, .video-info-panel');
+                for (var ii = 0; ii < info.length; ii++) {
+                    try { info[ii].style.display = 'none'; } catch (e2) { }
+                }
             }
         } catch (e) { }
     }
