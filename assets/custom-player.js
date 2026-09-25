@@ -1194,15 +1194,37 @@
     /* ---- adaptive quality guard ----
        "Auto" means the highest rendition, which is what we always asked for. On a
        weak TV or a congested network that choice is simply unplayable, so we watch
-       the real decode numbers and step down one rung when the device clearly cannot
-       keep up. Only ever touches Auto, and only a few times per video, so a single
-       busy scene cannot talk us down a whole ladder. */
-    var health = { at: 0, dropped: 0, total: 0, stalls: 0, bad: 0, steps: 0, id: '', own: false };
-    var HEALTH_MS = 3000;          // sampling window
-    var HEALTH_WARMUP_S = 8;       // ignore startup buffering
-    var HEALTH_DROP_RATIO = 0.08;  // >8% dropped frames counts as "cannot keep up"
-    var HEALTH_STALLS = 2;         // or this many rebuffer events in one window
-    var HEALTH_MAX_STEPS = 3;      // never walk more than 3 rungs down on our own
+       the device and move one rung at a time: down when it demonstrably cannot keep
+       up, back up when it is comfortably ahead.
+
+       Two very different failures look identical from the outside, and a guard that
+       only understands one of them is useless in practice:
+
+         - the decoder is too slow. Frames get dropped, but playback continues.
+         - the download is too slow. Nothing gets dropped, because there is nothing
+           to decode: the media simply stops advancing, readyState sags and `waiting`
+           fires. Watching dropped frames alone sees a perfectly healthy 0%.
+
+       So starvation is measured on its own terms, and any one of the three signals
+       is enough. Only ever touches Auto, and only a few times per video, so a single
+       busy scene cannot walk a whole ladder and a struggling device cannot flap. */
+    var health = { at: 0, started: 0, progress: 0, media: -1, dropped: 0, total: 0, stalls: 0, bad: 0, good: 0, steps: 0, moves: 0, cycles: 0, id: '', own: false };
+    var HEALTH_MS = 3000;            // sampling window
+    var HEALTH_WARMUP_MS = 6000;     // wall clock, deliberately NOT currentTime: a
+                                     // stream that dies before 6s must still be
+                                     // allowed to ask for less, not stay frozen
+    var HEALTH_PROGRESS_EPS = 0.05;  // how far the media has to move to count as progress
+    var HEALTH_STARVE_MS = 1200;     // this much of a window with no progress is bad
+    var HEALTH_STARVE_HARD_MS = 2400;// this much starving needs no second window
+    var HEALTH_DROP_RATIO = 0.08;    // >8% dropped frames counts as "cannot keep up"
+    var HEALTH_STALLS = 2;           // or this many rebuffer events in one window
+    var HEALTH_BAD_RUN = 2;          // bad windows before stepping down
+    var HEALTH_CLEAN_RATIO = 0.02;   // and this clean, with no stalls, before stepping up
+    var HEALTH_GOOD_RUN = 5;         // clean windows before climbing - deliberately slower
+    var HEALTH_MAX_STEPS = 3;        // downgrades per cycle
+    var HEALTH_MAX_MOVES = 8;        // level changes per cycle
+    var HEALTH_MAX_CYCLES = 2;       // down-and-up round trips per video, then it stops
+
 
     /* ---- continuous ("endless") playback state ---- */
     var chainOn = true;
@@ -1327,7 +1349,8 @@
         }
         qualityIdx = next;
         health.own = false;                          // a hand-made choice outranks the guard
-        if (next < 0) { health.steps = 0; health.bad = 0; }   // back to Auto: allow the guard again
+        health.bad = 0; health.good = 0;
+        if (next < 0) { health.steps = 0; health.moves = 0; }   // back to Auto: allow the guard again
         saveQuality();
         applyQuality();
         updateQualityLabel();
@@ -1345,7 +1368,8 @@
         else if (qualityIdx >= qualityList.length - 1) qualityIdx = -1;
         else qualityIdx += 1;
         health.own = false;
-        if (qualityIdx < 0) { health.steps = 0; health.bad = 0; }
+        health.bad = 0; health.good = 0;
+        if (qualityIdx < 0) { health.steps = 0; health.moves = 0; }
         saveQuality();
         applyQuality();
         updateQualityLabel();
@@ -1380,13 +1404,73 @@
     }
 
     function resetHealth() {
-        health.at = 0; health.dropped = 0; health.total = 0;
-        health.stalls = 0; health.bad = 0; health.steps = 0; health.own = false;
+        health.at = 0; health.started = 0; health.progress = 0; health.media = -1;
+        health.dropped = 0; health.total = 0;
+        health.stalls = 0; health.bad = 0; health.good = 0;
+        health.steps = 0; health.moves = 0; health.cycles = 0; health.own = false;
         health.id = active ? active.id : '';
     }
 
     function noteStall() {
         if (active) health.stalls++;
+    }
+
+    /* The guard may only act on Auto, or on a rung it moved to itself. A level the
+       user picked by hand is off limits in both directions. */
+    function healthMayAct() {
+        if (health.cycles > HEALTH_MAX_CYCLES) return false;
+        if (health.moves >= HEALTH_MAX_MOVES) return false;
+        return qualityIdx < 0 || health.own;
+    }
+
+    function healthApply(idx) {
+        health.moves++;
+        health.own = true;
+        qualityIdx = idx;
+        applyQuality();
+        updateQualityLabel();
+        if (qMenuOpen()) renderQualityMenu();
+    }
+
+    function healthStepDown(why, ratio, starveMs, stalls) {
+        if (!healthMayAct()) return;
+        if (health.steps >= HEALTH_MAX_STEPS) return;
+        var target = qualityList.length - 2 - health.steps;
+        if (target < 0) return;
+        health.steps++;
+        healthApply(target);
+        chainNotice('Quality lowered to ' + qualityList[target] + 'p - ' + why);
+        beacon('CP_Q_DOWNGRADE', { h: qualityList[target], steps: health.steps, why: why,
+            ratio: Math.round(ratio * 100), starveMs: starveMs, stalls: stalls });
+    }
+
+    /* Climbing back is the whole point of asking for Auto: once the device is
+       comfortably ahead, hand the pixels back. Reaching the top restores Auto
+       itself and re-arms the downgrade budget, because from there we are starting
+       over from a clean, known-good state. The cycle counter is not reset, so a
+       device that genuinely cannot settle still gets left alone eventually. */
+    function healthStepUp() {
+        if (qualityIdx < 0) return;                 // already all the way up
+        if (!healthMayAct()) return;
+        if (!health.own) return;                    // the user chose this level
+        var top = qualityList.length - 1;
+        if (qualityIdx >= top) {
+            health.moves++;
+            health.own = false;
+            health.cycles++;
+            qualityIdx = -1;
+            health.steps = 0; health.moves = 0;
+            applyQuality();
+            updateQualityLabel();
+            if (qMenuOpen()) renderQualityMenu();
+            chainNotice('Quality back to Auto (' + qualityList[top] + 'p)');
+            beacon('CP_Q_AUTO_RESTORED', { h: qualityList[top], cycle: health.cycles });
+            return;
+        }
+        var target = qualityIdx + 1;
+        healthApply(target);
+        chainNotice('Quality raised to ' + qualityList[target] + 'p');
+        beacon('CP_Q_UPGRADE', { h: qualityList[target], steps: health.steps });
     }
 
     /* Called from the 250ms UI tick, but only does real work every HEALTH_MS. */
@@ -1398,9 +1482,33 @@
         if (!health.at) { health.at = now; return; }
         if (now - health.at < HEALTH_MS) return;
 
-        var played = 0;
-        try { played = el.currentTime || 0; } catch (e) { }
-        if (el.paused || played < HEALTH_WARMUP_S) { health.at = now; health.stalls = 0; return; }
+        var media = 0;
+        try { media = el.currentTime || 0; } catch (e) { }
+
+        // A pause is the user, not the network: end the window without a verdict so
+        // pausing for a minute never looks like an unplayable stream.
+        if (el.paused) {
+            health.at = now; health.stalls = 0; health.started = 0;
+            health.progress = now; health.media = media;
+            return;
+        }
+        if (!health.started) health.started = now;      // wall clock, see HEALTH_WARMUP_MS
+        if (media > health.media + HEALTH_PROGRESS_EPS) health.progress = now;
+        health.media = media;
+
+        if (now - health.started < HEALTH_WARMUP_MS) { health.at = now; health.stalls = 0; return; }
+
+        // how much of THIS window the media was not moving for
+        var windowMs = now - health.at;
+        var since = health.progress > health.at ? health.progress : health.at;
+        var starveMs = now - since;
+        if (starveMs > windowMs) starveMs = windowMs;
+
+        // readyState below HAVE_FUTURE_DATA means there is no data ahead of the play
+        // head at all. This is the most direct "the download is not keeping up"
+        // reading there is, and it works even on engines that never fire `waiting`.
+        var noData = false;
+        try { noData = typeof el.readyState === 'number' && el.readyState < 3; } catch (e2) { }
 
         var c = playbackCounters(el);
         var dTotal = c.total - health.total;
@@ -1408,27 +1516,34 @@
         var stalls = health.stalls;
         health.at = now; health.dropped = c.dropped; health.total = c.total; health.stalls = 0;
 
-        var ratio = dTotal > 0 ? dDrop / dTotal : 0;
-        var bad = (c.known && dTotal > 0 && ratio > HEALTH_DROP_RATIO) || (!c.known && stalls >= HEALTH_STALLS) ||
-            (c.known && stalls >= HEALTH_STALLS * 2);
-        if (!bad) { health.bad = 0; return; }
-        if (++health.bad < 2) return;                 // one bad window is just a busy scene
-        health.bad = 0;
+        var known = c.known && dTotal > 0;
+        var ratio = known ? dDrop / dTotal : 0;
+        var starved = starveMs >= HEALTH_STARVE_MS || noData || stalls >= HEALTH_STALLS;
+        var strained = known && (ratio > HEALTH_DROP_RATIO || stalls >= HEALTH_STALLS * 2);
+        var bad = starved || strained;
 
-        // only ever touch Auto, or a rung this guard lowered itself; a level the
-        // user picked by hand is off limits
-        if (health.steps >= HEALTH_MAX_STEPS) return;
-        if (qualityIdx >= 0 && !health.own) return;
-        var target = qualityList.length - 2 - health.steps;
-        if (target < 0) return;
-        health.steps++;
-        health.own = true;
-        qualityIdx = target;
-        applyQuality();
-        updateQualityLabel();
-        if (qMenuOpen()) renderQualityMenu();
-        chainNotice('Quality lowered to ' + qualityList[target] + 'p - device cannot keep up');
-        beacon('CP_Q_DOWNGRADE', { h: qualityList[target], steps: health.steps, ratio: Math.round(ratio * 100), stalls: stalls });
+        if (bad) {
+            health.good = 0;
+            // a window that is mostly dead pipe is acted on straight away: waiting
+            // out a second one just means the user sits through another 3s of it
+            if (starveMs >= HEALTH_STARVE_HARD_MS || noData) {
+                health.bad = 0;
+                healthStepDown(noData ? 'not enough data buffered' : 'playback is stalling',
+                    ratio, starveMs, stalls);
+                return;
+            }
+            if (++health.bad < HEALTH_BAD_RUN) return;
+            health.bad = 0;
+            healthStepDown(starved ? 'playback is stalling' : 'device cannot keep up', ratio, starveMs, stalls);
+            return;
+        }
+        health.bad = 0;
+        // climbing back needs a much cleaner signal than dropping did, otherwise the
+        // guard oscillates on a borderline stream
+        if (!known || ratio >= HEALTH_CLEAN_RATIO) return;
+        if (++health.good < HEALTH_GOOD_RUN) return;
+        health.good = 0;
+        healthStepUp();
     }
 
     function updateQualityLabel() {

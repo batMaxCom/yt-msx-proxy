@@ -91,10 +91,36 @@ whether the next video starts by itself at the end).
 the remote's up/down keys.
 
 - Auto is a request for the best rendition, so a weak TV or a busy network can end up
-unplayable. The player watches the real decoder numbers (dropped frames, rebuffer
-events) and steps Auto down one rung at a time when the device demonstrably cannot keep
-up, down to three rungs. Anything you pick by hand is never touched, and choosing Auto
-again re-arms the guard. Every drop is announced on screen so it is never a mystery.
+unplayable. The player watches the device and moves one rung at a time: down when it
+demonstrably cannot keep up, and back up when it is comfortably ahead again, until
+Auto itself is restored and the full ladder is on offer once more. Anything you pick
+by hand is never touched, in either direction, and choosing Auto again re-arms the
+guard.
+
+- "Cannot keep up" comes in two flavours that look nothing alike, and the guard
+watches for both. A decoder that is too slow drops frames but keeps playing. A
+connection that is too slow drops nothing at all - there is nothing to decode, the
+picture just stops advancing, the buffer runs dry and playback re-stalls. So it also
+measures how long the media stopped moving for, watches the buffer state, and counts
+rebuffer events, and any one of those is enough. This is the common case on a weak
+pipe, and a guard that only reads dropped-frame counters sees a perfectly healthy 0%
+while the video is doing nothing.
+
+- The grace period before the guard intervenes is measured in wall-clock time from
+the start of playback, not in seconds of video watched. That distinction matters: a
+connection that stalls three seconds in never accumulates eight seconds of playback,
+so a guard waiting on playback progress would sit on the top rung forever and never
+help the client that needs it most. A window that is mostly dead pipe is acted on
+straight away; a milder one has to be seen twice, so a single hiccup is not punished.
+
+- A pause is a user, not a network, and never costs a rung.
+
+- The guard is deliberately slower to climb than to drop, and a ratio that sits
+between the two thresholds changes nothing at all, so a stream that is merely
+borderline does not get walked up and down. After a few full round trips it stops
+intervening for that video and leaves the choice to you. Every move is announced on
+screen, and the notice says whether the decoder or the download was at fault, so it
+is never a mystery.
 
 - The transport panel stays on screen for 5 seconds after the last keypress.
 
