@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261013';
+    global.__CUSTOM_PLAYER_VERSION = '20261015';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -675,6 +675,15 @@
         beacon('CP_KBD', { k: 'space', t: Math.round((el.currentTime || 0) * 10) / 10 });
     }
 
+    function trSetPaused(pause) {
+        var el = active && active.engEl;
+        if (!el) return;
+        try {
+            if (pause) el.pause();
+            else if (el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
+        } catch (e) { }
+    }
+
     function goHome() {
         try { global.location.hash = '#/browse-sets?c=home'; } catch (e) { }
     }
@@ -694,6 +703,7 @@
 
     function syncUI() {
         try {
+            bindInputElements();
             var tc = trEl();
             if (!tc) { trSeen = false; return; }
             if (!trSeen) {
@@ -748,11 +758,198 @@
             if (!appSettings.showToggleVideoInfo) {
                 var tvi = global.document.querySelector('.legend-item.toggle-video-info');
                 if (tvi) tvi.style.display = 'none';
+                var tray = global.document.querySelector('#title-tray');
+                if (tray) tray.style.display = 'none';
+                var pvt = global.document.querySelector('.player-video-text');
+                if (pvt) pvt.style.display = 'none';
             }
         } catch (e) { }
     }
 
     setInterval(syncUI, 250);
+
+    /* ---- input: mouse / touch / remote ----
+       All four control paths funnel into the same player actions:
+         keys        → handleKey (arrows, space, enter, Esc/Back, media keys)
+         remote/LG   → same keydown events (Back=461/8, PlayPause=179, Rewind=412,
+                       FF=417/227, Next/Prev track=415/416/413/414) plus Magic
+                       Remote pointer = mouse path
+         mouse       → hover keeps transport alive, click video toggles play,
+                       click/drag the seekbar to scrub, wheel = volume,
+                       click transport buttons to activate them
+         touch       → tap toggles play, swipe left/right = seek ±10s,
+                       swipe up/down = volume, drag the seekbar to scrub */
+
+    function isWatchSurface() { return !!(watchSurface() && trEl()); }
+
+    function isSnapped() {
+        var w = watchSurface();
+        try { return w ? w.classList.contains('snapped') : false; } catch (e) { return false; }
+    }
+
+    function inTransport(t) {
+        try { return !!(t && t.closest && t.closest('#transport-controls,#title-tray,#html5-video-info-panel')); } catch (e) { return false; }
+    }
+
+    function pokeTransport() { trVisible = true; lastTrActive = Date.now(); setTransport(true); }
+
+    function seekToFrac(f) {
+        var el = active && active.engEl;
+        if (!el) return;
+        var dur = el.duration;
+        if (!(isFinite(dur) && dur > 0)) return;
+        var nt = Math.max(0, Math.min(dur, f * dur));
+        try { el.currentTime = nt; } catch (e) { }
+        beacon('CP_SEEK', { t: Math.round(nt * 10) / 10 });
+    }
+
+    function changeVolume(delta) {
+        var el = active && active.engEl;
+        if (!el) return;
+        var v = Math.max(0, Math.min(1, (el.volume || 0) + delta));
+        try { el.volume = v; } catch (e) { }
+        var fw = global.document && global.document.querySelector('.html5-main-video');
+        if (fw && fw !== el) { try { fw.volume = v; } catch (e) { } }
+        beacon('CP_VOL', { v: Math.round(v * 100) / 100 });
+    }
+
+    function bindInputDocument() {
+        var doc = global.document;
+        if (!doc) return;
+
+        doc.addEventListener('mousemove', function (e) {
+            if (!isWatchSurface() || isSnapped()) return;
+            if (inTransport(e.target)) return;
+            pokeTransport();
+        }, true);
+
+        var downX = 0, downY = 0, downT = 0;
+        doc.addEventListener('mousedown', function (e) {
+            if (!isWatchSurface() || isSnapped()) return;
+            if (inTransport(e.target)) return;
+            var t = e.target;
+            if (!t || !t.closest || !t.closest('#player,#movie_player')) return;
+            downX = e.clientX; downY = e.clientY; downT = Date.now();
+        }, true);
+        doc.addEventListener('mouseup', function (e) {
+            if (!isWatchSurface() || isSnapped() || !downT) return;
+            var dx = e.clientX - downX, dy = e.clientY - downY;
+            downT = 0;
+            if (Math.abs(dx) > 24 || Math.abs(dy) > 24) return;
+            pokeTransport();
+            trTogglePlay();
+        }, true);
+
+        doc.addEventListener('wheel', function (e) {
+            if (!isWatchSurface() || isSnapped()) return;
+            if (inTransport(e.target)) return;
+            var t = e.target;
+            if (!t || !t.closest || !t.closest('#player,#movie_player')) return;
+            changeVolume(e.deltaY < 0 ? 0.05 : -0.05);
+            if (e.preventDefault) e.preventDefault();
+        }, true);
+
+        var tX = 0, tY = 0, tT = 0;
+        doc.addEventListener('touchstart', function (e) {
+            if (!isWatchSurface() || isSnapped()) return;
+            if (inTransport(e.target)) return;
+            var t = e.target;
+            if (!t || !t.closest || !t.closest('#player,#movie_player')) return;
+            var c = e.changedTouches && e.changedTouches[0];
+            if (!c) return;
+            tX = c.clientX; tY = c.clientY; tT = Date.now();
+        }, true);
+        doc.addEventListener('touchend', function (e) {
+            if (!isWatchSurface() || isSnapped() || !tT) return;
+            var c = e.changedTouches && e.changedTouches[0];
+            if (!c) return;
+            var dx = c.clientX - tX, dy = c.clientY - tY, dt = Date.now() - tT;
+            tT = 0;
+            if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) { pokeTransport(); trSeek(dx < 0 ? SEEK_STEP : -SEEK_STEP); return; }
+            if (Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx)) { pokeTransport(); changeVolume(dy < 0 ? 0.05 : -0.05); return; }
+            if (dt < 450) { pokeTransport(); trTogglePlay(); }
+        }, true);
+    }
+
+    var btnEl = null, barEl = null;
+
+    function bindInputElements() {
+        var doc = global.document;
+        if (!doc) return;
+
+        var bl = doc.querySelector('#button-list');
+        if (bl && bl !== btnEl) {
+            btnEl = bl;
+            bl.addEventListener('mouseover', function (e) {
+                    if (!isWatchSurface() || isSnapped()) return;
+                    var b = e.target && e.target.closest && e.target.closest('#button-list > div');
+                    if (!b) return;
+                    trVisible = true;
+                    trFocus = 'buttons';
+                    var bs = enabledButtons(), i;
+                    for (i = 0; i < bs.length; i++) if (bs[i] === b) { focusButton(i); break; }
+                    lastTrActive = Date.now();
+                }, true);
+                bl.addEventListener('click', function (e) {
+                    if (!isWatchSurface() || isSnapped()) return;
+                    var b = e.target && e.target.closest && e.target.closest('#button-list > div');
+                    if (!b) return;
+                    var cl = typeof b.className === 'string' ? b.className : '';
+                    if (/icon-player-play/.test(cl)) trTogglePlay();
+                    else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
+                    else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
+                    else if (/icon-home/.test(cl)) goHome();
+                    pokeTransport();
+                    if (e.preventDefault) e.preventDefault();
+                    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                }, true);
+        }
+
+        var bar = doc.querySelector('#progress-bar');
+        if (bar && bar !== barEl) {
+            barEl = bar;
+            try { bar.style.touchAction = 'none'; } catch (x) { }
+                var scrubbing = false;
+                var fracFrom = function (ev) {
+                    var r = bar.getBoundingClientRect();
+                    if (!r || !r.width) return null;
+                    var x = ev.clientX !== undefined ? ev.clientX : (ev.changedTouches && ev.changedTouches[0].clientX);
+                    return Math.max(0, Math.min(1, (x - r.left) / r.width));
+                };
+                var begin = function (ev) {
+                    if (!isWatchSurface() || isSnapped()) return;
+                    scrubbing = true;
+                    var f = fracFrom(ev);
+                    if (f !== null) seekToFrac(f);
+                    try { bar.setPointerCapture(ev.pointerId); } catch (e2) { }
+                    if (ev.preventDefault) ev.preventDefault();
+                };
+                var move = function (ev) {
+                    if (!scrubbing) return;
+                    var f = fracFrom(ev);
+                    if (f !== null) seekToFrac(f);
+                    if (ev.preventDefault) ev.preventDefault();
+                };
+                var end = function () { scrubbing = false; };
+                if (global.PointerEvent) {
+                    bar.addEventListener('pointerdown', begin);
+                    bar.addEventListener('pointermove', move);
+                    bar.addEventListener('pointerup', end);
+                    bar.addEventListener('pointercancel', end);
+                } else {
+                    bar.addEventListener('mousedown', begin);
+                    bar.addEventListener('mousemove', move);
+                    bar.addEventListener('mouseup', end);
+                    bar.addEventListener('mouseleave', end);
+                    bar.addEventListener('touchstart', begin, { passive: false });
+                    bar.addEventListener('touchmove', move, { passive: false });
+                    bar.addEventListener('touchend', end);
+                }
+        }
+    }
+
+    try { bindInputDocument(); } catch (e) { }
+    try { bindInputElements(); } catch (e) { }
 
     function handleKey(e) {
         var tgt = e.target;
@@ -769,6 +966,15 @@
         var k = e.key || '';
         var code = e.keyCode || e.which || 0;
         var key = k === ' ' ? 'space' : (k || String.fromCharCode(code));
+        var kmap = {
+            8: 'Back', 32: ' ', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown',
+            13: 'Enter', 27: 'Escape',
+            179: 'MediaPlayPause', 178: 'MediaPlayPause', 415: 'MediaPlay', 19: 'MediaPause',
+            412: 'MediaRewind', 417: 'MediaFastForward', 227: 'MediaFastForward',
+            413: 'MediaNextTrack', 416: 'MediaNextTrack', 414: 'MediaPrevTrack',
+            461: 'Back', 462: 'Back'
+        };
+        if (kmap[code] && (!k || k.length === 1)) key = kmap[code];
         var eat = function () {
             if (e.preventDefault) e.preventDefault();
             if (e.stopImmediatePropagation) e.stopImmediatePropagation();
@@ -781,6 +987,52 @@
                 trTogglePlay();
                 eat();
                 break;
+            case 'MediaPlayPause':
+                if (e.repeat) break;
+                showTransport();
+                trTogglePlay();
+                eat();
+                break;
+            case 'MediaPlay':
+                showTransport();
+                trSetPaused(false);
+                eat();
+                break;
+            case 'MediaPause':
+                showTransport();
+                trSetPaused(true);
+                eat();
+                break;
+            case 'MediaStop':
+                try { beacon('CP_KBD', { k: 'stop', id: active ? active.id : null }); } catch (err) { }
+                var stopId2 = active ? active.id : null;
+                stopActive();
+                if (stopId2) suppressQuit(stopId2);
+                break;
+            case 'MediaRewind':
+            case 'MediaPrevTrack':
+                showTransport();
+                trSeek(-SEEK_STEP);
+                eat();
+                break;
+            case 'MediaFastForward':
+            case 'MediaNextTrack':
+                showTransport();
+                trSeek(SEEK_STEP);
+                eat();
+                break;
+            case 'ArrowLeft':
+                showTransport();
+                if (trFocus === 'buttons') navButtons(-1);
+                else trSeek(-SEEK_STEP);
+                eat();
+                break;
+            case 'ArrowRight':
+                showTransport();
+                if (trFocus === 'buttons') navButtons(1);
+                else trSeek(SEEK_STEP);
+                eat();
+                break;
             case 'ArrowDown':
             case 'ArrowUp':
                 showTransport();
@@ -788,18 +1040,13 @@
                 else if (key === 'ArrowUp' && trFocus === 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); }
                 eat();
                 break;
-            case 'ArrowLeft':
-            case 'ArrowRight':
-                showTransport();
-                if (trFocus === 'buttons') navButtons(key === 'ArrowRight' ? 1 : -1);
-                else trSeek(key === 'ArrowRight' ? SEEK_STEP : -SEEK_STEP);
-                eat();
-                break;
             case 'Enter':
                 if (trVisible && trFocus === 'buttons') { activateFocusedButton(); eat(); }
                 break;
+            case 'Back':
+            case 'Backspace':
             case 'Escape':
-                try { beacon('CP_KBD', { k: 'esc', id: active ? active.id : null }); } catch (err) { }
+                try { beacon('CP_KBD', { k: key.toLowerCase(), id: active ? active.id : null }); } catch (err) { }
                 var quitId2 = active ? active.id : null;
                 stopActive();
                 if (quitId2) suppressQuit(quitId2);
