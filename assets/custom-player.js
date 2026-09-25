@@ -11,9 +11,9 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261012';
+    global.__CUSTOM_PLAYER_VERSION = '20261013';
 
-    var appSettings = { hideOnScreenNav: false };
+    var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
         xhrText(global.location.origin + '/settings.json', function (t) {
             if (t) { try { appSettings = JSON.parse(t) || appSettings; } catch (err) { } }
@@ -744,6 +744,10 @@
             if (appSettings.hideOnScreenNav) {
                 var legend = global.document.querySelector('#legend');
                 if (legend) legend.style.display = 'none';
+            }
+            if (!appSettings.showToggleVideoInfo) {
+                var tvi = global.document.querySelector('.legend-item.toggle-video-info');
+                if (tvi) tvi.style.display = 'none';
             }
         } catch (e) { }
     }

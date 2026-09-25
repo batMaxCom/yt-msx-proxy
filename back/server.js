@@ -40,7 +40,8 @@ if (!fs.existsSync(settingsPath)) {
     const defaultSettings = { 
         serverIp: 'localhost',  
         expBrowse: false,
-        hideOnScreenNav: false
+        hideOnScreenNav: false,
+        showToggleVideoInfo: false
     };
     fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 4));
     console.log("Created settings.json with default serverIp = localhost and expBrowse = false.");
