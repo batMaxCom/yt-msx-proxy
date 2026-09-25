@@ -11,6 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
+    global.__CUSTOM_PLAYER_VERSION = '20261010';
 
     var wl = (global.navigator && global.navigator.userAgent) || '';
     var isTV = /Web0S|webOS|LG Browser|LG-|SMART-TV|AppleTV|Tizen|Viera|Phantom]|DTV|wiiu/i.test(wl);
@@ -281,39 +282,49 @@
 
     /* The framework's element gets wedged by the 2016 app's own load()/error cycles
        and then buffers into MSE forever without decoding (rs:0). For MSE engines we
-       use a fresh element of our own; nativehls (TV) keeps the framework element. */
-    function fitOwnEl(vid) {
+       use a fresh element of our own; nativehls (TV) keeps the framework element.
+       The replacement mirrors the framework video's absolute geometry but is mounted
+       inside #player and uses NO z-index, so the app's own transport controls and
+       info panel (later/positioned siblings, z-index:1) still paint on top: the video
+       never covers the player navigation. */
+    function mirrorHostGeo(vid) {
         var host = global.document && global.document.querySelector('.html5-main-video');
-        if (!host || !vid || vid.parentNode !== global.document.body) return;
+        if (!host || !vid) return;
         try {
+            var cs = global.getComputedStyle(host);
+            vid.style.objectFit = cs.objectFit || 'contain';
+            vid.style.width = cs.width;
+            vid.style.height = cs.height;
+            vid.style.top = cs.top;
+            vid.style.left = cs.left;
+            vid.style.right = cs.right;
+            vid.style.bottom = cs.bottom;
             var r = host.getBoundingClientRect();
             if (!r || !(r.width > 0) || !(r.height > 0) || isNaN(r.left) || isNaN(r.top)) return;
-            vid.style.position = 'fixed';
-            vid.style.left = r.left + 'px';
-            vid.style.top = r.top + 'px';
-            vid.style.width = r.width + 'px';
-            vid.style.height = r.height + 'px';
-            try { vid.style.objectFit = global.getComputedStyle(host).objectFit || 'contain'; } catch (e) { }
+            var w = parseFloat(cs.width), h = parseFloat(cs.height);
+            if (!(w > 0)) vid.style.width = Math.round(r.width) + 'px';
+            if (!(h > 0)) vid.style.height = Math.round(r.height) + 'px';
+            if (cs.top === 'auto') vid.style.top = Math.round(r.top) + 'px';
+            if (cs.left === 'auto') vid.style.left = Math.round(r.left) + 'px';
         } catch (e) { }
     }
 
     function makeOwnEl() {
         var host = global.document && global.document.querySelector('.html5-main-video');
-        var body = global.document && global.document.body;
         var vid = global.document.createElement('video');
         vid.setAttribute('playsinline', '');
-        // Transparent until the first frame decodes, and pinned to the framework
-        // video's exact on-screen box (fixed positioning + rect from
-        // getBoundingClientRect) so it never spills over the navigation/title UI.
-        vid.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483000;pointer-events:none;background:transparent;';
-        try { if (body) body.appendChild(vid); } catch (e) { }
-        fitOwnEl(vid);
-        if (!ownElTimer) {
+        vid.style.cssText = 'position:absolute;pointer-events:none;background:transparent;';
+        var target = (global.document && global.document.querySelector('#player')) ||
+            (global.document && global.document.querySelector('#movie_player')) ||
+            (global.document && global.document.body);
+        try { if (target && target.appendChild) target.appendChild(vid); } catch (e) { }
+        mirrorHostGeo(vid);
+        if (host && !ownElTimer) {
             ownElTimer = setInterval(function () {
-                if (active && active.ownEl) fitOwnEl(active.ownEl);
+                if (active && active.ownEl) mirrorHostGeo(active.ownEl);
             }, 800);
         }
-        try { global.addEventListener('resize', function () { if (active && active.ownEl) fitOwnEl(active.ownEl); }); } catch (e) { }
+        try { global.addEventListener('resize', function () { if (active && active.ownEl) mirrorHostGeo(active.ownEl); }); } catch (e) { }
         beacon('CP_OWNEL', {});
         return vid;
     }
@@ -331,6 +342,13 @@
     }
 
     function stopActive() {
+        var el = active && active.engEl;
+        if (el) {
+            try { el.pause(); } catch (e) { }
+            try { if (el.currentSrc || el.src) el.src = ''; } catch (e) { }
+            try { el.removeAttribute('src'); } catch (e) { }
+            try { el.load(); } catch (e) { }
+        }
         if (active && active.engEl) {
             try { unbindSeek(active.engEl); } catch (e) { }
         }
@@ -469,12 +487,34 @@
 
     var lastCandidate = 0;
     var takeoverBusy = false;
+    var quitId = null;
+    var quitUntil = 0;
+    var lastHash = null;
+
+    /* A user-initiated quit (Esc) must not be immediately undone by the takeover:
+       after we stop playback the hash can still hold the same v=... and the app may
+       only append &resume, so re-takeover would silently restart the same video.
+       Suppress takeover of the just-quit id while the URL keeps pointing at that same
+       watch video; a proper navigation (different video, or away to browse) re-arms it. */
+    var QUIT_COOLDOWN_MS = 60000;
+
+    function suppressQuit(id) {
+        quitId = id;
+        quitUntil = Date.now() + QUIT_COOLDOWN_MS;
+    }
 
     function poll() {
         setTimeout(function () {
             var id = getVideoId();
             var el = global.document && global.document.querySelector('.html5-main-video');
             if (!id || !el) { lastCandidate = 0; poll(); return; }
+            var hashNow = (global.location && global.location.hash) || '';
+            if (hashNow !== lastHash) {
+                lastHash = hashNow;
+                if (id !== quitId) { quitId = null; quitUntil = 0; }
+                lastCandidate = 0;
+            }
+            var now = Date.now();
             if (active) {
                 var owned = active.el;
                 var lost = (owned !== el);
@@ -491,6 +531,7 @@
                 if (!lost) { lastCandidate = 0; poll(); return; }
                 stopActive();
             }
+            if (id === quitId && now < quitUntil) { lastCandidate = 0; poll(); return; }
             if (!takeoverBusy && el.readyState === 0) {
                 if (!lastCandidate) lastCandidate = Date.now();
                 var doingFlash = false;
@@ -564,7 +605,9 @@
                 break;
             case 'Escape':
                 try { beacon('CP_KBD', { k: 'esc', id: active.id }); } catch (err) { }
+                var quitId2 = active ? active.id : null;
                 stopActive();
+                if (quitId2) suppressQuit(quitId2);
                 // do NOT swallow: the TV app handles Esc (27) itself and navigates back
                 break;
         }
