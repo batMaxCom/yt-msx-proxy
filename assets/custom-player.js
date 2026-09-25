@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261010';
+    global.__CUSTOM_PLAYER_VERSION = '20261011';
 
     var wl = (global.navigator && global.navigator.userAgent) || '';
     var isTV = /Web0S|webOS|LG Browser|LG-|SMART-TV|AppleTV|Tizen|Viera|Phantom]|DTV|wiiu/i.test(wl);
@@ -556,59 +556,228 @@
         }
     }
 
-    /* ---- keyboard control: Esc quit, arrows volume/seek, space play/pause ---- */
+    /* ---- transport (player navigation) ----
+       The 2016 app renders its transport timeline from its own player model,
+       which never advances in our setup (we play on our own element), so the
+       seekbar stays 0:00 and the built-in navigation keys do nothing useful.
+       We re-implement both on top of the real framework DOM: feed the seekbar
+       and time labels from our playing element, own Arrow/Down/Space so the
+       panel is summoned on demand and auto-hides after TR_HIDE_MS of no
+       activity, and keep left/right seeking in every transport state. Volume
+       via up/down is intentionally removed (use the panel's Play/seek + the
+       TV's own system if any). Keys are only intercepted while the watch
+       surface exists and is not snapped into grid browsing. */
+
+    var TR_HIDE_MS = 3000;
+    var SEEK_STEP = 10;
+    var trSeen = false;
+    var trVisible = false;
+    var trFocus = 'seekbar';   // 'seekbar' | 'buttons'
+    var trIdx = 0;
+    var lastTrActive = 0;
+
+    function trEl() { return global.document && global.document.querySelector('#transport-controls'); }
+
+    function watchSurface() { return global.document && global.document.querySelector('#watch'); }
+
+    function fmtTime(s) {
+        if (!(isFinite(s) && s >= 0)) return '';
+        s = Math.floor(s);
+        var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+        if (h) return h + ':' + ('0' + m).slice(-2) + ':' + ('0' + ss).slice(-2);
+        return m + ':' + ('0' + ss).slice(-2);
+    }
+
+    function setTransport(visible) {
+        var tc = trEl();
+        var w = watchSurface();
+        if (visible) {
+            if (tc) tc.classList.remove('hidden');
+            if (w) w.classList.add('transport-showing');
+        } else {
+            if (tc) tc.classList.add('hidden');
+            if (w) w.classList.remove('transport-showing');
+        }
+    }
+
+    function showTransport() {
+        trVisible = true;
+        lastTrActive = Date.now();
+        setTransport(true);
+        if (trFocus !== 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); }
+    }
+
+    function clearButtonFocus() {
+        var list = global.document && global.document.querySelectorAll('#button-list > div');
+        if (!list) return;
+        for (var i = 0; i < list.length; i++) {
+            try { list[i].classList.remove('focused'); list[i].classList.remove('selected'); } catch (e) { }
+        }
+    }
+
+    function enabledButtons() {
+        var list = global.document && global.document.querySelectorAll('#button-list > div');
+        var out = [];
+        if (!list) return out;
+        for (var i = 0; i < list.length; i++) {
+            var cl = (typeof list[i].className === 'string') ? list[i].className : '';
+            if (/disabled/.test(cl)) continue;
+            out.push(list[i]);
+        }
+        return out;
+    }
+
+    function focusButton(idx) {
+        var bs = enabledButtons();
+        if (!bs.length) return;
+        trIdx = ((idx % bs.length) + bs.length) % bs.length;
+        clearButtonFocus();
+        var b = bs[trIdx];
+        try { b.classList.add('focused'); } catch (e) { }
+        if (/icon-player-play/.test(typeof b.className === 'string' ? b.className : '')) {
+            try { b.classList.add('selected'); } catch (e) { }
+        }
+    }
+
+    function navButtons(dir) {
+        var bs = enabledButtons();
+        if (!bs.length) return;
+        var cur = -1, i;
+        for (i = 0; i < bs.length; i++) { if (bs[i].classList.contains('focused')) cur = i; }
+        if (cur < 0) cur = trIdx;
+        focusButton(cur + dir);
+    }
+
+    function trSeek(delta) {
+        var el = active && active.engEl;
+        if (!el) return;
+        var dur = el.duration;
+        var max = isFinite(dur) && dur > 0 ? dur : Number.MAX_SAFE_INTEGER;
+        var nt = Math.max(0, Math.min(max, (el.currentTime || 0) + delta));
+        try { el.currentTime = nt; } catch (e) { }
+        beacon('CP_KBD', { k: delta > 0 ? 'ff' : 'rew', t: Math.round(nt * 10) / 10 });
+    }
+
+    function trTogglePlay() {
+        var el = active && active.engEl;
+        if (!el) return;
+        try {
+            if (el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
+            else el.pause();
+        } catch (e) { }
+        beacon('CP_KBD', { k: 'space', t: Math.round((el.currentTime || 0) * 10) / 10 });
+    }
+
+    function goHome() {
+        try { global.location.hash = '#/browse-sets?c=home'; } catch (e) { }
+    }
+
+    function activateFocusedButton() {
+        var bs = enabledButtons();
+        if (!bs.length) return;
+        var i, b = null;
+        for (i = 0; i < bs.length; i++) { if (bs[i].classList.contains('focused')) { b = bs[i]; break; } }
+        if (!b) return;
+        var cl = typeof b.className === 'string' ? b.className : '';
+        if (/icon-player-play/.test(cl)) trTogglePlay();
+        else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
+        else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
+        else if (/icon-home/.test(cl)) goHome();
+    }
+
+    function syncUI() {
+        try {
+            var tc = trEl();
+            if (!tc) { trSeen = false; return; }
+            if (!trSeen) {
+                trSeen = true;
+                trVisible = false;
+                setTransport(false);
+            }
+            if (trVisible) {
+                if (Date.now() - lastTrActive > TR_HIDE_MS) { trVisible = false; setTransport(false); }
+                else setTransport(true);
+            } else {
+                setTransport(false);
+            }
+            if (active && active.engEl) {
+                var el = active.engEl;
+                var ct = el.currentTime || 0;
+                var dur = el.duration;
+                var live = !(isFinite(dur) && dur > 0);
+                var pct = (!live && dur > 0) ? Math.min(100, ((ct / dur) * 100)) : 0;
+                var played = global.document.querySelector('#progress-bar .progress-bar-played');
+                var disc = global.document.querySelector('#progress-bar .progress-bar-disc');
+                var loaded = global.document.querySelector('#progress-bar .progress-bar-loaded');
+                if (played) played.style.width = pct + '%';
+                if (disc) disc.style.left = pct + '%';
+                if (loaded) {
+                    var bEnd = 0, i;
+                    if (el.buffered) for (i = 0; i < el.buffered.length; i++) bEnd = Math.max(bEnd, el.buffered.end(i));
+                    loaded.style.width = (!live && dur > 0 ? Math.min(100, (bEnd / dur) * 100) : 0) + '%';
+                }
+                var et = global.document.querySelector('#player-time-elapsed');
+                var tt = global.document.querySelector('.player-time-total');
+                if (et) { et.textContent = fmtTime(ct); try { et.classList.remove('no-model'); } catch (err) { } }
+                if (tt) tt.textContent = live ? '' : fmtTime(dur);
+                try { tc.classList.toggle('live-playback', !!live); } catch (err) { }
+                var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff');
+                for (i = 0; i < sb.length; i++) try { sb[i].classList.remove('disabled'); } catch (err) { }
+            }
+        } catch (e) { }
+    }
+
+    setInterval(syncUI, 250);
 
     function handleKey(e) {
-        if (!active || !active.engEl) return;
         var tgt = e.target;
         var tag = (tgt && (tgt.tagName || '')) || '';
         if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (tgt && tgt.isContentEditable)) return;
+
+        var w = watchSurface();
+        var tc = trEl();
+        if (!w || !tc) return;                     // only own keys while the watch surface exists
+        var snapped = false;
+        try { snapped = w.classList.contains('snapped'); } catch (err) { }
+        if (snapped) return;                       // let the app navigate the behind grid
+
         var k = e.key || '';
         var code = e.keyCode || e.which || 0;
         var key = k === ' ' ? 'space' : (k || String.fromCharCode(code));
-        var engEl = active.engEl;
+        var eat = function () {
+            if (e.preventDefault) e.preventDefault();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        };
         switch (key) {
             case ' ':
             case 'space':
                 if (e.repeat) break;
-                try {
-                    if (engEl.paused) { var p = engEl.play(); if (p && p.catch) p.catch(function () { }); }
-                    else engEl.pause();
-                } catch (err) { }
-                beacon('CP_KBD', { k: 'space', t: Math.round((engEl.currentTime || 0) * 10) / 10 });
-                if (e.preventDefault) e.preventDefault();
-                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                showTransport();
+                trTogglePlay();
+                eat();
                 break;
-            case 'ArrowUp':
             case 'ArrowDown':
-                try {
-                    var v = Math.max(0, Math.min(1, (engEl.volume || 0) + (key === 'ArrowUp' ? 0.1 : -0.1)));
-                    engEl.volume = v;
-                    var fw = global.document && global.document.querySelector('.html5-main-video');
-                    if (fw && fw !== engEl) fw.volume = v;
-                    beacon('CP_KBD', { k: key, v: Math.round(v * 100) / 100 });
-                } catch (err) { }
-                if (e.preventDefault) e.preventDefault();
-                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+            case 'ArrowUp':
+                showTransport();
+                if (key === 'ArrowDown' && trFocus === 'seekbar') { trFocus = 'buttons'; focusButton(0); }
+                else if (key === 'ArrowUp' && trFocus === 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); }
+                eat();
                 break;
             case 'ArrowLeft':
             case 'ArrowRight':
-                try {
-                    var dur = engEl.duration;
-                    var max = isFinite(dur) && dur > 0 ? dur : Number.MAX_SAFE_INTEGER;
-                    var nt = Math.max(0, Math.min(max, (engEl.currentTime || 0) + (key === 'ArrowRight' ? 10 : -10)));
-                    engEl.currentTime = nt;
-                    beacon('CP_KBD', { k: key, t: Math.round(nt * 10) / 10 });
-                } catch (err) { }
-                if (e.preventDefault) e.preventDefault();
-                if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                showTransport();
+                if (trFocus === 'buttons') navButtons(key === 'ArrowRight' ? 1 : -1);
+                else trSeek(key === 'ArrowRight' ? SEEK_STEP : -SEEK_STEP);
+                eat();
+                break;
+            case 'Enter':
+                if (trVisible && trFocus === 'buttons') { activateFocusedButton(); eat(); }
                 break;
             case 'Escape':
-                try { beacon('CP_KBD', { k: 'esc', id: active.id }); } catch (err) { }
+                try { beacon('CP_KBD', { k: 'esc', id: active ? active.id : null }); } catch (err) { }
                 var quitId2 = active ? active.id : null;
                 stopActive();
                 if (quitId2) suppressQuit(quitId2);
-                // do NOT swallow: the TV app handles Esc (27) itself and navigates back
                 break;
         }
     }
