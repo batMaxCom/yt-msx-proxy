@@ -78,6 +78,42 @@ Settings are in ./back/settings.json!
 
 - chainPlayback: when a video ends, automatically start the next related video instead of stopping [default: true]
 
+- ytCookie: optional, a YouTube `Cookie` header from a signed-in browser. This is what
+makes the home page actually personal - see below. You can also set it as the
+`YT_COOKIE` environment variable, or send an `X-YT-Cookie` header per request. Only
+session cookies that identify the account are forwarded, and they go to youtubei and
+nowhere else.
+
+## The home page and your preferences
+
+The home screen used to ignore the account completely. It asked YouTube for
+`FEtopics`, which is the topic/trending board - it looks like a home screen but has
+nothing to do with who is watching. It now asks for `FEwhat_to_watch`, the real
+"For you" feed.
+
+That alone is not enough, and this is the part worth understanding: YouTube builds
+recommendations from the account making the request - watch history, subscriptions,
+likes, and what has been played elsewhere. An anonymous request to the personalized
+feed quietly degrades into a generic trending list, which looks exactly like
+"preferences ignored" all over again. The paired OAuth token on its own does not
+carry that profile for the browse feed, so the server also accepts the account's
+browser session cookies:
+
+- put them in `back/settings.json` as `"ytCookie"`, or
+- set the `YT_COOKIE` environment variable, or
+- send an `X-YT-Cookie` header with the request (a browser already signed in to
+  YouTube that proxies through this server).
+
+To get them: sign in to YouTube in a desktop browser, open developer tools on
+youtube.com, copy the whole `Cookie` request header, and paste it in. A filter keeps
+only the cookies that identify a session (`SID`, `SAPISID`, `__Secure-1PSID`,
+`__Secure-3PSID`, `SIDCC`, `VISITOR_INFO1_LIVE`, `LOGIN_INFO`, ...), so analytics
+cookies are not forwarded and the value is never logged.
+
+Without cookies everything still works, YouTube just serves a generic feed. The
+log line `personalized: true/false` in the browse entry of the log tells you which
+mode you are in.
+
 ## Player buttons
 
 - Rewind / Forward (the two arrows) seek -10s / +10s, like the original client.
@@ -123,6 +159,14 @@ screen, and the notice says whether the decoder or the download was at fault, so
 is never a mystery.
 
 - The transport panel stays on screen for 5 seconds after the last keypress.
+
+- The watch screen shows the video's title, author and thumbnail. It has to draw them
+itself: the 2016 screen takes that information from an InnerTube payload shape that
+YouTube no longer serves, so on its own it comes up as a black rectangle with no
+caption at all. The metadata is already known to the backend (yt-dlp resolves it for
+playback anyway), so the player asks for it and puts up its own panel, bottom left,
+appearing and disappearing together with the controls. No extra yt-dlp run: it is
+served from the same metadata cache playback already filled.
 
 - Going back out of a video (Back key, or back to browse) stops playback instead of
 letting it run off-screen.

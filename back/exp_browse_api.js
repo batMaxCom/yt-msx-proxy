@@ -21,12 +21,61 @@ if (!fs.existsSync(settingsPath)) {
 
 const serverIp = settings.serverIp || "localhost";
 
-async function fetchBrowseData(browseId, authHeader = null) { 
+/* ---- identity for the personalized feed ----
+   YouTube decides what "For you" means from the account that is making the request:
+   watch history, subscriptions, likes, and what has been played on other devices.
+   An anonymous request to the personalized feed endpoint quietly degrades into a
+   generic trending list, which is exactly the "my preferences are ignored" symptom.
+
+   An OAuth token alone is not enough for the browse feed - InnerTube keys the
+   recommendation profile off the browser session cookies. So we accept them from
+   three places, in priority order:
+     1. an X-YT-Cookie header on the incoming request (a browser signed in to a
+        YouTube session that is proxying through us),
+     2. settings.json -> "ytCookie" (a pasted cookie header from a signed-in
+        browser, the normal setup for a TV that has no YouTube session of its own),
+     3. nothing, in which case the feed is simply anonymous and YouTube serves a
+        generic list. That is a working state, not an error.
+   The cookies are only ever sent to youtubei, never logged. */
+function ytCookieHeader(reqCookie) {
+    const candidates = [
+        reqCookie,
+        process.env.YT_COOKIE,
+        (() => {
+            try { return JSON.parse(fs.readFileSync(settingsPath, 'utf8')).ytCookie; } catch (e) { return null; }
+        })(),
+    ];
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim()) return c.trim();
+    }
+    return '';
+}
+
+// Only the cookies that actually identify a session; dropping the rest keeps the
+// request small and avoids leaking analytics cookies we have no use for.
+const COOKIE_ALLOWLIST = /^(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID|__Secure-1PAPISID|__Secure-3PAPISID|__Secure-1PSIDCC|__Secure-3PSIDCC|SIDCC|__Secure-1PSIDTS|__Secure-3PSIDTS|LOGIN_INFO|VISITOR_INFO1_LIVE|PREF|__Secure-1PSIDSS|__Secure-3PSIDSS|SESSDATA)$/;
+
+function filterCookies(cookieHeader) {
+    if (!cookieHeader) return '';
+    const keep = [];
+    for (const part of String(cookieHeader).split(';')) {
+        const name = part.split('=')[0].trim();
+        if (name && COOKIE_ALLOWLIST.test(name)) keep.push(part.trim());
+    }
+    return keep.join('; ');
+}
+
+/* The real personalized feed. FEtopics is YouTube's topic/trending board - it looks
+   like a home screen but has nothing to do with the viewer, which is why the home
+   page felt like it was ignoring the account entirely. */
+const HOME_BROWSE_ID = 'FEwhat_to_watch';
+
+async function fetchBrowseData(browseId, authHeader = null, reqCookie = null) { 
     const apiKey = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
     const apiUrl = `https://www.googleapis.com/youtubei/v1/browse?key=${apiKey}`;
 
     if (browseId == "home") {
-        browseId = "FEtopics";
+        browseId = HOME_BROWSE_ID;
     }
 
     const postData = {
@@ -49,11 +98,17 @@ async function fetchBrowseData(browseId, authHeader = null) {
         headers['Authorization'] = `Bearer ${authHeader}`;
     }
 
+    const cookie = filterCookies(ytCookieHeader(reqCookie));
+    if (cookie) {
+        headers['Cookie'] = cookie;
+    }
+
     try {
         const t0 = Date.now();
         logger.info('browse', 'BROWSE_REQUEST', {
             browseId,
             auth: !!authHeader,
+            personalized: !!cookie,
             clientName: postData.context.client.clientName,
             clientVersion: postData.context.client.clientVersion,
             url: apiUrl,

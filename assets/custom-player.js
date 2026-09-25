@@ -761,6 +761,8 @@
         chainPendingFor = '';
         chainItems = [];
         chainFor = '';
+        metaReq++;                            // drop any metadata still in flight
+        hideVideoMeta();
         chainLoadingFor = '';
     }
 
@@ -904,6 +906,7 @@
         try { engEl.addEventListener('waiting', function () { noteStall(); }); } catch (e5) { }
         resetHealth();
         chainAdvanceTo({ id: id, title: (conf.title || '') });
+        loadVideoMeta(id);                  // the watch screen has no title of its own
         // the up-next ranking is resolved as soon as the video starts, not when it
         // ends: the skip button needs a target straight away, and the toggle only
         // decides whether playback rolls over on its own
@@ -956,14 +959,15 @@
      });
  }
 
- function startFromInfo(id, el, t, cb) {
-     if (!t || !el || active) { if (cb) cb(false); return; }
-     var links = parseAdaptive(t);
-     var hls = null, i;
-     for (i = 0; i < links.length; i++) { if (links[i].url && /itag=hls/.test(links[i].url)) { hls = links[i].url; break; } }
-     var ok = start({ id: id, el: el, mediaLinks: links, hlsUrl: hls || (base + '/api/hls/' + id) });
-     if (cb) cb(ok);
- }
+  function startFromInfo(id, el, t, cb) {
+      if (!t || !el || active) { if (cb) cb(false); return; }
+      var links = parseAdaptive(t);
+      var hls = null, i;
+      for (i = 0; i < links.length; i++) { if (links[i].url && /itag=hls/.test(links[i].url)) { hls = links[i].url; break; } }
+      var ok = start({ id: id, el: el, mediaLinks: links, hlsUrl: hls || (base + '/api/hls/' + id) });
+      if (cb) cb(ok);
+  }
+
 
 
     var lastCandidate = 0;
@@ -1097,9 +1101,11 @@
         if (visible) {
             if (tc) tc.classList.remove('hidden');
             if (w) w.classList.add('transport-showing');
+            if (metaReady) metaShow();       // the panel lives and dies with the controls
         } else {
             if (tc) tc.classList.add('hidden');
             if (w) w.classList.remove('transport-showing');
+            hideVideoMeta();
         }
     }
 
@@ -1933,6 +1939,90 @@
 
     function chainNotice(text) {
         chainToast({ id: '', title: text }, 0);
+    }
+
+    /* ---- watch screen metadata: thumbnail, title, author ----
+       The 2016 watch screen takes its title/author/thumbnail from an InnerTube
+       payload shape that YouTube no longer serves, so it renders an empty black
+       screen. The metadata is already known to the backend (yt-dlp resolves it for
+       playback anyway), so the player asks for it and draws its own panel instead of
+       trying to feed a 2016 renderer a 2025 response.
+
+       Visibility rides on the transport timer: the panel shows with the controls and
+       fades out with them, which is where the original client put this information. */
+    var metaReq = 0;
+    var metaReady = false;
+
+    function loadVideoMeta(id) {
+        var doc = global.document;
+        if (!doc || !id) return;
+        var seq = ++metaReq;
+        hideVideoMeta();
+        xhrText(base + '/api/video-meta/' + encodeURIComponent(id), function (t) {
+            if (seq !== metaReq || !active || active.id !== id) return;   // moved on already
+            var m = null;
+            try { m = JSON.parse(t); } catch (e) { }
+            if (!m || !m.title) return;
+            renderVideoMeta(m);
+        });
+    }
+
+    function metaStyle() {
+        return 'position:absolute;left:3%;bottom:12%;z-index:55;max-width:46%;' +
+            'display:flex;align-items:flex-start;gap:14px;pointer-events:none;' +
+            'opacity:0;transition:opacity .35s;text-align:left;';
+    }
+
+    function renderVideoMeta(m) {
+        var doc = global.document;
+        var host = menuHost();
+        if (!doc || !host) return;
+        var el = doc.getElementById('yt-cp-meta');
+        if (!el) {
+            el = doc.createElement('div');
+            el.id = 'yt-cp-meta';
+            el.style.cssText = metaStyle();
+            var img = doc.createElement('img');
+            img.id = 'yt-cp-meta-thumb';
+            img.style.cssText = 'width:200px;height:112px;object-fit:cover;flex:0 0 auto;' +
+                'border-radius:3px;background:#111;';
+            var box = doc.createElement('div');
+            box.style.cssText = 'min-width:0;';
+            var title = doc.createElement('div');
+            title.id = 'yt-cp-meta-title';
+            title.style.cssText = 'color:#fff;font-size:26px;line-height:1.2;font-weight:500;' +
+                'text-shadow:0 1px 3px rgba(0,0,0,.85);max-height:2.4em;overflow:hidden;';
+            var author = doc.createElement('div');
+            author.id = 'yt-cp-meta-author';
+            author.style.cssText = 'color:#ddd;font-size:19px;margin-top:6px;' +
+                'text-shadow:0 1px 3px rgba(0,0,0,.85);';
+            box.appendChild(title);
+            box.appendChild(author);
+            el.appendChild(img);
+            el.appendChild(box);
+            host.appendChild(el);
+        }
+        var thumb = doc.getElementById('yt-cp-meta-thumb');
+        var ttl = doc.getElementById('yt-cp-meta-title');
+        var by = doc.getElementById('yt-cp-meta-author');
+        if (thumb && m.thumbnail) thumb.src = m.thumbnail;
+        if (ttl) ttl.textContent = m.title;
+        if (by) by.textContent = m.author || '';
+        metaReady = true;
+        // The panel is chrome, not a popup: it appears with the controls and leaves
+        // with them. Showing it on arrival while the transport is already hidden
+        // would strand it on screen, because nothing else ever hides it.
+        if (trVisible) metaShow();
+    }
+
+    function metaShow() {
+        var el = global.document && global.document.getElementById('yt-cp-meta');
+        if (el) { try { el.style.opacity = '1'; } catch (e) { } }
+    }
+
+    function hideVideoMeta() {
+        var el = global.document && global.document.getElementById('yt-cp-meta');
+        if (el) { try { el.style.opacity = '0'; } catch (e) { } }
     }
 
     function chainToast(item, dir) {

@@ -13,7 +13,7 @@ const { fetchGuideData } = require('./guide_api');
 const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
 const { fetchRelated } = require('./related_api');
-const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest } = require('./get_video_info');
+const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest, getVideoInfoCached } = require('./get_video_info');
 
 // tv_cast pairing / lounge endpoints
 const {
@@ -409,7 +409,7 @@ app.get('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId);
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req));
         res.json(browseData);
     } catch (error) {
         console.error('Error:', error.message);
@@ -595,12 +595,22 @@ app.all('/api/lounge/bc/bind', async (req, res) => {
 
 
 
+// The 2016 client sends its OAuth bearer when the user paired an account.
+function bearerOf(req) {
+    const h = req.headers.authorization || req.headers.Authorization;
+    if (!h || typeof h !== 'string') return null;
+    return h.startsWith('Bearer ') ? h.slice(7) : null;
+}
+
+// Optional: a YouTube session cookie header, so the "For you" feed is built from
+// the account's real history instead of degrading to a generic trending list.
+// See back/exp_browse_api.js for where it is used and how it is filtered.
+function ytCookieOf(req) {
+    return req.headers['x-yt-cookie'] || null;
+}
+
 app.post('/api/browse', async (req, res) => {
     const { browseId } = req.body;
-
-    const authHeader = req.headers.authorization ? req.headers.authorization.split(' ')[1] : null;
-
-    console.log('Authorization Header:', authHeader);
 
     if (!browseId) {
         return res.status(400).json({
@@ -609,7 +619,7 @@ app.post('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, authHeader);
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req));
 
         res.json(browseData);
     } catch (error) {
@@ -697,6 +707,60 @@ async function handleRelatedRequest(req, res) {
 
 app.get('/api/related', handleRelatedRequest);
 app.get('/api/related/:videoId', handleRelatedRequest);
+
+
+// Metadata for the watch screen: title, author and thumbnail.
+//
+// The 2016 client renders its own watch metadata from an InnerTube response shape
+// that no longer exists, so the screen comes up with a black video and no title at
+// all. Rather than trying to teach a 2016 renderer a 2025 payload, the player asks
+// for the metadata itself and draws its own panel - the same split this project
+// already uses for playback itself.
+//
+// Served from the yt-dlp metadata cache, so when the video is already playing (the
+// normal case) this costs nothing and does not spawn a second yt-dlp run; the
+// single-flight in getVideoInfoCached covers the case where both requests race.
+function pickThumb(output, videoId) {
+    const list = Array.isArray(output.thumbnails) ? output.thumbnails : [];
+    let best = null;
+    for (const t of list) {
+        if (!t || !t.url) continue;
+        // stay in the 16:9 range: hqdefault is a reliable fallback even when
+        // yt-dlp reports nothing at all
+        if (t.height && t.width && t.height / t.width > 0.6) continue;
+        if (!best || Number(t.width || 0) > Number(best.width || 0)) best = t;
+    }
+    if (best && best.url) return String(best.url);
+    if (output.thumbnail) return String(output.thumbnail);
+    return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+}
+
+app.get('/api/video-meta/:videoId', async (req, res) => {
+    const videoId = String(req.params.videoId || '').trim();
+    if (!/^[\w-]{6,20}$/.test(videoId)) {
+        return res.status(400).json({ error: 'A valid videoId is required.' });
+    }
+    try {
+        const output = await getVideoInfoCached(videoId);
+        // res.json() is wrapped by the image proxy, so the thumbnail comes back
+        // already rewritten to /img/... and the TV never talks to ytimg directly
+        res.json({
+            id: String(output.id || videoId),
+            title: String(output.title || ''),
+            author: String(output.uploader || output.channel || ''),
+            channelId: String(output.channel_id || output.uploader_id || ''),
+            duration: Number(output.duration) || 0,
+            thumbnail: pickThumb(output, videoId),
+            published: String(output.upload_date || ''),
+        });
+    } catch (error) {
+        logger.error('video-meta', 'metadata lookup failed', {
+            video_id: videoId,
+            message: logger.truncateStderr(String(error.message || error)),
+        });
+        res.status(502).json({ error: 'Failed to load video metadata.' });
+    }
+});
 
 
 process.on('unhandledRejection', (reason) => {
