@@ -12,6 +12,7 @@ const { fetchGuideData } = require('./guide_api');
 
 const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
+const { fetchRelated } = require('./related_api');
 const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest } = require('./get_video_info');
 
 // tv_cast pairing / lounge endpoints
@@ -41,7 +42,8 @@ if (!fs.existsSync(settingsPath)) {
         serverIp: 'localhost',  
         expBrowse: false,
         hideOnScreenNav: false,
-        showToggleVideoInfo: false
+        showToggleVideoInfo: false,
+        chainPlayback: true
     };
     fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 4));
     console.log("Created settings.json with default serverIp = localhost and expBrowse = false.");
@@ -204,9 +206,12 @@ app.get('/index.html', (req, res) => {
 
 // Expose runtime settings to the TV client (custom-player.js reads the
 // hideOnScreenNav flag from here to decide whether on-screen nav hints stay).
+// Keys added after a settings.json was first written are filled in here, so
+// an existing install sees the current defaults without editing the file.
+const SETTINGS_DEFAULTS = { chainPlayback: true };
 app.get('/settings.json', (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json(settings);
+    res.json(Object.assign({}, SETTINGS_DEFAULTS, settings));
 });
 
 oauthRouter(app);
@@ -667,6 +672,31 @@ app.post('/api/next', async (req, res) => {
 
 
 app.post('/api/search', handleSearchRequest);
+
+
+// Related videos for the endless ("chain") playback mode: InnerTube /next with a
+// search fallback, see back/related_api.js. The client calls this when a video
+// starts and walks the list when the video ends.
+async function handleRelatedRequest(req, res) {
+    const videoId = (req.query.videoId || req.query.id || req.params.videoId || '').toString().trim();
+    if (!/^[\w-]{6,20}$/.test(videoId)) {
+        return res.status(400).json({ error: 'A valid videoId is required.' });
+    }
+    try {
+        const result = await fetchRelated(videoId, req.query.limit);
+        res.json(result);
+    } catch (error) {
+        console.error('Error fetching related videos:', error.message);
+        logger.error('related', 'request failed', { video_id: videoId, message: error.message });
+        res.status(500).json({
+            error: 'Failed to fetch related videos.',
+            details: error.message,
+        });
+    }
+}
+
+app.get('/api/related', handleRelatedRequest);
+app.get('/api/related/:videoId', handleRelatedRequest);
 
 
 process.on('unhandledRejection', (reason) => {

@@ -15,7 +15,7 @@
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
-        xhrText(global.location.origin + '/settings.json', function (t) {
+        xhrText((global.location.origin || '') + '/settings.json', function (t) {
             if (t) { try { appSettings = JSON.parse(t) || appSettings; } catch (err) { } }
         });
     } catch (err) { }
@@ -84,11 +84,15 @@
     function Engine() { this.stopped = false; }
     Engine.prototype.close = function () { this.stopped = true; };
     Engine.prototype.seek = function () { };
+    Engine.prototype.adopt = function () { };   // re-attach to a swapped video element
 
     function EngineNativeHls(conf) {
         this.conf = conf;
         Engine.call(this);
         var self = this;
+        // remember a "?q=" that start() may have appended, so adopt() can rebuild it
+        var qm = /[?&]q=(\d+)/.exec(String(conf.hlsUrl || ''));
+        this._q = qm ? parseInt(qm[1], 10) : 0;
         conf.el.src = conf.hlsUrl;
         try { conf.el.load(); } catch (e) { }
         var tryPlay = function () {
@@ -103,24 +107,25 @@
     EngineNativeHls.prototype = Object.create(Engine.prototype);
     EngineNativeHls.prototype.constructor = EngineNativeHls;
     EngineNativeHls.prototype.setQuality = function (h) {
-        var el = this.conf && this.conf.el;
-        if (!el) return;
+        this._q = h || 0;
+        this.conf.hlsUrl = this._hlsUrlFor(h);
+        this.adopt(this.conf.el);
+        beacon('CP_Q_RESTART', { h: h || 0 });
+    };
+    EngineNativeHls.prototype._hlsUrlFor = function (h) {
         var baseUrl = String(this.conf.hlsUrl || '').split('?')[0];
-        if (!baseUrl) return;
-        var t = el.currentTime || 0;
-        var playing = el.paused === false;
-        try { el.pause(); } catch (e) { }
-        el.removeAttribute('src');
-        try { el.load(); } catch (e) { }
-        var onMeta = function () {
-            el.removeEventListener('loadedmetadata', onMeta);
-            try { if (t > 1 && isFinite(el.duration) && t < el.duration) el.currentTime = t; } catch (e) { }
-            if (playing && el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
-        };
-        el.addEventListener('loadedmetadata', onMeta);
-        el.src = baseUrl + (h ? '?q=' + h : '');
-        try { el.load(); } catch (e) { }
-        beacon('CP_Q_RESTART', { h: h || 0, t: Math.round(t * 10) / 10 });
+        return baseUrl + (h ? '?q=' + h : '');
+    };
+    EngineNativeHls.prototype.adopt = function (el) {
+        var conf = this.conf;
+        if (!conf) return;
+        if (el) conf.el = el;
+        if (!conf.el || this.stopped) return;
+        conf.el.src = this._hlsUrlFor(this._q);
+        try { conf.el.load(); } catch (e) { }
+        var self = this;
+        var p = conf.el.play();
+        if (p && p.catch) p.catch(function () { setTimeout(function () { if (!self.stopped && conf.el && conf.el.paused) { var q = conf.el.play(); if (q && q.catch) q.catch(function () { }); } }, 400); });
     };
 
     function EngineHlsJs(conf) {
@@ -166,6 +171,14 @@
         Engine.prototype.close.call(this);
         try { if (this._hls) this._hls.destroy(); } catch (e) { }
     };
+    EngineHlsJs.prototype.adopt = function (el) {
+        var hls = this._hls;
+        if (!hls || !el) return;
+        try { hls.detachMedia(); } catch (e) { }
+        this.conf.el = el;
+        try { hls.attachMedia(el); } catch (e2) { }
+        if (el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
+    };
     EngineHlsJs.prototype.setPendingQ = function (h) {
         this._pendingQ = h || null;
         if (this._hls && this._hls.levels && this._hls.levels.length) this.setQuality(h);
@@ -174,9 +187,17 @@
         var hls = this._hls;
         if (!hls || !hls.levels || !hls.levels.length) { this._pendingQ = h || null; return; }
         var idx = -1, i;
-        if (h) { for (i = 0; i < hls.levels.length; i++) if (hls.levels[i].height === h) { idx = i; break; } }
+        if (h) {
+            for (i = 0; i < hls.levels.length; i++) if (hls.levels[i].height === h) { idx = i; break; }
+        } else {
+            // auto = best available rendition: the manifest is already sorted
+            // ascending by BANDWIDTH, so the last level is the top quality.
+            // Cap ABR there too, otherwise the player could climb past it.
+            idx = hls.levels.length - 1;
+            try { hls.autoLevelCapping = idx; } catch (e2) { }
+        }
         try { hls.currentLevel = idx; } catch (e) { }
-        beacon('HLSJS_Q', { h: h || 0, idx: idx, levels: hls.levels.length });
+        beacon('HLSJS_Q', { h: h || 0, idx: idx, levels: hls.levels.length, auto: !h });
     };
 
     function EngineMseWebm(conf) {
@@ -261,6 +282,7 @@
         this._videoSb = null;
         this._audioSb = null;
         this._ms = null;
+        this._pending = 0;
         try { el.pause(); } catch (e) { }
         try { el.removeAttribute('src'); el.load(); } catch (e) { }
         var ms = new global.MediaSource();
@@ -302,6 +324,7 @@
     EngineMseWebm.prototype._loadStream = function (url, sb, done, onFirst, generation) {
         var self = this, firstFired = false, finished = false;
         var current = function () { return !self.stopped && generation === self._generation; };
+        this._pending++;
         var fireFirst = function () {
             if (firstFired || !current()) return;
             firstFired = true;
@@ -311,7 +334,10 @@
         var finish = function () {
             if (finished) return;
             finished = true;
+            // done() may start the audio stream, which bumps _pending again
             if (done && current()) done();
+            self._pending--;
+            self._endOfStreamWhenComplete();
         };
         var append = function (buf) {
             if (!current()) { finish(); return; }
@@ -331,6 +357,16 @@
             finish();
         });
         if (request) this._requests.push(request);
+    };
+
+    EngineMseWebm.prototype._endOfStreamWhenComplete = function () {
+        if (this.stopped) return;
+        if (this._pending > 0) return;
+        var ms = this._ms;
+        if (!ms || ms.readyState !== 'open') return;
+        // Without endOfStream() the element never reaches the end of the
+        // buffered range, so "ended" never fires and playback never ends.
+        try { ms.endOfStream(); } catch (e) { }
     };
 
     EngineMseWebm.prototype._boot = function (generation) {
@@ -506,14 +542,50 @@
         return out;
     }
 
+    function linkBitrate(l) {
+        if (!l) return 0;
+        var explicit = parseFloat(l.bitrate !== undefined ? l.bitrate : l.tbr);
+        if (isFinite(explicit) && explicit > 0) return explicit;
+        var m = /[?&]bitrate=([\d.]+)/i.exec(String(l.url || ''));
+        return m ? parseFloat(m[1]) : 0;
+    }
+
+    /* Bytes advertised by the backend (adaptive_fmts "clen"). The MSE engines
+       buffer a whole file before playing, so an absurdly large rendition would
+       stall or OOM the device; use it to keep "auto" at the best rendition that
+       is still sane. Unknown sizes are never filtered out. */
+    function linkBytes(l) {
+        if (!l) return 0;
+        var raw = l.clen !== undefined ? l.clen : l.contentLength;
+        var n = parseFloat(raw);
+        if (isFinite(n) && n > 0) return n;
+        var m = /[?&]clen=(\d+)/i.exec(String(l.url || ''));
+        return m ? parseFloat(m[1]) : 0;
+    }
+
+    function autoByteCap() {
+        var mb = parseInt(appSettings.maxAutoQualityMB, 10);
+        if (!isFinite(mb) || mb <= 0) mb = 600;
+        return mb * 1024 * 1024;
+    }
+
+    /* "auto" = the best stream this video has: highest resolution, then the
+       highest bitrate. Renditions larger than the sanity cap are stepped over
+       (in resolution order) so a multi-GB 4K file cannot wedge the player. */
     function defaultVideo(links) {
         var candidates = (links || []).filter(function (l) { return l && l.url && linkMime(l).indexOf('video/') === 0; });
         if (!candidates.length) return null;
-        var preferred = [360, 240, 480, 144, 720, 1080, 1440, 2160, 4320], i, j;
-        for (i = 0; i < preferred.length; i++) {
-            for (j = 0; j < candidates.length; j++) if (formatHeight(candidates[j]) === preferred[i]) return candidates[j];
+        var sorted = candidates.slice().sort(function (a, b) {
+            var ha = formatHeight(a), hb = formatHeight(b);
+            if (ha !== hb) return hb - ha;
+            return linkBitrate(b) - linkBitrate(a);
+        });
+        var cap = autoByteCap(), i;
+        for (i = 0; i < sorted.length; i++) {
+            var bytes = linkBytes(sorted[i]);
+            if (!bytes || bytes <= cap) return sorted[i];
         }
-        return candidates[0];
+        return sorted[0];
     }
 
     function bestVideo(links, container) {
@@ -649,6 +721,7 @@
         var el = active && active.engEl;
         if (el) {
             try { el.pause(); } catch (e) { }
+            try { el.removeEventListener('ended', chainOnEnded); } catch (e2) { }
             try { if (el.currentSrc || el.src) el.src = ''; } catch (e) { }
             try { el.removeAttribute('src'); } catch (e) { }
             try { el.load(); } catch (e) { }
@@ -661,6 +734,25 @@
             dropOwnEl(active.ownEl);
         }
         active = null;
+        chainBusy = false;
+        chainPendingFor = '';
+        chainItems = [];
+        chainFor = '';
+        chainLoadingFor = '';
+    }
+
+    /* The 2016 app re-creates its video element every time the watch surface
+       re-renders (which it does for every chained video). Adopt the new node
+       instead of restarting playback from zero. */
+    function adoptElement(el) {
+        if (!active || !el) return;
+        if (!active.ownEl && active.engine) {
+            try { if (active.engine.adopt) active.engine.adopt(el); } catch (e) { }
+        }
+        active.el = el;
+        try { el.setAttribute('data-yt-custom', active.id); } catch (e) { }
+        try { el.addEventListener('ended', chainOnEnded); } catch (e2) { }
+        beacon('CP_ADOPT', { id: active.id, own: active.ownEl ? 1 : 0 });
     }
 
     function onSeek() {
@@ -682,7 +774,10 @@
         if (!el) return false;
         var id = conf.id || getVideoId();
         if (!id) return false;
-        if (active && active.id === id && active.el === el && active.engEl && !active.engEl.paused) return true;
+        if (active && active.id === id && active.engEl && !active.engEl.paused) {
+            if (el !== active.el) adoptElement(el);
+            return true;
+        }
 
         stopActive();
         active = { id: id, el: el, engine: null };
@@ -768,8 +863,9 @@
                 beacon('CP_ENGINE', { k: 'progressive', id: id, q: currentHeight() || 0 });
             } else {
                 qualityMode = 'hls';
+                if (wantH) hlsUrl += (hlsUrl.indexOf('?') < 0 ? '?' : '&') + 'q=' + wantH;
                 eng = new EngineNativeHls({ el: el, hlsUrl: hlsUrl });
-                beacon('CP_ENGINE', { k: 'lastresort-nativehls', id: id });
+                beacon('CP_ENGINE', { k: 'lastresort-nativehls', id: id, q: wantH || 0 });
             }
         }
 
@@ -779,6 +875,12 @@
         onSeekHandler = onSeek;
         bindSeek(engEl);
         try { engEl.addEventListener('seeked', function () { beacon('CP_SEEKED', {}); }); } catch (e) { }
+        try { engEl.addEventListener('ended', chainOnEnded); } catch (e2) { }
+        if (chainEnabled()) {
+            loadChain(id);
+            if (chainPlayed.length > 60) chainPlayed.shift();
+            if (chainPlayed.indexOf(id) < 0) chainPlayed.push(id);
+        }
         if (qualityMode === 'hls') loadQualityList(id, wantH);
         else applyQuality();
         return true;
@@ -816,7 +918,7 @@
     }
 
     function startById(id, el, cb) {
-        xhrText(base + '/get_video_info?video_id=' + id, function (t) {
+        xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function (t) {
             if (!t || !el || active) { if (cb) cb(false); return; }
             var links = parseAdaptive(t);
             var hls = null, i;
@@ -857,8 +959,11 @@
             }
             var now = Date.now();
             if (active) {
-                var owned = active.el;
-                var lost = (owned !== el);
+                var lost = (active.el !== el);
+                if (lost && active.id === id && !active.ownEl) {
+                    adoptElement(el);            // same video, framework swapped the node
+                    lost = false;
+                }
                 if (!lost && !active.ownEl) {
                     lost = (el.readyState === 0 && !/^blob:/.test(el.currentSrc || el.src || ''));
                 }
@@ -1029,6 +1134,18 @@
     var qualityRequest = 0;
     var storedHeight = 0;
 
+    /* ---- continuous ("endless") playback state ---- */
+    var chainOn = true;
+    var chainItems = [];
+    var chainFor = '';
+    var chainRequest = 0;
+    var chainBusy = false;
+    var chainPlayed = [];
+    var chainPendingFor = '';
+    var chainToastTimer = 0;
+    var chainLoadingFor = '';
+    var chainPrefetchedFor = '';
+
     function readStoredQuality() {
         storedHeight = 0;
         try {
@@ -1037,9 +1154,38 @@
         } catch (e) { }
     }
 
+    function readChainPref() {
+        chainOn = (appSettings.chainPlayback === undefined) ? true : !!appSettings.chainPlayback;
+        try {
+            var v = global.localStorage && global.localStorage.getItem('ytc_chain');
+            if (v === '0') chainOn = false;
+            else if (v === '1') chainOn = true;
+        } catch (e) { }
+    }
+
+    function saveChainPref() {
+        try { if (global.localStorage) global.localStorage.setItem('ytc_chain', chainOn ? '1' : '0'); } catch (e) { }
+    }
+
+    function chainEnabled() { return !!chainOn; }
+
+    function setChainEnabled(on) {
+        chainOn = !!on;
+        saveChainPref();
+        if (!chainOn) { chainBusy = false; chainPendingFor = ''; }
+        beacon('CP_CHAIN', { on: chainOn });
+        return chainOn;
+    }
+
+    function maxLevel() {
+        return qualityList.length ? qualityList[qualityList.length - 1] : 0;
+    }
+
     function qualityLabel() {
         var h = currentHeight();
-        return h ? h + 'p' : 'Auto';
+        if (h) return h + 'p';
+        var top = maxLevel();
+        return top ? 'Auto ' + top + 'p' : 'Auto';
     }
 
     function currentHeight() {
@@ -1061,6 +1207,7 @@
         qualityIdx = -1;
         if (wanted > 0) for (i = 0; i < out.length; i++) if (out[i] === wanted) { qualityIdx = i; break; }
         updateQualityLabel();
+        if (qMenuOpen()) renderQualityMenu();
         if (shouldApply) applyQuality();
     }
 
@@ -1074,7 +1221,10 @@
         if (typeof preferred === 'function') { cb = preferred; preferred = undefined; }
         if (!id) { if (cb) cb(false); return; }
         var request = ++qualityRequest;
-        xhrText(base + '/api/hls/' + encodeURIComponent(id), function (t) {
+        // levels=1 asks the backend for the FULL ladder; the plain master
+        // playlist is trimmed to the single best rendition (that is what "auto"
+        // plays), so it can no longer be used to build the menu.
+        xhrText(base + '/api/hls/' + encodeURIComponent(id) + '?levels=1', function (t) {
             if (request !== qualityRequest || (active && active.id !== id)) { if (cb) cb(false); return; }
             if (!t) { if (cb) cb(false); return; }
             var seen = {}, out = [], h, m, re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)/g;
@@ -1103,6 +1253,7 @@
         saveQuality();
         applyQuality();
         updateQualityLabel();
+        if (qMenuOpen()) renderQualityMenu();
         beacon('CP_Q', { idx: qualityIdx, h: currentHeight() });
         return true;
     }
@@ -1132,7 +1283,7 @@
 
     function updateQualityLabel() {
         try {
-            var span = global.document && global.document.querySelector('#button-list .icon-player-settings > .label');
+            var span = global.document && global.document.querySelector('#button-list .icon-player-settings .label');
             if (span) {
                 var text = 'Quality: ' + qualityLabel();
                 if (span.textContent !== text) span.textContent = text;
@@ -1140,7 +1291,378 @@
         } catch (e) { }
     }
 
+    /* ---- quality dropdown ----
+       The 2016 client has no quality picker, so we put a plain DOM menu on top
+       of the transport: Auto (best available) first, then every rendition the
+       backend offers, then the endless-playback switch. The app's own
+       navigation code does not know this element, so pointer input and the
+       remote keys are handled here (documented in qualityMenuKey). */
+    var qMenu = null;
+    var qMenuAnchor = null;
+    var qMenuIdx = 0;
+    var qMenuRows = [];
+
+    function qualityButton() {
+        var doc = global.document;
+        if (!doc) return null;
+        return doc.querySelector('#button-list .icon-player-settings') ||
+            doc.querySelector('.icon-player-settings');
+    }
+
+    function menuHost() {
+        var doc = global.document;
+        if (!doc) return null;
+        return doc.querySelector('#player') || doc.querySelector('#movie_player') || doc.body;
+    }
+
+    function qMenuOpen() {
+        return !!(qMenu && qMenu.style && qMenu.style.display !== 'none');
+    }
+
+    function qualityRows() {
+        var rows = [], i;
+        var top = maxLevel();
+        rows.push({ type: 'q', value: 0, label: top ? 'Auto (max ' + top + 'p)' : 'Auto', on: qualityIdx < 0 });
+        for (i = qualityList.length - 1; i >= 0; i--) {
+            rows.push({ type: 'q', value: qualityList[i], label: qualityList[i] + 'p', on: currentHeight() === qualityList[i] });
+        }
+        rows.push({ type: 'sep' });
+        rows.push({ type: 'chain', value: 1, label: 'Endless playback', on: chainEnabled() });
+        return rows;
+    }
+
+    function onQualityRowClick(idx, e) {
+        if (e && e.preventDefault) e.preventDefault();
+        if (e && e.stopPropagation) e.stopPropagation();
+        qMenuIdx = idx;
+        selectQualityRow(qMenuRows[idx]);
+    }
+
+    function buildQualityMenu() {
+        if (qMenu) return qMenu;
+        var doc = global.document;
+        if (!doc || !doc.createElement) return null;
+        var host = menuHost();
+        if (!host) return null;
+        var el = doc.createElement('div');
+        el.id = 'yt-cp-quality-menu';
+        el.style.cssText = 'position:fixed;z-index:60;display:none;min-width:200px;' +
+            'padding:10px 0;background:#1f1f1f;color:#fff;border:2px solid #6b6b6b;border-radius:4px;' +
+            'box-shadow:0 6px 20px rgba(0,0,0,.65);text-align:left;pointer-events:auto;' +
+            'font:normal 24px/1.4 Roboto,Arial,Helvetica,sans-serif;';
+        try { host.appendChild(el); } catch (e) { return null; }
+        el.addEventListener('mousedown', function (e) { if (e.stopPropagation) e.stopPropagation(); }, true);
+        // rows bind their own click handler; this one is only a fallback for
+        // targets inside a row that do not re-emit (the 2016 app stops bubbling)
+        el.addEventListener('click', function (e) {
+            var t = e.target && e.target.closest ? e.target.closest('.yt-cp-row') : null;
+            if (!t) return;
+            var idx = parseInt(t.getAttribute('data-idx'), 10);
+            if (isNaN(idx) || idx === qMenuIdx) return;
+            onQualityRowClick(idx, e);
+        });
+        el.addEventListener('mousemove', function (e) {
+            var t = e.target && e.target.closest ? e.target.closest('.yt-cp-row') : null;
+            if (!t) return;
+            var idx = parseInt(t.getAttribute('data-idx'), 10);
+            if (isNaN(idx) || idx === qMenuIdx) return;
+            qMenuIdx = idx;
+            highlightQualityRow();
+        });
+        qMenu = el;
+        return qMenu;
+    }
+
+    function renderQualityMenu() {
+        var el = buildQualityMenu();
+        if (!el) return;
+        var doc = global.document;
+        var rows = qualityRows();
+        var i, row;
+        while (el.firstChild) el.removeChild(el.firstChild);
+        qMenuRows = [];
+        for (i = 0; i < rows.length; i++) {
+            row = doc.createElement('div');
+            qMenuRows.push(rows[i]);
+            row.setAttribute('data-idx', String(i));
+            if (rows[i].type === 'sep') {
+                row.className = 'yt-cp-row yt-cp-sep';
+                row.style.cssText = 'height:1px;margin:8px 0;background:#5a5a5a;';
+            } else {
+                row.className = 'yt-cp-row';
+                row.style.cssText = 'padding:6px 20px;white-space:nowrap;';
+                var text = rows[i].label;
+                if (rows[i].type === 'chain') text += ': ' + (chainEnabled() ? 'on' : 'off');
+                if (rows[i].on) text += '  \u2713';
+                row.appendChild(doc.createTextNode(text));
+                (function (idx) {
+                    row.addEventListener('click', function (e) { onQualityRowClick(idx, e); });
+                })(i);
+            }
+            el.appendChild(row);
+        }
+        highlightQualityRow();
+    }
+
+    function highlightQualityRow() {
+        if (!qMenu) return;
+        var nodes = qMenu.getElementsByTagName('div'), i, n;
+        for (i = 0; i < nodes.length; i++) {
+            n = nodes[i];
+            if (!n.className || n.className.indexOf('yt-cp-row') < 0) continue;
+            var idx = parseInt(n.getAttribute('data-idx'), 10);
+            var row = qMenuRows[idx];
+            var on = (idx === qMenuIdx);
+            n.style.background = on ? '#3d3d3d' : 'transparent';
+            n.style.color = (!row || row.type === 'sep') ? '#9a9a9a' : '#fff';
+            if (on && n.scrollIntoView) { try { n.scrollIntoView({ block: 'nearest' }); } catch (e) { } }
+        }
+    }
+
+    function positionQualityMenu() {
+        if (!qMenu) return;
+        var doc = global.document;
+        var vw = global.innerWidth || (doc.documentElement && doc.documentElement.clientWidth) || 1280;
+        var vh = global.innerHeight || (doc.documentElement && doc.documentElement.clientHeight) || 720;
+        var w = qMenu.offsetWidth || 200;
+        var hgt = qMenu.offsetHeight || 200;
+        var top = Math.max(10, Math.round((vh - hgt) / 2));
+        var left = Math.max(10, Math.round((vw - w) / 2));
+        var r = null;
+        try { r = qMenuAnchor && qMenuAnchor.getBoundingClientRect ? qMenuAnchor.getBoundingClientRect() : null; } catch (e) { r = null; }
+        if (r && r.width && r.height) {
+            top = r.top - hgt - 10;                 // above the button, like every TV client
+            if (top < 10) top = Math.min(vh - hgt - 10, r.bottom + 10);
+            left = r.left + Math.round(r.width / 2) - Math.round(w / 2);
+        }
+        // fixed + viewport clamping: the player host is not always positioned,
+        // so absolute coordinates would resolve against the wrong ancestor
+        qMenu.style.top = Math.max(10, Math.min(vh - hgt - 10, top)) + 'px';
+        qMenu.style.left = Math.max(10, Math.min(vw - w - 10, left)) + 'px';
+    }
+
+    function openQualityMenu(anchor) {
+        var el = buildQualityMenu();
+        if (!el) return false;
+        if (!qualityList.length) loadQualityList(active ? active.id : getVideoId());
+        qMenuAnchor = anchor || qualityButton();
+        // start the cursor on the row that is currently in effect
+        var rows = qualityRows(), i;
+        qMenuIdx = 0;
+        for (i = 0; i < rows.length; i++) {
+            if (rows[i].type === 'q' && rows[i].on) { qMenuIdx = i; break; }
+        }
+        renderQualityMenu();
+        el.style.display = 'block';
+        positionQualityMenu();
+        if (qMenuAnchor && qMenuAnchor.focus && qMenuAnchor.focus) { try { qMenuAnchor.focus(); } catch (e) { } }
+        pokeTransport();
+        beacon('CP_QMENU', { open: true, levels: qualityList.join(',') });
+        return true;
+    }
+
+    function closeQualityMenu() {
+        if (!qMenu) return;
+        qMenu.style.display = 'none';
+        qMenuAnchor = null;
+        beacon('CP_QMENU', { open: false });
+    }
+
+    function toggleQualityMenu(anchor) {
+        if (qMenuOpen()) { closeQualityMenu(); return true; }
+        return openQualityMenu(anchor);
+    }
+
+    function selectQualityRow(row) {
+        if (!row) return;
+        if (row.type === 'q') {
+            setQualityTo(row.value);
+            closeQualityMenu();
+        } else if (row.type === 'chain') {
+            setChainEnabled(!chainEnabled());
+            renderQualityMenu();
+        }
+    }
+
+    function movableRow(dir) {
+        var rows = qualityRows(), i, j;
+        if (!rows.length) return;
+        for (i = 0; i < rows.length; i++) {
+            j = (i + dir + rows.length) % rows.length;
+            if (rows[j].type !== 'sep') { qMenuIdx = j; return; }
+        }
+    }
+
+    function qualityMenuKey(e) {
+        if (!qMenuOpen()) return false;
+        var code = e.keyCode || e.which || 0;
+        var key = e.key || '';
+        var map = { 8: 'Back', 13: 'Enter', 27: 'Escape', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown' };
+        if (map[code]) key = map[code];
+        if (key === 'Backspace') key = 'Back';
+        var handled = true;
+        switch (key) {
+            case 'ArrowDown':
+                movableRow(1);
+                highlightQualityRow();
+                break;
+            case 'ArrowUp':
+                movableRow(-1);
+                highlightQualityRow();
+                break;
+            case 'Enter':
+            case ' ':
+            case 'space':
+                selectQualityRow(qMenuRows[qMenuIdx]);
+                break;
+            case 'Escape':
+            case 'Back':
+                closeQualityMenu();
+                break;
+            default:
+                handled = false;
+        }
+        if (!handled) return false;
+        if (e.preventDefault) e.preventDefault();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        return true;
+    }
+
+    /* ---- endless ("chain") playback ----
+       When a video runs out we ask the backend for YouTube's own up-next
+       ranking (/api/related -> InnerTube /next, search fallback) and start the
+       best candidate we have not played yet. The hash is rewritten so the app's
+       watch screen follows along, and the next video's metadata is warmed up
+       while the current one is still playing. */
+
+    function chainPrefetch(id) {
+        if (!id) return;
+        // warms the server-side yt-dlp cache so the switch has no visible stall
+        xhrText(base + '/get_video_info?video_id=' + encodeURIComponent(id), function () { });
+    }
+
+    function loadChain(id) {
+        if (!id) return;
+        if (chainFor === id && (chainItems.length || chainLoadingFor === id)) return;
+        chainFor = id;
+        chainItems = [];
+        chainLoadingFor = id;
+        var req = ++chainRequest;
+        xhrText(base + '/api/related?videoId=' + encodeURIComponent(id) + '&limit=20', function (res) {
+            if (req !== chainRequest) return;
+            chainLoadingFor = '';
+            var data = null;
+            try { data = JSON.parse(res); } catch (e) { beacon('CP_CHAIN_BADJSON', {}); return; }
+            if (!data || !data.items || !data.items.length) { beacon('CP_CHAIN_EMPTY', { id: id, src: data && data.source }); return; }
+            chainItems = data.items;
+            beacon('CP_CHAIN_LIST', { id: id, n: chainItems.length, src: data.source });
+        });
+    }
+
+    function pickChainItem(currentId) {
+        if (!chainItems.length) return null;
+        var i, it, fallback = null;
+        for (i = 0; i < chainItems.length; i++) {
+            it = chainItems[i];
+            if (!it || !it.id || it.id === currentId) continue;
+            if (chainPlayed.indexOf(it.id) >= 0) continue;
+            // keep a live stream as a last resort: it never "ends", so chaining
+            // into one would stop the endless stream on its own terms
+            if (it.live) { if (!fallback) fallback = it; continue; }
+            return it;
+        }
+        return fallback;
+    }
+
+    function chainNavigate(id) {
+        try {
+            var hash = (global.location && global.location.hash) || '';
+            if (hash.indexOf('v=') >= 0) hash = hash.replace(/([?&#]v=)[\w-]+/, '$1' + id);
+            else hash = '#/watch?v=' + id;
+            global.location.hash = hash;
+            beacon('CP_CHAIN_HASH', { to: id, hash: hash.slice(0, 60) });
+        } catch (e) { beacon('CP_CHAIN_NAV_FAIL', { id: id, e: String(e) }); }
+    }
+
+    function chainToast(item) {
+        var doc = global.document;
+        if (!doc || !item) return;
+        var host = menuHost();
+        if (!host) return;
+        var el = doc.getElementById('yt-cp-chain-toast');
+        if (!el) {
+            el = doc.createElement('div');
+            el.id = 'yt-cp-chain-toast';
+            el.style.cssText = 'position:absolute;left:0;right:0;top:8%;z-index:60;text-align:center;' +
+                'pointer-events:none;opacity:0;transition:opacity .4s;';
+            host.appendChild(el);
+        }
+        el.textContent = '\u25b6 ' + (item.title || item.id);
+        try { el.style.opacity = '1'; } catch (e) { }
+        if (chainToastTimer) clearTimeout(chainToastTimer);
+        chainToastTimer = setTimeout(function () {
+            try { if (el) el.style.opacity = '0'; } catch (e2) { }
+        }, 4000);
+    }
+
+    function chainNext(currentId) {
+        if (!chainEnabled() || chainBusy) return false;
+        if (getVideoId() !== currentId) return false;      // app is already navigating
+        if (!chainItems.length) { loadChain(currentId); return false; }
+        var next = pickChainItem(currentId);
+        if (!next) {
+            // ranking exhausted: look for a fresh list before giving up
+            if (chainFor !== currentId) { loadChain(currentId); return false; }
+            beacon('CP_CHAIN_DONE', { id: currentId });
+            return false;
+        }
+        chainBusy = true;
+        chainItems.shift();
+        chainPlayed.push(next.id);
+        var ahead = chainItems.length ? chainItems[0].id : '';
+        beacon('CP_CHAIN_GO', { from: currentId, to: next.id, title: next.title });
+        chainNavigate(next.id);
+        var el = global.document && global.document.querySelector('.html5-main-video');
+        stopActive();                       // clears chainItems, so read `ahead` first
+        if (ahead) chainPrefetch(ahead);
+        if (el) {
+            startById(next.id, el, function (ok) {
+                chainBusy = false;
+                if (ok) chainToast(next);
+            });
+        } else {
+            chainBusy = false;
+        }
+        return true;
+    }
+
+    function chainCheck() {
+        if (!chainEnabled() || !active || !active.engEl) return;
+        if (chainBusy) return;
+        if (chainPendingFor === active.id) return;
+        if (getVideoId() !== active.id) return;             // app-driven nav wins
+        var el = active.engEl, dur = el.duration;
+        if (el.ended) { chainPendingFor = active.id; chainNext(active.id); return; }
+        if (el.paused) return;                              // user paused: do not jump
+        if (!(isFinite(dur) && dur > 0)) return;            // live stream
+        if (dur - (el.currentTime || 0) > 1.5) return;
+        if (chainPrefetchedFor !== active.id) {
+            chainPrefetchedFor = active.id;
+            var nxt = pickChainItem(active.id);
+            if (nxt) chainPrefetch(nxt.id);                 // warm the cache once
+        }
+        chainPendingFor = active.id;
+        chainNext(active.id);
+    }
+
+    function chainOnEnded() {
+        if (!active) return;
+        beacon('CP_ENDED', { id: active.id });
+        chainCheck();
+    }
+
     readStoredQuality();
+    readChainPref();
 
     function openMoreActions() {
         var list = global.document && global.document.querySelector('#button-list');
@@ -1164,7 +1686,7 @@
         if (/icon-player-play/.test(cl)) { trTogglePlay(); return true; }
         if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
         if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
-        if (/yt-cp-quality|icon-player-settings/.test(cl)) { cycleQuality(); return true; }
+        if (/yt-cp-quality|icon-player-settings/.test(cl)) { return toggleQualityMenu(b); }
         if (/icon-ellipsis/.test(cl)) return openMoreActions();
         if (/icon-home/.test(cl)) { goHome(); return true; }
         return false;
@@ -1182,13 +1704,17 @@
                 setTransport(false);
             }
             if (trVisible) {
-                if (Date.now() - lastTrActive > TR_HIDE_MS) { trVisible = false; setTransport(false); }
-                else setTransport(true);
+                if (Date.now() - lastTrActive > TR_HIDE_MS) {
+                    trVisible = false;
+                    setTransport(false);
+                    if (qMenuOpen()) closeQualityMenu();   // the menu hangs off the transport
+                } else setTransport(true);
             } else {
                 setTransport(false);
             }
             if (active && active.engEl) {
                 var el = active.engEl;
+                chainCheck();           // near-end fallback if "ended" never fires
                 var ct = el.currentTime || 0;
                 var dur = el.duration;
                 var live = !(isFinite(dur) && dur > 0);
@@ -1267,7 +1793,11 @@
     }
 
     function inTransport(t) {
-        try { return !!(t && t.closest && t.closest('#transport-controls,#title-tray,#html5-video-info-panel')); } catch (e) { return false; }
+        try { return !!(t && t.closest && t.closest('#transport-controls,#title-tray,#html5-video-info-panel,#yt-cp-quality-menu')); } catch (e) { return false; }
+    }
+
+    function inQualityMenu(t) {
+        try { return !!(t && t.closest && t.closest('#yt-cp-quality-menu')); } catch (e) { return false; }
     }
 
     function pokeTransport() { trVisible = true; lastTrActive = Date.now(); setTransport(true); }
@@ -1304,6 +1834,7 @@
 
         var downX = 0, downY = 0, downT = 0;
         doc.addEventListener('mousedown', function (e) {
+            if (qMenuOpen() && !inQualityMenu(e.target)) closeQualityMenu();
             if (!isWatchSurface() || isSnapped()) return;
             if (inTransport(e.target)) return;
             var t = e.target;
@@ -1330,6 +1861,7 @@
 
         var tX = 0, tY = 0, tT = 0;
         doc.addEventListener('touchstart', function (e) {
+            if (qMenuOpen() && !inQualityMenu(e.target)) closeQualityMenu();
             if (!isWatchSurface() || isSnapped()) return;
             if (inTransport(e.target)) return;
             var t = e.target;
@@ -1378,7 +1910,7 @@
                     if (/icon-player-play/.test(cl)) { trTogglePlay(); handled = true; }
                     else if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); handled = true; }
                     else if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); handled = true; }
-                    else if (/yt-cp-quality|icon-player-settings/.test(cl)) { cycleQuality(); handled = true; }
+                    else if (/yt-cp-quality|icon-player-settings/.test(cl)) { toggleQualityMenu(b); handled = true; }
                     else if (/icon-home/.test(cl)) { goHome(); handled = true; }
                     else if (/icon-ellipsis/.test(cl)) {
                         trFocus = 'buttons';
@@ -1469,13 +2001,17 @@
         var tag = (tgt && (tgt.tagName || '')) || '';
         if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (tgt && tgt.isContentEditable)) return;
 
+        // The quality dropdown swallows navigation while it is open, whatever
+        // the rest of the player is doing (it lives outside the app's focus model).
+        if (qMenuOpen() && qualityMenuKey(e)) return;
+
         var w = watchSurface();
         var tc = trEl();
         if (!w || !tc) return;                     // only own keys while the watch surface exists
         var hash = '';
         try { hash = global.location && global.location.hash || ''; } catch (err) { }
-        if (hash.indexOf('/watch') === -1) return; // non-watch screens: let the app handle its own nav
-        if (!active) return;                       // no running session: let the app drive the screen
+        if (hash.indexOf('/watch') === -1) { closeQualityMenu(); return; } // non-watch screens: let the app handle its own nav
+        if (!active) { closeQualityMenu(); return; } // no running session: let the app drive the screen
         var snapped = false;
         try { snapped = w.classList.contains('snapped'); } catch (err) { }
         if (snapped) return;                       // let the app navigate the behind grid
@@ -1585,6 +2121,12 @@
         getQuality: function () { return { height: currentHeight(), levels: qualityList.slice(), auto: qualityIdx < 0 }; },
         setQuality: setQualityTo,
         cycleQuality: cycleQuality,
+        openQualityMenu: openQualityMenu,
+        toggleQualityMenu: toggleQualityMenu,
+        closeQualityMenu: closeQualityMenu,
+        getChainEnabled: chainEnabled,
+        setChainEnabled: setChainEnabled,
+        playRelated: chainNext,
         stop: stopActive,
         _remount: remount
     };

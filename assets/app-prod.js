@@ -12955,7 +12955,7 @@
             this.cc = this.Ma.nimbleNextVsBack ? [this.Ob, this.Bb,
             this.ya, this.A, this.S, this.M, this.$a, this.I, this.sa, this.W
             ] : [this.Ob, this.A, this.S, this.M, this.$a, this.Bb, this.W, a, a];
-            this.cc.push(new M("[[Quality|Choose video quality.]]", void 0, function () { if (window.YTCustomPlayer && window.YTCustomPlayer.cycleQuality) window.YTCustomPlayer.cycleQuality(); }, void 0, "icon-player-settings"));
+            this.cc.push(new M("[[Quality|Choose video quality.]]", void 0, function () { var p = window.YTCustomPlayer; if (!p) return; if (p.toggleQualityMenu) p.toggleQualityMenu(); else if (p.cycleQuality) p.cycleQuality(); }, void 0, "icon-player-settings"));
             this.f = l;
             this.i = null;
             this.P = !1;

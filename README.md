@@ -76,6 +76,8 @@ Settings are in ./back/settings.json!
 
 - expBrowse: make the server use the wip browse api that fetches from the YouTube server, it is mostly complete! [default: true]
 
+- chainPlayback: when a video ends, automatically start the next related video instead of stopping [default: true]
+
 Be careful with your token folder, this has device ids and also has oauth tokens, I had issues when I didn't save it to a json file, luckly had no issues with refreshing so it doesn't save when you refresh. Just don't leak it or anything,
 it should expire anyways.
 

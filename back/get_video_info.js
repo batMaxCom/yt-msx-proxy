@@ -1056,6 +1056,26 @@ function buildHlsEntry(videoId, formats) {
     };
 }
 
+/* Variant choice for the "auto" quality mode.
+   Auto means "the best stream this video has", so pick the highest rendition.
+   Codec still matters: an AVC rendition plays everywhere, while VP9/AV1 above
+   1080p is usually refused by the webOS/Tizen media stacks (and by the LL-HLS
+   transcode path), so a fancy codec is only used when no AVC rendition exists. */
+function variantIsAvc(v) {
+    const codec = String((v && v.codec) || '').toLowerCase();
+    if (!codec) return true;                      // unknown -> assume the safe TS/AVC default
+    return /avc|h264/.test(codec);
+}
+
+function pickAutoVariant(variants) {
+    const list = Array.isArray(variants) ? variants.filter(v => v && v.url) : [];
+    if (!list.length) return null;
+    const byHeightDesc = list.slice().sort((a, b) => (b.height || 0) - (a.height || 0));
+    const top = byHeightDesc[0];
+    if (variantIsAvc(top)) return top;
+    return byHeightDesc.find(variantIsAvc) || top;
+}
+
 const BROWSER_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -1152,17 +1172,31 @@ async function handleHlsRequest(req, res) {
             const encAudio = encodeURIComponent(entry.audio.url);
             const qH = parseInt(req.query && req.query.q, 10) || 0;
 
+            const variants = Array.isArray(entry.variants) ? entry.variants : [];
+            // ?levels=1 asks for the full ladder (the client uses it to build the
+            // quality menu). Without it the playlist carries the single best
+            // rendition, so "auto" really means "highest quality available" no
+            // matter which engine (native HLS, hls.js ABR, WAM) consumes it.
+            const wantLevels = !!(req.query && (req.query.levels === '1' || req.query.levels === 'true'));
+
             const chosen = [];
-            if (qH > 0 && Array.isArray(entry.variants)) {
-                const hit = entry.variants.find(v => v.height === qH) ||
-                    entry.variants.reduce((best, v) => {
-                        if (!best) return v;
-                        return Math.abs(v.height - qH) < Math.abs(best.height - qH) ? v : best;
-                    }, null);
-                if (hit) chosen.push(hit);
-                else for (const v of entry.variants) chosen.push(v);
-            } else if (Array.isArray(entry.variants) && entry.variants.length) {
-                for (const v of entry.variants) chosen.push(v);
+            if (variants.length) {
+                if (qH > 0) {
+                    const hit = variants.find(v => v.height === qH) ||
+                        variants.reduce((best, v) => {
+                            if (!best) return v;
+                            return Math.abs(v.height - qH) < Math.abs(best.height - qH) ? v : best;
+                        }, null);
+                    if (hit) chosen.push(hit);
+                    else if (wantLevels) for (const v of variants) chosen.push(v);
+                    else chosen.push(pickAutoVariant(variants));
+                } else if (wantLevels) {
+                    for (const v of variants) chosen.push(v);
+                } else {
+                    const best = pickAutoVariant(variants);
+                    if (best) chosen.push(best);
+                    else for (const v of variants) chosen.push(v);
+                }
             } else {
                 const fall = {
                     height: (decodeURIComponent(entry.video.url).match(/itag=(\d+)/) || [])[1] || '',
@@ -1170,6 +1204,14 @@ async function handleHlsRequest(req, res) {
                 };
                 chosen.push(fall);
             }
+
+            logger.info('hls', 'master playlist', {
+                video_id: videoId,
+                mode: qH > 0 ? `q=${qH}` : (wantLevels ? 'levels' : 'auto'),
+                variants: variants.length,
+                served: chosen.length,
+                height: chosen.length ? chosen[0].height : 0,
+            });
 
             const bwOf = v => {
                 if (v.tbr > 0) return Math.round(v.tbr * 1000);
@@ -1222,4 +1264,4 @@ async function handleHlsRequest(req, res) {
     }
 }
 
-module.exports = { handleGetVideoInfo, handleStreamRequest, handleHlsRequest };
+module.exports = { handleGetVideoInfo, handleStreamRequest, handleHlsRequest, getVideoInfoCached };
