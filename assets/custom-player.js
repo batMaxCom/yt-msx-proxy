@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261020';
+    global.__CUSTOM_PLAYER_VERSION = '20261022';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -1060,6 +1060,7 @@
         qualityListId = id || '';
         qualityIdx = -1;
         if (wanted > 0) for (i = 0; i < out.length; i++) if (out[i] === wanted) { qualityIdx = i; break; }
+        updateQualityLabel();
         if (shouldApply) applyQuality();
     }
 
@@ -1101,6 +1102,7 @@
         qualityIdx = next;
         saveQuality();
         applyQuality();
+        updateQualityLabel();
         beacon('CP_Q', { idx: qualityIdx, h: currentHeight() });
         return true;
     }
@@ -1115,6 +1117,7 @@
         else qualityIdx += 1;
         saveQuality();
         applyQuality();
+        updateQualityLabel();
         beacon('CP_Q', { idx: qualityIdx, h: currentHeight() });
     }
 
@@ -1129,8 +1132,11 @@
 
     function updateQualityLabel() {
         try {
-            var span = global.document && global.document.querySelector('#button-list .yt-cp-quality > span');
-            if (span && span.textContent !== qualityLabel()) span.textContent = qualityLabel();
+            var span = global.document && global.document.querySelector('#button-list .icon-player-settings > .label');
+            if (span) {
+                var text = 'Quality: ' + qualityLabel();
+                if (span.textContent !== text) span.textContent = text;
+            }
         } catch (e) { }
     }
 
@@ -1138,16 +1144,17 @@
 
     function activateFocusedButton() {
         var bs = enabledButtons();
-        if (!bs.length) return;
+        if (!bs.length) return false;
         var i, b = null;
         for (i = 0; i < bs.length; i++) { if (bs[i].classList.contains('focused')) { b = bs[i]; break; } }
-        if (!b) return;
+        if (!b) return false;
         var cl = typeof b.className === 'string' ? b.className : '';
-        if (/icon-player-play/.test(cl)) trTogglePlay();
-        else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
-        else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
-        else if (/yt-cp-quality/.test(cl)) cycleQuality();
-        else if (/icon-home/.test(cl)) goHome();
+        if (/icon-player-play/.test(cl)) { trTogglePlay(); return true; }
+        if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
+        if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
+        if (/yt-cp-quality|icon-player-settings/.test(cl)) { cycleQuality(); return true; }
+        if (/icon-home/.test(cl)) { goHome(); return true; }
+        return false;
     }
 
     function syncUI() {
@@ -1235,6 +1242,11 @@
                        swipe up/down = volume, drag the seekbar to scrub */
 
     function isWatchSurface() { return !!(watchSurface() && trEl()); }
+
+    function moreActionsOpen() {
+        var bl = global.document && global.document.querySelector('#button-list');
+        return !!(bl && bl.querySelector('.icon-ellipsis') && !bl.querySelector('.icon-player-play'));
+    }
 
     function isSnapped() {
         var w = watchSurface();
@@ -1349,29 +1361,21 @@
                     var b = e.target && e.target.closest && e.target.closest('#button-list > div');
                     if (!b) return;
                     var cl = typeof b.className === 'string' ? b.className : '';
-                    if (/icon-player-play/.test(cl)) trTogglePlay();
-                    else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
-                    else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
-                    else if (/yt-cp-quality/.test(cl)) cycleQuality();
-                    else if (/icon-home/.test(cl)) goHome();
+                    var handled = false;
+                    if (/icon-player-play/.test(cl)) { trTogglePlay(); handled = true; }
+                    else if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); handled = true; }
+                    else if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); handled = true; }
+                    else if (/yt-cp-quality|icon-player-settings/.test(cl)) { cycleQuality(); handled = true; }
+                    else if (/icon-home/.test(cl)) { goHome(); handled = true; }
+                    else if (/icon-ellipsis/.test(cl)) {
+                        trFocus = 'buttons';
+                    }
                     pokeTransport();
-                    if (e.preventDefault) e.preventDefault();
-                    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                    if (handled) {
+                        if (e.preventDefault) e.preventDefault();
+                        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                    }
                 }, true);
-        }
-
-        if (bl) {
-            try {
-                if (!bl.querySelector('.yt-cp-quality')) {
-                    var qBtn = doc.createElement('div');
-                    qBtn.className = 'yt-cp-quality button';
-                    qBtn.setAttribute('tabindex', '-1');
-                    qBtn.title = 'Quality';
-                    qBtn.style.cssText = 'display:flex;align-items:center;justify-content:center;min-width:64px;height:40px;padding:0 12px;margin:0 6px;font-size:20px;line-height:40px;text-align:center;color:rgba(255,255,255,0.9);background:rgba(0,0,0,0.55);border-radius:4px;cursor:pointer;';
-                    qBtn.innerHTML = '<span>Auto</span>';
-                    bl.appendChild(qBtn);
-                }
-            } catch (e2) { }
         }
 
         var bar = doc.querySelector('#progress-bar');
@@ -1462,6 +1466,7 @@
         var snapped = false;
         try { snapped = w.classList.contains('snapped'); } catch (err) { }
         if (snapped) return;                       // let the app navigate the behind grid
+        if (moreActionsOpen()) return;
 
         var k = e.key || '';
         var code = e.keyCode || e.which || 0;
@@ -1541,7 +1546,7 @@
                 eat();
                 break;
             case 'Enter':
-                if (trVisible && trFocus === 'buttons') { activateFocusedButton(); eat(); }
+                if (trVisible && trFocus === 'buttons' && activateFocusedButton()) eat();
                 break;
             case 'Back':
             case 'Backspace':
@@ -1564,6 +1569,7 @@
         activeVideo: function () { return active ? active.id : null; },
         getQuality: function () { return { height: currentHeight(), levels: qualityList.slice(), auto: qualityIdx < 0 }; },
         setQuality: setQualityTo,
+        cycleQuality: cycleQuality,
         stop: stopActive,
         _remount: remount
     };
