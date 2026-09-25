@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261018';
+    global.__CUSTOM_PLAYER_VERSION = '20261020';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -52,6 +52,7 @@
             }
         };
         x.send(null);
+        return x;
     }
 
     function absUrl(u) {
@@ -101,6 +102,26 @@
     }
     EngineNativeHls.prototype = Object.create(Engine.prototype);
     EngineNativeHls.prototype.constructor = EngineNativeHls;
+    EngineNativeHls.prototype.setQuality = function (h) {
+        var el = this.conf && this.conf.el;
+        if (!el) return;
+        var baseUrl = String(this.conf.hlsUrl || '').split('?')[0];
+        if (!baseUrl) return;
+        var t = el.currentTime || 0;
+        var playing = el.paused === false;
+        try { el.pause(); } catch (e) { }
+        el.removeAttribute('src');
+        try { el.load(); } catch (e) { }
+        var onMeta = function () {
+            el.removeEventListener('loadedmetadata', onMeta);
+            try { if (t > 1 && isFinite(el.duration) && t < el.duration) el.currentTime = t; } catch (e) { }
+            if (playing && el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
+        };
+        el.addEventListener('loadedmetadata', onMeta);
+        el.src = baseUrl + (h ? '?q=' + h : '');
+        try { el.load(); } catch (e) { }
+        beacon('CP_Q_RESTART', { h: h || 0, t: Math.round(t * 10) / 10 });
+    };
 
     function EngineHlsJs(conf) {
         this.conf = conf;
@@ -119,10 +140,12 @@
             fragLoadingMaxRetry: 6
         });
         this._hls = hls;
+        this._pendingQ = null;
         hls.attachMedia(conf.el);
         hls.on(Hls.Events.MANIFEST_PARSED, function () {
             if (self.stopped) return;
             beacon('HLSJS_READY', { levels: hls.levels ? hls.levels.length : -1 });
+            if (self._pendingQ) self.setQuality(self._pendingQ);
             hideFrameworkEl();
             if (conf.el.paused) {
                 var p = conf.el.play();
@@ -143,77 +166,202 @@
         Engine.prototype.close.call(this);
         try { if (this._hls) this._hls.destroy(); } catch (e) { }
     };
+    EngineHlsJs.prototype.setPendingQ = function (h) {
+        this._pendingQ = h || null;
+        if (this._hls && this._hls.levels && this._hls.levels.length) this.setQuality(h);
+    };
+    EngineHlsJs.prototype.setQuality = function (h) {
+        var hls = this._hls;
+        if (!hls || !hls.levels || !hls.levels.length) { this._pendingQ = h || null; return; }
+        var idx = -1, i;
+        if (h) { for (i = 0; i < hls.levels.length; i++) if (hls.levels[i].height === h) { idx = i; break; } }
+        try { hls.currentLevel = idx; } catch (e) { }
+        beacon('HLSJS_Q', { h: h || 0, idx: idx, levels: hls.levels.length });
+    };
 
     function EngineMseWebm(conf) {
         this.conf = conf;
         Engine.call(this);
-        var self = this;
-        var ms = new MediaSource();
-        this._ms = ms;
+        this._videoLinks = (conf.videoLinks || []).slice();
+        if (!this._videoLinks.length && conf.video) this._videoLinks = [conf.video];
+        this._audio = conf.audio || null;
+        this._requests = [];
+        this._generation = 0;
+        this._objectUrl = '';
         this._videoSb = null;
         this._audioSb = null;
-        conf.el.src = URL.createObjectURL(ms);
-        ms.addEventListener('sourceopen', function () {
-            if (self.stopped || ms.readyState !== 'open') return;
-            beacon('WEBM_SOURCEOPEN', { rs: ms.readyState, same: conf.el === (global.document && global.document.querySelector('.html5-main-video')) });
-            try { self._videoSb = ms.addSourceBuffer(conf.video.mime); }
-            catch (e) { beacon('WEBM_VIDEOSB_FAIL', { m: conf.video.mime, e: String(e) }); return; }
-            try { if (conf.audio) self._audioSb = ms.addSourceBuffer(conf.audio.mime); }
-            catch (e) { self._audioSb = null; }
-            self._loadStream(conf.video.url, self._videoSb, function () {
-                if (self.stopped) return;
-                if (self._audioSb && conf.audio) self._loadStream(conf.audio.url, self._audioSb, null);
-            }, function () { self._boot(); });
-        });
+        this._currentVideo = null;
+        this._restoreTime = 0;
+        this._shouldPlay = true;
+        var video = this._selectVideo(conf.height);
+        this._openSource(video);
     }
     EngineMseWebm.prototype = Object.create(Engine.prototype);
     EngineMseWebm.prototype.constructor = EngineMseWebm;
 
-    EngineMseWebm.prototype._loadStream = function (url, sb, done, onFirst) {
-        var self = this, firstFired = false;
+    EngineMseWebm.prototype.getQualityLevels = function () {
+        return qualityHeights(this._videoLinks);
+    };
+
+    EngineMseWebm.prototype._selectVideo = function (h) {
+        if (!this._videoLinks.length) return null;
+        if (h) {
+            var exact = null, nearest = null, nearestDistance = Number.MAX_SAFE_INTEGER, i;
+            for (i = 0; i < this._videoLinks.length; i++) {
+                var current = this._videoLinks[i];
+                var currentHeight = formatHeight(current);
+                if (currentHeight === h) { exact = current; break; }
+                var distance = Math.abs(currentHeight - h);
+                if (currentHeight > 0 && distance < nearestDistance) { nearest = current; nearestDistance = distance; }
+            }
+            if (exact) return exact;
+            if (nearest) return nearest;
+        }
+        return defaultVideo(this._videoLinks);
+    };
+
+    EngineMseWebm.prototype._clearMetadata = function () {
+        var el = this.conf && this.conf.el;
+        if (el && this._onMeta) {
+            try { el.removeEventListener('loadedmetadata', this._onMeta); } catch (e) { }
+        }
+        this._onMeta = null;
+    };
+
+    EngineMseWebm.prototype._abortRequests = function () {
+        for (var i = 0; i < this._requests.length; i++) {
+            try { this._requests[i].abort(); } catch (e) { }
+        }
+        this._requests = [];
+    };
+
+    EngineMseWebm.prototype.close = function () {
+        Engine.prototype.close.call(this);
+        this._clearMetadata();
+        this._abortRequests();
+        if (this._ms) {
+            try { if (this._ms.readyState === 'open') this._ms.endOfStream(); } catch (e) { }
+        }
+        if (this._objectUrl) {
+            try { global.URL.revokeObjectURL(this._objectUrl); } catch (e) { }
+            this._objectUrl = '';
+        }
+    };
+
+    EngineMseWebm.prototype._openSource = function (video) {
+        if (this.stopped) return;
+        if (!video || !video.url) { beacon('MSE_SOURCE_FAIL', { reason: 'video' }); return; }
+        var generation = ++this._generation;
+        this._abortRequests();
+        this._clearMetadata();
+        var self = this;
+        var el = this.conf && this.conf.el;
+        var oldUrl = this._objectUrl;
+        this._currentVideo = video;
+        this._videoSb = null;
+        this._audioSb = null;
+        this._ms = null;
+        try { el.pause(); } catch (e) { }
+        try { el.removeAttribute('src'); el.load(); } catch (e) { }
+        var ms = new global.MediaSource();
+        this._ms = ms;
+        var objectUrl = global.URL.createObjectURL(ms);
+        this._objectUrl = objectUrl;
+        this._onMeta = function () {
+            if (self.stopped || generation !== self._generation) return;
+            self._clearMetadata();
+            var t = self._restoreTime || 0;
+            try { if (t > 0 && isFinite(el.duration) && t < el.duration) el.currentTime = t; } catch (err) { }
+            if (self._shouldPlay && el.paused) {
+                var p = el.play();
+                if (p && p.catch) p.catch(function () { });
+            }
+        };
+        el.addEventListener('loadedmetadata', this._onMeta);
+        el.src = objectUrl;
+        try { el.load(); } catch (e) { }
+        if (oldUrl) {
+            try { global.URL.revokeObjectURL(oldUrl); } catch (e) { }
+        }
+        ms.addEventListener('sourceopen', function () {
+            if (self.stopped || generation !== self._generation || ms.readyState !== 'open') return;
+            var videoMime = video.mime || mseMime(video, 'video');
+            var audioMime = self._audio ? (self._audio.mime || mseMime(self._audio, 'audio')) : '';
+            beacon('MSE_SOURCEOPEN', { rs: ms.readyState, mime: videoMime });
+            try { self._videoSb = ms.addSourceBuffer(videoMime); }
+            catch (e) { beacon('MSE_VIDEOSB_FAIL', { m: videoMime, e: String(e) }); return; }
+            try { if (self._audio) self._audioSb = ms.addSourceBuffer(audioMime); }
+            catch (e) { self._audioSb = null; }
+            self._loadStream(video.url, self._videoSb, function () {
+                if (self.stopped || generation !== self._generation) return;
+                if (self._audioSb && self._audio) self._loadStream(self._audio.url, self._audioSb, null, null, generation);
+            }, function () { self._boot(generation); }, generation);
+        });
+    };
+
+    EngineMseWebm.prototype._loadStream = function (url, sb, done, onFirst, generation) {
+        var self = this, firstFired = false, finished = false;
+        var current = function () { return !self.stopped && generation === self._generation; };
         var fireFirst = function () {
-            if (firstFired) return;
+            if (firstFired || !current()) return;
             firstFired = true;
-            beacon('WEBM_FIRST_APPEND', { len: sb.buffered && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : -1 });
+            beacon('MSE_FIRST_APPEND', { len: sb.buffered && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : -1 });
             if (onFirst) onFirst();
         };
-        var finish = function () { if (done) done(); };
+        var finish = function () {
+            if (finished) return;
+            finished = true;
+            if (done && current()) done();
+        };
         var append = function (buf) {
-            if (self.stopped) { finish(); return; }
+            if (!current()) { finish(); return; }
             var go = function () {
+                if (!current()) { finish(); return; }
                 try { sb.appendBuffer(buf); }
-                catch (e) { beacon('WEBM_APPEND_FAIL', { e: String(e), bytes: buf.byteLength }); finish(); return; }
-                beacon('WEBM_FULL', { bytes: buf.byteLength, b: sb.buffered && sb.buffered.length ? +sb.buffered.end(sb.buffered.length - 1).toFixed(1) : -1, rs: self.conf.el.readyState });
+                catch (e) { beacon('MSE_APPEND_FAIL', { e: String(e), bytes: buf.byteLength }); finish(); return; }
+                beacon('MSE_FULL', { bytes: buf.byteLength, b: sb.buffered && sb.buffered.length ? +sb.buffered.end(sb.buffered.length - 1).toFixed(1) : -1, rs: self.conf.el.readyState });
                 fireFirst();
-                if (done) done();
+                finish();
             };
             if (sb.updating) sb.addEventListener('updateend', function h() { sb.removeEventListener('updateend', h); go(); });
             else go();
         };
-        xhrArray(url, append, function (st) { beacon('WEBM_FETCH_FAIL', { s: st }); finish(); });
+        var request = xhrArray(url, append, function (st) {
+            if (current()) beacon('MSE_FETCH_FAIL', { s: st });
+            finish();
+        });
+        if (request) this._requests.push(request);
     };
-    EngineMseWebm.prototype._boot = function () {
-        if (this.stopped) return;
+
+    EngineMseWebm.prototype._boot = function (generation) {
+        if (this.stopped || generation !== this._generation) return;
         var self = this, tries = 0;
         var kick = function () {
-            if (self.stopped) return;
+            if (self.stopped || generation !== self._generation) return;
             var el = self.conf.el;
             var rs = el.readyState;
-            try { beacon('WEBM_KICK', { rs: rs, t: Math.round((el.currentTime || 0) * 10) / 10, b: el.buffered && el.buffered.length ? +el.buffered.end(el.buffered.length - 1).toFixed(1) : -1 }); } catch (e) { }
-            // once the decoder actually opened, stop kicking and hide the extra element
+            try { beacon('MSE_KICK', { rs: rs, t: Math.round((el.currentTime || 0) * 10) / 10, b: el.buffered && el.buffered.length ? +el.buffered.end(el.buffered.length - 1).toFixed(1) : -1 }); } catch (e) { }
             if (rs >= 2) { hideFrameworkEl(); return; }
+            if (!self._shouldPlay) return;
             var p = el.play();
             if (p && p.catch) p.catch(function () { });
             if (tries++ < 10) setTimeout(kick, 2500);
             else {
-                // decoder wedged: remount a fresh engine on the same element
-                try { beacon('WEBM_REMOUNT', { t: Math.round((el.currentTime || 0) * 10) / 10, rs: rs }); } catch (e) { }
-                if (window.YTCustomPlayer && window.YTCustomPlayer._remount) {
-                    window.YTCustomPlayer._remount(self.conf.el);
-                }
+                try { beacon('MSE_REMOUNT', { t: Math.round((el.currentTime || 0) * 10) / 10, rs: rs }); } catch (e) { }
+                if (global.YTCustomPlayer && global.YTCustomPlayer._remount) global.YTCustomPlayer._remount(self.conf.el);
             }
         };
         kick();
+    };
+
+    EngineMseWebm.prototype.setQuality = function (h) {
+        var video = this._selectVideo(h);
+        if (!video || video === this._currentVideo) return;
+        var el = this.conf && this.conf.el;
+        this._restoreTime = el ? (el.currentTime || 0) : 0;
+        this._shouldPlay = !!(el && el.paused === false);
+        this._openSource(video);
+        beacon('MSE_Q', { h: formatHeight(video) || 0, requested: h || 0 });
     };
 
     function EngineNoop() { Engine.call(this); }
@@ -223,61 +371,209 @@
     function EngineProgressive(conf) {
         this.conf = conf;
         Engine.call(this);
-        var self = this;
-        conf.el.src = conf.url;
-        try { conf.el.load(); } catch (e) { }
-        var t = setTimeout(function () {
-            if (!self.stopped && conf.el.paused) {
-                var p = conf.el.play();
-                if (p && p.catch) p.catch(function () { });
-            }
-        }, 300);
-        this._timer = t;
+        this._sources = (conf.sources || []).slice();
+        if (!this._sources.length && conf.url) this._sources = [{ url: conf.url }];
+        this._currentSource = null;
+        this._restoreTime = 0;
+        this._shouldPlay = true;
+        this._timer = null;
+        this._onMeta = null;
+        this._loadSource(this._selectSource(conf.height));
     }
     EngineProgressive.prototype = Object.create(Engine.prototype);
     EngineProgressive.prototype.constructor = EngineProgressive;
 
+    EngineProgressive.prototype.getQualityLevels = function () {
+        return qualityHeights(this._sources);
+    };
+
+    EngineProgressive.prototype._selectSource = function (h) {
+        if (!this._sources.length) return null;
+        if (h) {
+            var exact = null, nearest = null, nearestDistance = Number.MAX_SAFE_INTEGER, i;
+            for (i = 0; i < this._sources.length; i++) {
+                var current = this._sources[i];
+                var currentHeight = formatHeight(current);
+                if (currentHeight === h) { exact = current; break; }
+                var distance = Math.abs(currentHeight - h);
+                if (currentHeight > 0 && distance < nearestDistance) { nearest = current; nearestDistance = distance; }
+            }
+            if (exact) return exact;
+            if (nearest) return nearest;
+        }
+        return defaultVideo(this._sources);
+    };
+
+    EngineProgressive.prototype._clearMetadata = function () {
+        var el = this.conf && this.conf.el;
+        if (el && this._onMeta) {
+            try { el.removeEventListener('loadedmetadata', this._onMeta); } catch (e) { }
+        }
+        this._onMeta = null;
+    };
+
+    EngineProgressive.prototype._loadSource = function (source) {
+        if (this.stopped || !source || !source.url) return;
+        this._clearMetadata();
+        var self = this;
+        var el = this.conf && this.conf.el;
+        this._currentSource = source;
+        try { el.pause(); } catch (e) { }
+        try { el.removeAttribute('src'); el.load(); } catch (e) { }
+        this._onMeta = function () {
+            if (self.stopped) return;
+            self._clearMetadata();
+            var t = self._restoreTime || 0;
+            try { if (t > 0 && isFinite(el.duration) && t < el.duration) el.currentTime = t; } catch (err) { }
+            if (self._shouldPlay && el.paused) {
+                var p = el.play();
+                if (p && p.catch) p.catch(function () { });
+            }
+        };
+        el.addEventListener('loadedmetadata', this._onMeta);
+        el.src = source.url;
+        try { el.load(); } catch (e) { }
+        if (this._timer) clearTimeout(this._timer);
+        this._timer = setTimeout(function () {
+            if (!self.stopped && self._shouldPlay && el.paused) {
+                var p = el.play();
+                if (p && p.catch) p.catch(function () { });
+            }
+        }, 300);
+    };
+
+    EngineProgressive.prototype.setQuality = function (h) {
+        var source = this._selectSource(h);
+        if (!source || source === this._currentSource) return;
+        var el = this.conf && this.conf.el;
+        this._restoreTime = el ? (el.currentTime || 0) : 0;
+        this._shouldPlay = !!(el && el.paused === false);
+        this._loadSource(source);
+        beacon('PROGRESSIVE_Q', { h: formatHeight(source) || 0, requested: h || 0 });
+    };
+
+    EngineProgressive.prototype.close = function () {
+        Engine.prototype.close.call(this);
+        this._clearMetadata();
+        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    };
+
     /* ---------------- format picking ---------------- */
 
-    function bestVideo(links) {
-        var best = null, i;
-        for (i = 0; i < links.length; i++) {
-            var l = links[i];
-            if (!l || !l.url) continue;
-            var m = (l.mime || l.type || '').split(';')[0];
-            if (m !== 'video/webm') continue;
-            if (!best) { best = l; continue; }
-            var h1 = parseInt((l.url.match(/itag=(\d+)/) || [])[1], 10);
-            var h0 = parseInt((best.url.match(/itag=(\d+)/) || [])[1], 10);
-            if ((!isNaN(h1) && !isNaN(h0) && h1 < h0)) best = l;
-        }
-        return best;
+    function linkMime(l) {
+        return String(l && (l.mime || l.type) || '').split(';')[0].trim().toLowerCase();
     }
 
-    function bestAudio(links) {
-        var i;
-        for (i = 0; i < links.length; i++) {
-            var l = links[i];
-            if (l && l.url && (l.mime || l.type || '').split(';')[0] === 'audio/webm') return l;
+    function linkCodecs(l) {
+        if (!l) return '';
+        var raw = String(l.mime || l.type || '');
+        var match = /codecs\s*=\s*["']?([^;"']+)/i.exec(raw);
+        return String(match ? match[1] : (l.codecs || l.codec || '')).trim();
+    }
+
+    function linkItag(l) {
+        if (!l) return '';
+        if (l.itag !== undefined && l.itag !== null && l.itag !== '') return String(l.itag);
+        var match = /[?&]itag=(\d+)/i.exec(String(l.url || ''));
+        return match ? match[1] : '';
+    }
+
+    function formatHeight(l) {
+        if (!l) return 0;
+        var explicit = parseInt(l.height, 10);
+        if (isFinite(explicit) && explicit > 0) return explicit;
+        var size = String(l.size || l.resolution || '');
+        var match = /(\d+)\s*x\s*(\d+)/i.exec(size);
+        if (match) return parseInt(match[2], 10) || 0;
+        match = /[?&]size=(\d+)x(\d+)/i.exec(String(l.url || ''));
+        if (match) return parseInt(match[2], 10) || 0;
+        var heights = {
+            '18': 360, '22': 720, '37': 1080, '38': 3072,
+            '133': 240, '134': 360, '135': 480, '136': 720, '137': 1080, '138': 2160,
+            '160': 144, '247': 720, '248': 144, '271': 1440, '272': 2880, '278': 1440,
+            '394': 144, '397': 480, '398': 720, '399': 1080, '571': 4320, '616': 4320
+        };
+        return heights[linkItag(l)] || 0;
+    }
+
+    function qualityHeights(links) {
+        var seen = {}, out = [], i;
+        for (i = 0; i < (links || []).length; i++) {
+            var h = formatHeight(links[i]);
+            if (h > 0 && !seen[h]) { seen[h] = true; out.push(h); }
         }
-        return null;
+        out.sort(function (a, b) { return a - b; });
+        return out;
+    }
+
+    function defaultVideo(links) {
+        var candidates = (links || []).filter(function (l) { return l && l.url && linkMime(l).indexOf('video/') === 0; });
+        if (!candidates.length) return null;
+        var preferred = [360, 240, 480, 144, 720, 1080, 1440, 2160, 4320], i, j;
+        for (i = 0; i < preferred.length; i++) {
+            for (j = 0; j < candidates.length; j++) if (formatHeight(candidates[j]) === preferred[i]) return candidates[j];
+        }
+        return candidates[0];
+    }
+
+    function bestVideo(links, container) {
+        container = container || 'webm';
+        var candidates = (links || []).filter(function (l) { return l && l.url && linkMime(l) === 'video/' + container; });
+        return defaultVideo(candidates);
+    }
+
+    function bestAudio(links, container) {
+        container = container || 'webm';
+        var candidates = (links || []).filter(function (l) { return l && l.url && linkMime(l) === 'audio/' + container; });
+        return candidates.length ? candidates[0] : null;
+    }
+
+    function isMuxedLink(l) {
+        if (!l || !l.url || linkMime(l) !== 'video/mp4' || /api\/hls\//i.test(l.url)) return false;
+        var itag = linkItag(l);
+        if (/^(18|22|37|38)$/.test(itag)) return true;
+        if (linkCodecs(l).indexOf(',') >= 0) return true;
+        return String(l.muxed || l.audio || '') === '1';
+    }
+
+    function progressiveLinks(links, progLink) {
+        var out = [], seen = {}, i, l;
+        function add(candidate) {
+            if (!candidate || !candidate.url || /api\/hls\//i.test(candidate.url)) return;
+            if (linkMime(candidate) !== 'video/mp4' && !/(?:^|[?&])itag=(?:18|22|37|38)(?:&|$)/i.test(candidate.url)) return;
+            if (seen[candidate.url]) return;
+            seen[candidate.url] = true;
+            out.push(candidate);
+        }
+        for (i = 0; i < (links || []).length; i++) {
+            l = links[i];
+            if (isMuxedLink(l)) add(l);
+        }
+        if (progLink && linkMime(progLink) === 'video/mp4') add(progLink);
+        return out;
     }
 
     function muxedUrl(links) {
-        var i;
-        for (i = 0; i < links.length; i++) if (links[i] && links[i].url && /itag=18/.test(links[i].url)) return links[i].url;
-        return null;
+        var candidates = progressiveLinks(links, null);
+        var source = defaultVideo(candidates);
+        return source ? source.url : null;
     }
 
-    function codecsForItag(url, kind) {
-        var it = parseInt((url.match(/itag=(\d+)/) || [])[1], 10);
-        if (kind === 'audio') return (it === 171 || it === 172) ? 'vorbis' : 'opus';
+    function codecsForItag(url, kind, mime) {
+        var it = parseInt((String(url || '').match(/[?&]itag=(\d+)/i) || [])[1], 10);
+        var base = String(mime || '').toLowerCase();
+        if (kind === 'audio') {
+            if (base.indexOf('mp4') >= 0 || base.indexOf('m4a') >= 0) return it === 139 ? 'mp4a.40.5' : 'mp4a.40.2';
+            return (it === 171 || it === 172) ? 'vorbis' : 'opus';
+        }
+        if (base.indexOf('mp4') >= 0) return 'avc1.4d401e';
         return (it === 43 || it === 44 || it === 45) ? 'vp8' : 'vp9';
     }
 
     function mseMime(l, kind) {
-        var b = kind === 'audio' ? 'audio/webm' : 'video/webm';
-        var c = l.codecs || codecsForItag(l.url || '', kind);
+        var fallback = kind === 'audio' ? 'audio/webm' : 'video/webm';
+        var b = linkMime(l) || fallback;
+        var c = linkCodecs(l) || codecsForItag(l && l.url, kind, b);
         return c ? b + '; codecs="' + c + '"' : b;
     }
 
@@ -349,6 +645,7 @@
     }
 
     function stopActive() {
+        qualityRequest++;
         var el = active && active.engEl;
         if (el) {
             try { el.pause(); } catch (e) { }
@@ -398,44 +695,79 @@
         var eng = null;
         var engEl = el;
         var links = conf.mediaLinks || [];
+        var previousHeight = qualityListId === id ? currentHeight() : null;
+        var wantH = previousHeight || storedHeight;
+        if (qualityListId !== id) {
+            qualityList = [];
+            qualityIdx = -1;
+            qualityListId = id;
+        }
+        qualityMode = '';
 
         if (nativeHlsOk(el)) {
+            qualityMode = 'hls';
+            if (wantH) hlsUrl += (hlsUrl.indexOf('?') < 0 ? '?' : '&') + 'q=' + wantH;
             eng = new EngineNativeHls({ el: el, hlsUrl: hlsUrl });
-            beacon('CP_ENGINE', { k: 'nativehls', id: id });
+            beacon('CP_ENGINE', { k: 'nativehls', id: id, q: wantH || 0 });
         } else if (global.Hls && global.Hls.isSupported && global.Hls.isSupported()) {
+            qualityMode = 'hls';
             // hls.js on desktop: every TS segment is a small, fresh upstream
             // request proxied by /api/hls — no sustained-download throttling.
             engEl = makeOwnEl();
             eng = new EngineHlsJs({ el: engEl, hlsUrl: hlsUrl });
+            if (eng._ok) eng.setPendingQ(wantH);
             beacon('CP_ENGINE', { k: 'hlsjs', id: id });
-        } else if (mseOk('video/webm; codecs="vp9"')) {
-            var v = bestVideo(links);
-            var au = bestAudio(links);
+        } else {
+            var webmLinks = (links || []).filter(function (l) { return l && l.url && linkMime(l) === 'video/webm'; });
+            var v = mseOk('video/webm; codecs="vp9"') ? bestVideo(links, 'webm') : null;
             if (v) {
+                setQualityList(id, qualityHeights(webmLinks), wantH, false);
+                qualityMode = 'mse';
                 engEl = makeOwnEl();
                 eng = new EngineMseWebm({
                     el: engEl,
-                    video: { url: absUrl(v.url), mime: mseMime(v, 'video') },
-                    audio: au ? { url: absUrl(au.url), mime: mseMime(au, 'audio') } : null
+                    videoLinks: webmLinks,
+                    height: currentHeight(),
+                    audio: (function () {
+                        var a = bestAudio(links, 'webm');
+                        return a ? { url: absUrl(a.url), mime: mseMime(a, 'audio') } : null;
+                    })()
                 });
-                beacon('CP_ENGINE', { k: 'msewebm', id: id });
+                beacon('CP_ENGINE', { k: 'msewebm', id: id, q: currentHeight() || 0 });
             } else {
-                eng = new EngineNoop();
-                beacon('CP_ENGINE', { k: 'msewebm', pending: true, id: id });
+                var mp4Links = (links || []).filter(function (l) { return l && l.url && linkMime(l) === 'video/mp4' && !isMuxedLink(l); });
+                v = (mseOk('video/mp4; codecs="avc1.4d401e"') || mseOk('video/mp4')) ? bestVideo(mp4Links, 'mp4') : null;
+                if (v) {
+                    setQualityList(id, qualityHeights(mp4Links), wantH, false);
+                    qualityMode = 'mse';
+                    engEl = makeOwnEl();
+                    eng = new EngineMseWebm({
+                        el: engEl,
+                        videoLinks: mp4Links,
+                        height: currentHeight(),
+                        audio: (function () {
+                            var a = bestAudio(links, 'mp4');
+                            return a ? { url: absUrl(a.url), mime: mseMime(a, 'audio') } : null;
+                        })()
+                    });
+                    beacon('CP_ENGINE', { k: 'msemp4', id: id, q: currentHeight() || 0 });
+                } else {
+                    eng = new EngineNoop();
+                    beacon('CP_ENGINE', { k: 'nomse', id: id });
+                }
             }
-        } else {
-            eng = new EngineNoop();
-            beacon('CP_ENGINE', { k: 'nomse', id: id });
         }
 
         if (eng && eng.constructor === EngineNoop) {
-            var mu = conf.progLink && conf.progLink.url && !/api\/hls/.test(conf.progLink.url) ? conf.progLink.url : muxedUrl(links);
-            if (mu) {
+            var sources = progressiveLinks(links, conf.progLink);
+            if (sources.length) {
+                setQualityList(id, qualityHeights(sources), wantH, false);
+                qualityMode = 'progressive';
                 engEl = makeOwnEl();
-                eng = new EngineProgressive({ el: engEl, url: absUrl(mu) });
-                beacon('CP_ENGINE', { k: 'progressive', id: id });
+                eng = new EngineProgressive({ el: engEl, sources: sources, height: currentHeight() });
+                beacon('CP_ENGINE', { k: 'progressive', id: id, q: currentHeight() || 0 });
             } else {
-                // last resort: hand the master playlist to the element (works only on real HLS browsers)
+                qualityMode = 'hls';
                 eng = new EngineNativeHls({ el: el, hlsUrl: hlsUrl });
                 beacon('CP_ENGINE', { k: 'lastresort-nativehls', id: id });
             }
@@ -447,6 +779,8 @@
         onSeekHandler = onSeek;
         bindSeek(engEl);
         try { engEl.addEventListener('seeked', function () { beacon('CP_SEEKED', {}); }); } catch (e) { }
+        if (qualityMode === 'hls') loadQualityList(id, wantH);
+        else applyQuality();
         return true;
     }
 
@@ -688,6 +1022,120 @@
         try { global.location.hash = '#/browse-sets?c=home'; } catch (e) { }
     }
 
+    var qualityList = [];
+    var qualityIdx = -1;
+    var qualityListId = '';
+    var qualityMode = '';
+    var qualityRequest = 0;
+    var storedHeight = 0;
+
+    function readStoredQuality() {
+        storedHeight = 0;
+        try {
+            var v = parseInt(global.localStorage && global.localStorage.getItem('ytc_quality'), 10);
+            if (isFinite(v) && v > 0) storedHeight = v;
+        } catch (e) { }
+    }
+
+    function qualityLabel() {
+        var h = currentHeight();
+        return h ? h + 'p' : 'Auto';
+    }
+
+    function currentHeight() {
+        if (qualityIdx < 0 || !qualityList.length || qualityIdx >= qualityList.length) return null;
+        return qualityList[qualityIdx];
+    }
+
+    function setQualityList(id, levels, preferred, shouldApply) {
+        var seen = {}, out = [], i, h;
+        for (i = 0; i < (levels || []).length; i++) {
+            h = parseInt(levels[i], 10);
+            if (h > 0 && !seen[h]) { seen[h] = true; out.push(h); }
+        }
+        out.sort(function (a, b) { return a - b; });
+        var wanted = preferred;
+        if (wanted === undefined) wanted = qualityListId === id ? currentHeight() : storedHeight;
+        qualityList = out;
+        qualityListId = id || '';
+        qualityIdx = -1;
+        if (wanted > 0) for (i = 0; i < out.length; i++) if (out[i] === wanted) { qualityIdx = i; break; }
+        if (shouldApply) applyQuality();
+    }
+
+    function saveQuality() {
+        var h = currentHeight() || 0;
+        storedHeight = h;
+        try { if (global.localStorage) global.localStorage.setItem('ytc_quality', String(h)); } catch (e) { }
+    }
+
+    function loadQualityList(id, preferred, cb) {
+        if (typeof preferred === 'function') { cb = preferred; preferred = undefined; }
+        if (!id) { if (cb) cb(false); return; }
+        var request = ++qualityRequest;
+        xhrText(base + '/api/hls/' + encodeURIComponent(id), function (t) {
+            if (request !== qualityRequest || (active && active.id !== id)) { if (cb) cb(false); return; }
+            if (!t) { if (cb) cb(false); return; }
+            var seen = {}, out = [], h, m, re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)/g;
+            while ((m = re.exec(t))) {
+                h = parseInt(m[2], 10);
+                if (h > 0 && !seen[h]) { seen[h] = true; out.push(h); }
+            }
+            if (out.length) {
+                out.sort(function (a, b) { return a - b; });
+                setQualityList(id, out, preferred, true);
+            }
+            beacon('CP_QLIST', { levels: out.join(','), videoId: id });
+            if (cb) cb(true);
+        });
+    }
+
+    function setQualityTo(height) {
+        if (!qualityList.length) return false;
+        var next = -1;
+        if (height) {
+            var parsed = parseInt(height, 10);
+            for (var i = 0; i < qualityList.length; i++) if (qualityList[i] === parsed) { next = i; break; }
+            if (next < 0) return false;
+        }
+        qualityIdx = next;
+        saveQuality();
+        applyQuality();
+        beacon('CP_Q', { idx: qualityIdx, h: currentHeight() });
+        return true;
+    }
+
+    function cycleQuality() {
+        if (!qualityList.length) {
+            if (qualityMode === 'hls') loadQualityList(active ? active.id : getVideoId());
+            return;
+        }
+        if (qualityIdx < 0) qualityIdx = 0;
+        else if (qualityIdx >= qualityList.length - 1) qualityIdx = -1;
+        else qualityIdx += 1;
+        saveQuality();
+        applyQuality();
+        beacon('CP_Q', { idx: qualityIdx, h: currentHeight() });
+    }
+
+    function applyQuality() {
+        var eng = active && active.engine;
+        if (eng && typeof eng.setQuality === 'function') {
+            eng.setQuality(currentHeight());
+        } else {
+            beacon('CP_Q_NOTSUP', { e: eng && eng.constructor ? eng.constructor.name : 'none' });
+        }
+    }
+
+    function updateQualityLabel() {
+        try {
+            var span = global.document && global.document.querySelector('#button-list .yt-cp-quality > span');
+            if (span && span.textContent !== qualityLabel()) span.textContent = qualityLabel();
+        } catch (e) { }
+    }
+
+    readStoredQuality();
+
     function activateFocusedButton() {
         var bs = enabledButtons();
         if (!bs.length) return;
@@ -698,12 +1146,14 @@
         if (/icon-player-play/.test(cl)) trTogglePlay();
         else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
         else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
+        else if (/yt-cp-quality/.test(cl)) cycleQuality();
         else if (/icon-home/.test(cl)) goHome();
     }
 
     function syncUI() {
         try {
             bindInputElements();
+            updateQualityLabel();
             var tc = trEl();
             if (!tc) { trSeen = false; return; }
             if (!trSeen) {
@@ -902,11 +1352,26 @@
                     if (/icon-player-play/.test(cl)) trTogglePlay();
                     else if (/icon-player-rew/.test(cl)) trSeek(-SEEK_STEP);
                     else if (/icon-player-ff/.test(cl)) trSeek(SEEK_STEP);
+                    else if (/yt-cp-quality/.test(cl)) cycleQuality();
                     else if (/icon-home/.test(cl)) goHome();
                     pokeTransport();
                     if (e.preventDefault) e.preventDefault();
                     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
                 }, true);
+        }
+
+        if (bl) {
+            try {
+                if (!bl.querySelector('.yt-cp-quality')) {
+                    var qBtn = doc.createElement('div');
+                    qBtn.className = 'yt-cp-quality button';
+                    qBtn.setAttribute('tabindex', '-1');
+                    qBtn.title = 'Quality';
+                    qBtn.style.cssText = 'display:flex;align-items:center;justify-content:center;min-width:64px;height:40px;padding:0 12px;margin:0 6px;font-size:20px;line-height:40px;text-align:center;color:rgba(255,255,255,0.9);background:rgba(0,0,0,0.55);border-radius:4px;cursor:pointer;';
+                    qBtn.innerHTML = '<span>Auto</span>';
+                    bl.appendChild(qBtn);
+                }
+            } catch (e2) { }
         }
 
         var bar = doc.querySelector('#progress-bar');
@@ -1097,6 +1562,8 @@
         startById: startById,
         isActive: function () { return !!active; },
         activeVideo: function () { return active ? active.id : null; },
+        getQuality: function () { return { height: currentHeight(), levels: qualityList.slice(), auto: qualityIdx < 0 }; },
+        setQuality: setQualityTo,
         stop: stopActive,
         _remount: remount
     };

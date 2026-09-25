@@ -1039,7 +1039,7 @@ function buildHlsEntry(videoId, formats) {
             width: f.width || 0,
             itag: String(f.format_id || ''),
             url: f.url,
-            codec: String(f.vcodec || '').split('.')[0] || 'avc1',
+            codec: f.vcodec ? String(f.vcodec) : 'avc1',
             tbr: Number(f.tbr) || 0,
             expiresAt: parseExpireSeconds(f.url) ? parseExpireSeconds(f.url) * 1000 : Date.now() + 6 * 60 * 60 * 1000,
         }));
