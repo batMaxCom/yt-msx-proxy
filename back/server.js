@@ -39,7 +39,8 @@ let settings;
 if (!fs.existsSync(settingsPath)) {
     const defaultSettings = { 
         serverIp: 'localhost',  
-        expBrowse: false        
+        expBrowse: false,
+        hideOnScreenNav: false
     };
     fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 4));
     console.log("Created settings.json with default serverIp = localhost and expBrowse = false.");
@@ -198,6 +199,13 @@ app.get('/', (req, res) => {
 
 app.get('/index.html', (req, res) => {
     res.sendFile(path.join(__dirname, '../index.html'));
+});
+
+// Expose runtime settings to the TV client (custom-player.js reads the
+// hideOnScreenNav flag from here to decide whether on-screen nav hints stay).
+app.get('/settings.json', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(settings);
 });
 
 oauthRouter(app);

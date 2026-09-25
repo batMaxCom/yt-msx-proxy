@@ -11,7 +11,14 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261011';
+    global.__CUSTOM_PLAYER_VERSION = '20261012';
+
+    var appSettings = { hideOnScreenNav: false };
+    try {
+        xhrText(global.location.origin + '/settings.json', function (t) {
+            if (t) { try { appSettings = JSON.parse(t) || appSettings; } catch (err) { } }
+        });
+    } catch (err) { }
 
     var wl = (global.navigator && global.navigator.userAgent) || '';
     var isTV = /Web0S|webOS|LG Browser|LG-|SMART-TV|AppleTV|Tizen|Viera|Phantom]|DTV|wiiu/i.test(wl);
@@ -723,6 +730,20 @@
                 try { tc.classList.toggle('live-playback', !!live); } catch (err) { }
                 var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff');
                 for (i = 0; i < sb.length; i++) try { sb[i].classList.remove('disabled'); } catch (err) { }
+                // the 2016 app keeps its loading spinner forever because its own
+                // player model never reports "started" — hide it once we actually play
+                if (el.readyState >= 2 || (el.currentTime || 0) > 0) {
+                    var spin = global.document.querySelector('#spinner');
+                    if (spin) spin.style.display = 'none';
+                    var lid = global.document.querySelector('.loading-indicator');
+                    if (lid) lid.style.display = 'none';
+                    var fid = global.document.querySelector('.fallback-loading-indicator');
+                    if (fid) fid.style.display = 'none';
+                }
+            }
+            if (appSettings.hideOnScreenNav) {
+                var legend = global.document.querySelector('#legend');
+                if (legend) legend.style.display = 'none';
             }
         } catch (e) { }
     }
