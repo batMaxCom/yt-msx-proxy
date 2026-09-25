@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261022';
+    global.__CUSTOM_PLAYER_VERSION = '20261026';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
     try {
@@ -1142,6 +1142,18 @@
 
     readStoredQuality();
 
+    function openMoreActions() {
+        var list = global.document && global.document.querySelector('#button-list');
+        var view = list && list.Xb;
+        var component = view && view.parent;
+        if (component && typeof component.VU === 'function') {
+            try { component.VU(); return true; } catch (err) { }
+        }
+        var b = list && list.querySelector('.icon-ellipsis');
+        if (!b) return false;
+        try { b.click(); return true; } catch (err) { return false; }
+    }
+
     function activateFocusedButton() {
         var bs = enabledButtons();
         if (!bs.length) return false;
@@ -1153,6 +1165,7 @@
         if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
         if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
         if (/yt-cp-quality|icon-player-settings/.test(cl)) { cycleQuality(); return true; }
+        if (/icon-ellipsis/.test(cl)) return openMoreActions();
         if (/icon-home/.test(cl)) { goHome(); return true; }
         return false;
     }
@@ -1479,7 +1492,7 @@
             413: 'MediaNextTrack', 416: 'MediaNextTrack', 414: 'MediaPrevTrack',
             461: 'Back', 462: 'Back'
         };
-        if (kmap[code] && (!k || k.length === 1)) key = kmap[code];
+        if (kmap[code]) key = kmap[code];
         var eat = function () {
             if (e.preventDefault) e.preventDefault();
             if (e.stopImmediatePropagation) e.stopImmediatePropagation();
@@ -1539,11 +1552,13 @@
                 eat();
                 break;
             case 'ArrowDown':
+                showTransport();
+                if (trFocus === 'seekbar') { trFocus = 'buttons'; focusButton(0); eat(); }
+                break;
             case 'ArrowUp':
                 showTransport();
-                if (key === 'ArrowDown' && trFocus === 'seekbar') { trFocus = 'buttons'; focusButton(0); }
-                else if (key === 'ArrowUp' && trFocus === 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); }
-                eat();
+                if (openMoreActions()) { trFocus = 'buttons'; eat(); }
+                else if (trFocus === 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); eat(); }
                 break;
             case 'Enter':
                 if (trVisible && trFocus === 'buttons' && activateFocusedButton()) eat();
