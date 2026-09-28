@@ -3,9 +3,9 @@
     var currentHost = window.location.hostname;
     var currentPort = window.location.port;
 
-    var APP_URL = "http://" + currentHost + ":" + (currentPort || "8090");  
+    var APP_URL = window.location.origin;
     var APP_HOST =  currentHost;  
-    var PROXY_URL = "http://" + currentHost + ":8070"; 
+    var PROXY_URL = APP_URL + "/proxy"; 
 
     console.log("APP_URL:", APP_URL);
     console.log("PROXY_URL:", PROXY_URL);

@@ -1,12 +1,15 @@
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const cors = require('cors');
+const compression = require('compression');
 const QRCode = require('qrcode');
 const corsAnywhere = require('cors-anywhere');
 
 const logger = require('./logger');
+const { configure: configurePublicOrigin, resolve: resolvePublicOrigin, createRewriteContext, firstValue } = require('./public_origin');
 
 const { fetchGuideData } = require('./guide_api');
 
@@ -64,19 +67,102 @@ console.log("Loaded Server IP:", serverIp);
 const app = express();
 const port = 8090;
 
+// nginx (or any TLS-terminating front) terminates the client connection, so
+// the origin the client actually uses can differ from the bind address.
+// Everything we emit as a URL has to follow the request, not the settings.
+configurePublicOrigin({ serverIp, port, getSettings: () => settings });
+
 // Relay every YouTube CDN image through this backend and rewrite all outgoing
 // JSON so the browser never talks to YouTube/archive.org directly.
-const imageProxyCtx = {
-    serverIp,
-    port,
-    origin: `http://${serverIp}:${port}`,
-};
+const imageProxyCtx = createRewriteContext();
 imageProxy.installImageProxyRoutes(app, imageProxyCtx);
+
+// Remember the origin for this request before any route runs, so the res.json
+// rewriter (which has no access to req) emits matching URLs.
+app.use((req, res, next) => {
+    resolvePublicOrigin(req);
+    next();
+});
+
+// Same CORS proxy, reachable under the main origin. The client now builds
+// PROXY_URL from window.location.origin (so it keeps working behind a TLS or
+// HTTP/3 front) and hits /proxy/<absolute-url>. This route forwards verbatim to
+// the cors-anywhere server defined below, which keeps the origin checks and the
+// cookie stripping in one place.
+//
+// Registered before bodyParser on purpose: it has to see the raw request stream,
+// otherwise JSON POST bodies (the lounge pairing calls) would already be
+// consumed by the time we pipe them upstream.
+const HOP_BY_HOP = new Set([
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length',
+]);
+
+app.use('/proxy', (req, res) => {
+    const headers = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+        if (!HOP_BY_HOP.has(key.toLowerCase())) headers[key] = value;
+    }
+
+    const upstream = http.request({
+        host: bindAddr === '0.0.0.0' ? '127.0.0.1' : bindAddr,
+        port: corsPort,
+        method: req.method,
+        path: req.url,
+        headers,
+    }, upstreamRes => {
+        res.status(upstreamRes.statusCode || 502);
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+            if (!HOP_BY_HOP.has(key.toLowerCase())) res.setHeader(key, value);
+        }
+        upstreamRes.pipe(res);
+    });
+
+    upstream.on('error', err => {
+        logger.error('proxy', 'CORS proxy forward failed', { message: err.message });
+        if (!res.headersSent) {
+            res.status(502).send('Proxy forward failed');
+        } else {
+            res.destroy();
+        }
+    });
+
+    // Abort only when the *client* disappears mid-response. Listening on req
+    // 'close' instead would fire as soon as a bodyless GET has been sent,
+    // killing the upstream request before it ever answered.
+    res.on('close', () => {
+        if (!res.writableEnded) upstream.destroy();
+    });
+
+    req.on('aborted', () => upstream.destroy());
+
+    req.pipe(upstream);
+});
 
 // Address on which the HTTP server binds. Defaults to the configured server IP.
 // Set BIND_ADDR=0.0.0.0 when running in Docker / behind a NAT so the socket
 // binds to every interface while the client-facing URLs keep using serverIp.
 const bindAddr = process.env.BIND_ADDR || serverIp;
+
+// nginx terminates TLS and sets X-Forwarded-Proto/Host. Without this, Express
+// treats the connection as plain HTTP and req.protocol is always 'http'.
+app.set('trust proxy', true);
+
+// The 2016 client is a web app: app-prod.js alone is ~1.3 MB, app-prod.css
+// ~190 KB and the image cache is ~39 MB. Compressing the JSON/HTML/CSS/JS
+// path is the single biggest win for interface load time on a high-RTT link.
+// Video and HLS segments are untouched: their content types are not in the
+// default `compressible` filter, so bytes go out untouched and fast.
+app.use(compression({
+    threshold: 1024,
+    filter: (req, res) => {
+        if (req.path.startsWith('/api/stream/') || req.path.startsWith('/api/hls/')) {
+            return false;
+        }
+        if (res.getHeader('Content-Encoding')) return false;
+        return compression.filter(req, res);
+    },
+}));
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -90,14 +176,53 @@ app.use((req, res, next) => {
     next();
 });
 
+const corsPort = 8070;
+
+// Origins we always trust: the backends' own addresses, plus whatever the
+// client-facing origin currently is (behind an nginx front that value comes
+// from X-Forwarded-*). Kept as a set because the check runs on every request.
+const trustedOrigins = new Set([
+    `http://${serverIp}:${port}`,
+    `http://${serverIp}:${corsPort}`,
+    `http://localhost:${port}`,
+    `http://localhost:${corsPort}`,
+    'null',
+    '""',
+    '',
+]);
+
+function originIsAllowed(origin, req) {
+    if (!origin) return true;
+    if (trustedOrigins.has(origin)) return true;
+
+    const configured = settings && settings.publicOrigin;
+    if (configured && origin === String(configured).replace(/\/+$/, '')) return true;
+
+    // Same-origin pages only: the Origin host must match the host the request
+    // was addressed to. This covers the nginx front (plain or TLS/HTTP3)
+    // without having to enumerate every scheme and port combination.
+    try {
+        const originHost = new URL(origin).host;
+        const reqHost = firstValue(req.headers['x-forwarded-host']) || req.headers.host;
+        return !!reqHost && originHost === reqHost;
+    } catch (e) {
+        return false;
+    }
+}
+
 const server = corsAnywhere.createServer({
-    originWhitelist: [`http://${serverIp}:8090`, 'null', '""', ''],
+    // Empty on purpose. cors-anywhere only supports a static array here and
+    // runs this check *after* handleInitialRequest, so a literal list would
+    // reject every origin that arrives through the nginx front
+    // (https://your-host, :8080, ...) that it does not literally know about.
+    // All origin policy lives in originIsAllowed, which runs first.
+    originWhitelist: [],
     removeHeaders: ['cookie', 'cookie2'],
     handleInitialRequest: (req, res) => {
         const origin = req.headers.origin;
 
-        if (origin === `http://${serverIp}:8090` || origin === 'null' || origin === '""' || origin === '') {
-            res.setHeader('Access-Control-Allow-Origin', origin);
+        if (originIsAllowed(origin, req)) {
+            res.setHeader('Access-Control-Allow-Origin', origin || '*');
         } else {
             res.writeHead(403, 'Forbidden');
             res.end('Origin not allowed');
@@ -118,10 +243,9 @@ const server = corsAnywhere.createServer({
 });
 
 
-server.listen(8070, bindAddr, () => {
-    console.log('CORS Anywhere proxy running on http://' + serverIp + ':8070');
+server.listen(corsPort, bindAddr, () => {
+    console.log('CORS Anywhere proxy running on http://' + serverIp + ':' + corsPort);
 });
-
 
 app.use((req, res, next) => {
     const started = Date.now();
@@ -157,9 +281,26 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 
-app.use('/assets', express.static(path.join(__dirname, '../assets')));
+// /assets carries the whole 2016 client bundle. Over a high-RTT link every
+// conditional revalidation is a wasted round trip, so serve it with a real
+// TTL (settings.staticMaxAge, raise it once the bundle is stable in
+// production) plus ETag as the fallback when the TTL lapses.
+const staticMaxAge = typeof settings.staticMaxAge === 'string'
+    ? settings.staticMaxAge
+    : '1h';
 
-app.use('/logs', express.static(path.join(__dirname, '../logs')));
+app.use('/assets', express.static(path.join(__dirname, '../assets'), {
+    maxAge: staticMaxAge,
+    etag: true,
+    lastModified: true,
+    setHeaders: res => res.setHeader('Vary', 'Accept-Encoding'),
+}));
+
+// The log viewer is a live debugging aid — never let it sit in a cache.
+app.use('/logs', express.static(path.join(__dirname, '../logs'), {
+    maxAge: 0,
+    etag: true,
+}));
 
 app.post(['/error_204', '/api/stats/atr', '/csi_204'], express.raw({ type: () => true, limit: '2mb' }), (req, res) => {
     const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';

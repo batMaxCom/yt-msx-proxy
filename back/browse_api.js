@@ -20,12 +20,15 @@ if (!fs.existsSync(settingsPath)) {
 
 const serverIp = settings.serverIp || "localhost";
 
+const BROWSE_FIXTURE = path.join(__dirname, '..', 'assets', 'browse_example_client6.json');
+
 async function fetchBrowseData() {
     try {
-        const fileUrl = `http://${serverIp}:8090/assets/browse_example_client6.json`;
-        const fileResponse = await axios.get(fileUrl);
-
-        return fileResponse.data;
+        // Read the fixture from disk. This used to be an HTTP request back to
+        // our own public address, which cost a round trip, hardcoded the
+        // public origin, and broke outright once TLS moved to an nginx front.
+        const raw = await fs.promises.readFile(BROWSE_FIXTURE, 'utf8');
+        return JSON.parse(raw);
     } catch (error) {
         console.error('Error:', error.message);
         

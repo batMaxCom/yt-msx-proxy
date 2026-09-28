@@ -29,7 +29,7 @@ function cacheKey(targetUrl) {
 
 // Turn an absolute YouTube CDN image URL into one served by our backend.
 // Returns the original URL untouched when it is not on an allowed host.
-function toProxyUrl(rawUrl, serverIp, port) {
+function toProxyUrl(rawUrl, origin) {
     let parsed;
     try {
         parsed = new URL(rawUrl);
@@ -39,7 +39,6 @@ function toProxyUrl(rawUrl, serverIp, port) {
     if (!ALLOWED_HOSTS.has(parsed.host)) {
         return rawUrl;
     }
-    const origin = `http://${serverIp}:${port}`;
     return `${origin}/img/${parsed.host}${parsed.pathname}${parsed.search}`;
 }
 
@@ -57,7 +56,7 @@ function rewriteString(str, ctx) {
 
     // Fast path: the whole string is one URL.
     if (str.length < 2000 && /^https?:\/\//.test(str)) {
-        const proxied = toProxyUrl(str, ctx.serverIp, ctx.port);
+        const proxied = toProxyUrl(str, ctx.origin);
         if (proxied !== str) return proxied;
     }
 
@@ -70,7 +69,7 @@ function rewriteString(str, ctx) {
     out = out.replace(ENCODED_RE, (match, host, rest) => {
         let tail = rest || '';
         if (!tail.startsWith('%2F')) tail = '%2F' + tail;
-        return `http%3A%2F%2F${encodeURIComponent(ctx.serverIp)}%3A${ctx.port}%2Fimg%2F${host}${tail}`;
+        return `${ctx.encodedOrigin}%2Fimg%2F${host}${tail}`;
     });
 
     return out;

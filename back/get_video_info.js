@@ -5,6 +5,7 @@ const axios = require('axios');
 const youtubeDl = require('youtube-dl-exec');
 const logger = require('./logger');
 const { rewriteString } = require('./image_proxy');
+const { resolve: resolvePublicOrigin, createRewriteContext, encodeOrigin } = require('./public_origin');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 const bundledYtDlpPath = path.join(
@@ -881,7 +882,7 @@ function handleGetVideoInfo(req, res) {
             //console.log('Constructed adaptive_fmts:', adaptiveFmtsResponse);
             //console.log('Constructed fmt_list:', fmtList);
 
-            const videoInfo = `baseUrl=https%3A%2F%2F${encodeURIComponent(serverIp)}%3A8090
+            const videoInfo = `baseUrl=${encodeOrigin(resolvePublicOrigin(req))}
         iv_module=https%3A%2F%2Fs.ytimg.com%2Fyts%2Fswfbin%2Fplayer-vflq9bo_X%2Fiv_module.swf
         account_playback_token=QUFFLUhqbUNlSEVkMTBaWWVFcjgtNC1KZ3VIRzA0X2I2d3xBQ3Jtc0tsYklEbEFDemhBNlJJOS01TkFZQzJNUmVrVERqeDhaV1pqQmJEOFZ3V3pSWjNNRnhiZnd5NnJWejJONzM3dFh0MG9PT0U2Q3gzVnVKS194cEphNkVPeFE3azlSSFhabmh0QkpITW90b2FEMnpvVGZPQQ%3D%3D
         cbr=Chrome
@@ -963,11 +964,7 @@ function handleGetVideoInfo(req, res) {
 
             const encodedResponse = encodedProperties.join('&').replace(/\s+/g, '');
 
-            const rewrittenResponse = rewriteString(encodedResponse, {
-                serverIp,
-                port: 8090,
-                origin: `http://${serverIp}:8090`,
-            });
+            const rewrittenResponse = rewriteString(encodedResponse, createRewriteContext());
 
             res.send(rewrittenResponse);
         })
@@ -992,8 +989,7 @@ function handleGetVideoInfo(req, res) {
 }
 
 function hlsPathFor(videoId, req) {
-    const host = (req && req.headers && req.headers.host) || `${serverIp}:8090`;
-    return `http://${host}/api/hls/${videoId}?mime=application/x-mpegURL&itag=hls`;
+    return `${resolvePublicOrigin(req)}/api/hls/${videoId}?mime=application/x-mpegURL&itag=hls`;
 }
 
 function buildHlsEntry(videoId, formats) {
@@ -1168,7 +1164,7 @@ async function handleHlsRequest(req, res) {
         }
 
         if (!sub) {
-            const base = `http://${req.headers.host || `${serverIp}:8090`}`;
+            const base = resolvePublicOrigin(req);
             const encAudio = encodeURIComponent(entry.audio.url);
             const qH = parseInt(req.query && req.query.q, 10) || 0;
 

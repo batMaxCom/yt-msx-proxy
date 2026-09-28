@@ -84,6 +84,76 @@ makes the home page actually personal - see below. You can also set it as the
 session cookies that identify the account are forwarded, and they go to youtubei and
 nowhere else.
 
+- publicOrigin: optional. The origin clients use, e.g. `https://tv.example.com`. Only
+needed when the front cannot send `X-Forwarded-Proto`/`X-Forwarded-Host` (a bare port
+mapping, or a tunnel that strips them). With an nginx front in place this is derived
+from the request automatically and you do not need to set it.
+
+- staticMaxAge: `Cache-Control` for `/assets` (the app bundle). [default: `1h`]
+Raise it to e.g. `30d` once the bundle is stable in production; every revalidation
+costs a round trip, which is expensive on a high-latency link.
+
+## Speed: running behind nginx
+
+The server normally sits abroad and the client cannot reach YouTube directly, so
+every video byte is relayed. Relaying through Node means the client's long-haul
+TCP connection carries the server's own TCP connection to YouTube inside it — this
+is TCP-over-TCP, where one lost packet on the outer connection stalls the inner
+one entirely. That, not Node itself, is what caps throughput.
+
+The container therefore runs an nginx front next to the backend
+(`deploy/entrypoint.sh`, config in `deploy/nginx/`). It buys three things:
+
+- **HTTP/3 (QUIC) on :443** turns the client link into UDP with per-stream loss
+  recovery, so the inner TCP is no longer nested in an outer TCP. This is the
+  structural fix.
+- **HTTP/2** puts all of the player's range requests on one connection instead of
+  the browser's 6-per-host cap, which is what limits how much of the
+  bandwidth-delay product you can fill.
+- **nginx off the data path** — `sendfile`/`splice` move video bytes in the kernel
+  and one stalled connection no longer blocks the event loop.
+
+It also gzips the text path, which is where the interface-load win is:
+`app-prod.js` goes from 1.32 MB to 275 KB, `app-prod.css` from 187 KB to 30 KB.
+
+### Running it
+
+```sh
+docker build -t 2016youtubetv .
+
+# HTTP only, on :8080
+docker run -d -p 8080:8080 2016youtubetv
+
+# With TLS + HTTP/2 + HTTP/3, on :443 (UDP too, for QUIC)
+docker run -d -p 443:443 -p 443:443/udp \
+  -v /path/to/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro \
+  -v /path/to/privkey.pem:/etc/nginx/certs/privkey.pem:ro \
+  2016youtubetv
+```
+
+Without a certificate the container still starts and serves plain HTTP on :8080 —
+you get the compression, the zero-copy relay and the connection coalescing, but not
+the QUIC fix. Mount certs to switch to the TLS front; no rebuild needed.
+
+Apply `deploy/sysctl.conf` on the host as well. BBR and a larger receive window
+matter on a lossy long-haul route, where the default 64 KB window cannot fill the
+pipe at all:
+
+```sh
+sysctl -p deploy/sysctl.conf
+```
+
+Run the container with `--network host` if the platform allows it; the default
+bridge adds a hop and its NAT can throttle a lot of small range requests.
+
+### If UDP is blocked
+
+QUIC needs UDP. When a middlebox eats it, put a WireGuard/AmneziaWG tunnel between
+client and server and run the app inside it: the outer leg becomes UDP either way,
+so you get the same relief from TCP-over-TCP, plus working MTU control and
+per-stream obfuscation. Run nginx inside the tunnel and keep `:8080` as the
+fallback entry point.
+
 ## The home page and your preferences
 
 The home screen used to ignore the account completely. It asked YouTube for
