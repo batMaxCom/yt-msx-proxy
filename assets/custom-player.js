@@ -11,9 +11,9 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261026';
+    global.__CUSTOM_PLAYER_VERSION = '20261027';
 
-    var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: false };
+    var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
         xhrText((global.location.origin || '') + '/settings.json', function (t) {
             if (t) { try { appSettings = JSON.parse(t) || appSettings; } catch (err) { } }
@@ -1098,17 +1098,33 @@
         return m + ':' + ('0' + ss).slice(-2);
     }
 
+    var trShown = null;                    // last visual transport state we applied
+    function setTitleTray(visible) {
+        var doc = global.document;
+        var tray = doc && doc.getElementById('title-tray');
+        if (!tray) return;
+        var want = visible ? 'block' : 'none';
+        try { if (tray.style.display !== want) tray.style.display = want; } catch (e) { }
+    }
+
     function setTransport(visible) {
+        if (trShown === visible) return;   // idempotent: called per mousemove/tick
+        trShown = visible;
         var tc = trEl();
         var w = watchSurface();
         if (visible) {
             if (tc) tc.classList.remove('hidden');
             if (w) w.classList.add('transport-showing');
+            setTitleTray(true);              // top title rides with the navigation
             if (metaReady) metaShow();       // the panel lives and dies with the controls
+            // paint the freshly-shown transport with live values this frame, so a
+            // "0:00" flash from the app's own dead model can never be seen
+            try { syncUI(); } catch (e) { }
         } else {
             if (tc) tc.classList.add('hidden');
             if (w) w.classList.remove('transport-showing');
             hideVideoMeta();
+            setTitleTray(false);             // ... and hides with it
         }
     }
 
@@ -1639,6 +1655,15 @@
         selectQualityRow(qMenuRows[idx]);
     }
 
+    function qualityMenuRow(t) {
+        // TVs sometimes lack Element.prototype.closest; walk up manually.
+        if (t && t.closest) return t.closest('.yt-cp-row');
+        for (var n = t; n && n !== qMenu; n = n.parentNode) {
+            if (n && n.getAttribute && /(^|\s)yt-cp-row(\s|$)/.test(n.getAttribute('class') || '')) return n;
+        }
+        return null;
+    }
+
     function buildQualityMenu() {
         if (qMenu) return qMenu;
         var doc = global.document;
@@ -1647,7 +1672,7 @@
         if (!host) return null;
         var el = doc.createElement('div');
         el.id = 'yt-cp-quality-menu';
-        el.style.cssText = 'position:fixed;z-index:60;display:none;min-width:200px;' +
+        el.style.cssText = 'position:fixed;z-index:2147483000;display:none;min-width:200px;' +
             'padding:10px 0;background:#1f1f1f;color:#fff;border:2px solid #6b6b6b;border-radius:4px;' +
             'box-shadow:0 6px 20px rgba(0,0,0,.65);text-align:left;pointer-events:auto;' +
             'font:normal 24px/1.4 Roboto,Arial,Helvetica,sans-serif;';
@@ -1656,14 +1681,14 @@
         // rows bind their own click handler; this one is only a fallback for
         // targets inside a row that do not re-emit (the 2016 app stops bubbling)
         el.addEventListener('click', function (e) {
-            var t = e.target && e.target.closest ? e.target.closest('.yt-cp-row') : null;
+            var t = qualityMenuRow(e.target);
             if (!t) return;
             var idx = parseInt(t.getAttribute('data-idx'), 10);
             if (isNaN(idx) || idx === qMenuIdx) return;
             onQualityRowClick(idx, e);
         });
         el.addEventListener('mousemove', function (e) {
-            var t = e.target && e.target.closest ? e.target.closest('.yt-cp-row') : null;
+            var t = qualityMenuRow(e.target);
             if (!t) return;
             var idx = parseInt(t.getAttribute('data-idx'), 10);
             if (isNaN(idx) || idx === qMenuIdx) return;
@@ -1975,26 +2000,17 @@
        The 2016 watch screen takes its title/author/thumbnail from an InnerTube
        payload shape that YouTube no longer serves, so it renders an empty black
        screen. The metadata is already known to the backend (yt-dlp resolves it for
-       playback anyway), so the player asks for it and draws its own panel instead of
-       trying to feed a 2016 renderer a 2025 response.
+       playback anyway).
 
-       Visibility rides on the transport timer: the panel shows with the controls and
-       fades out with them, which is where the original client put this information. */
+       The top title-tray (#title-tray) still renders its round avatar + title, so
+       the old bottom thumbnail/title/author panel (#yt-cp-meta) is now dead code
+       and intentionally disabled: it only duplicated info at the bottom of the
+       player. */
     var metaReq = 0;
     var metaReady = false;
 
     function loadVideoMeta(id) {
-        var doc = global.document;
-        if (!doc || !id) return;
-        var seq = ++metaReq;
-        hideVideoMeta();
-        xhrText(base + '/api/video-meta/' + encodeURIComponent(id), function (t) {
-            if (seq !== metaReq || !active || active.id !== id) return;   // moved on already
-            var m = null;
-            try { m = JSON.parse(t); } catch (e) { }
-            if (!m || !m.title) return;
-            renderVideoMeta(m);
-        });
+        void id;   // bottom metadata panel disabled: keep the top title-tray only
     }
 
     function metaStyle() {
@@ -2210,6 +2226,18 @@
 
     function syncUI() {
         try {
+            var bhalf = global.document && global.document.getElementById('bottom-half');
+            if (bhalf && bhalf.style.pointerEvents !== 'none') bhalf.style.pointerEvents = 'none'; // the app's nav backdrop otherwise swallows every click on the transport
+            // the top title-tray follows the transport: it hides together with the navigation
+            var tray = global.document && global.document.getElementById('title-tray');
+            if (tray) {
+                try {
+                    var tcn = trEl();
+                    var trayHidden = !!(tcn && tcn.className && tcn.className.indexOf('hidden') >= 0);
+                    var want = trayHidden ? 'none' : 'block';
+                    if (tray.style.display !== want) tray.style.display = want;
+                } catch (e3) { }
+            }
             bindInputElements();
             updateQualityLabel();
             samplePlaybackHealth();
@@ -2274,10 +2302,8 @@
             if (!appSettings.showToggleVideoInfo) {
                 var tvi = global.document.querySelector('.legend-item.toggle-video-info');
                 if (tvi) tvi.style.display = 'none';
-                var tray = global.document.querySelector('#title-tray');
-                if (tray) tray.style.display = 'none';
-                var pvt = global.document.querySelector('.player-video-text');
-                if (pvt) pvt.style.display = 'none';
+                // NOTE: #title-tray and .player-video-text (top title + round avatar) are
+                // intentionally NOT hidden here — they are the persistent top header now.
                 var info = global.document.querySelectorAll('#html5-video-info-panel, .html5-video-info-panel, #movie_player .html5-video-info, .video-info-panel');
                 for (var ii = 0; ii < info.length; ii++) {
                     try { info[ii].style.display = 'none'; } catch (e2) { }
@@ -2286,7 +2312,7 @@
         } catch (e) { }
     }
 
-    setInterval(syncUI, 250);
+    setInterval(syncUI, 150);
 
     /* ---- input: mouse / touch / remote ----
        All four control paths funnel into the same player actions:
