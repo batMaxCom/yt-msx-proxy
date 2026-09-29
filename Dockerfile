@@ -10,8 +10,7 @@
 # window.location. Nothing has to be hard-coded per host.
 #
 # Published ports:
-#   8080  plain HTTP  (always available)
-#   443   TLS + HTTP/2 (only when certs are mounted at /etc/nginx/certs)
+#   8080  plain HTTP  (the only public entry, nginx front for the TV)
 #   8090  Node, for direct access / debugging
 #   8070  standalone cors-anywhere; the client normally uses /proxy instead
 #
@@ -52,14 +51,12 @@ RUN npm ci --omit=dev
 # Copy the rest of the project after npm install to keep the caching warm.
 COPY . .
 
-# nginx configuration. 20-https.conf is moved aside by the entrypoint when no
-# certificate is present, so the container starts either way.
+# nginx configuration. Only the plain HTTP front on :8080 is used (no TLS).
 COPY deploy/nginx/nginx.conf              /etc/nginx/nginx.conf
 COPY deploy/nginx/youtubetv-locations.conf /etc/nginx/youtubetv-locations.conf
 COPY deploy/nginx/conf.d/                 /etc/nginx/conf.d/
 # The stock config would collide with ours on :8080 and on the default server.
-RUN rm -f /etc/nginx/conf.d/default.conf \
-    && mkdir -p /etc/nginx/certs /var/www/certbot
+RUN rm -f /etc/nginx/conf.d/default.conf
 
 # BBR plus larger socket buffers matter here: the client link is long-haul and
 # lossy, and the default 64 KB receive window cannot fill it. Tuned in
@@ -73,7 +70,6 @@ ENV BIND_ADDR=0.0.0.0
 ENV CORS_PROXY_HOST=0.0.0.0
 
 EXPOSE 8080
-EXPOSE 443
 EXPOSE 8090
 EXPOSE 8070
 

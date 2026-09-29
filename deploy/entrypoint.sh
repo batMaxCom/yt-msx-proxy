@@ -1,33 +1,17 @@
 #!/bin/sh
 # Runs nginx in front of the Node backend inside one container.
 #
-# The TLS/HTTP2 server block is only enabled when a certificate is mounted at
-# /etc/nginx/certs/fullchain.pem. Without one the container still works, just
-# over plain HTTP on :8080. QUIC/HTTP/3 is not used anymore: the only client is
-# the 2016 TV app, which speaks plain HTTP/1.1 on :8080.
+# TLS/HTTP/2/QUIC are gone - the only client is the 2016 TV app, which speaks
+# plain HTTP/1.1, so nginx always serves plain HTTP on :8080 and proxies to the
+# backend on :8090. No certificate is involved anymore.
 
 set -eu
 
-CERT_DIR=/etc/nginx/certs
-CERT_FILE="$CERT_DIR/fullchain.pem"
-KEY_FILE="$CERT_DIR/privkey.pem"
-TLS_CONF=/etc/nginx/conf.d/20-https.conf
-TLS_CONF_DISABLED=/etc/nginx/conf.d/20-https.conf.disabled
+# Stale HTTPS listener blocks from older images: nginx -t would fail on ssl
+# directives without a certificate, so drop them defensively before starting.
+rm -f /etc/nginx/conf.d/20-https.conf /etc/nginx/conf.d/20-https.conf.disabled
 
-if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
-    if [ -f "$TLS_CONF_DISABLED" ] && [ ! -f "$TLS_CONF" ]; then
-        mv "$TLS_CONF_DISABLED" "$TLS_CONF"
-    fi
-    echo "[entrypoint] TLS + HTTP/2 enabled on :443 (cert: $CERT_FILE)"
-else
-    if [ -f "$TLS_CONF" ]; then
-        mv "$TLS_CONF" "$TLS_CONF_DISABLED"
-    fi
-    echo "[entrypoint] no certificate at $CERT_FILE - running plain HTTP on :8080"
-    echo "[entrypoint] mount certs to terminate TLS (HTTP/2) on :443"
-fi
-
-# If nginx fails to start (bad cert, port taken) the container would otherwise
+# If nginx fails to start (bad config, port taken) the container would otherwise
 # sit there serving nothing, so validate the config before committing to it.
 if ! nginx -t -q 2>/tmp/nginx-test.log; then
     echo "[entrypoint] nginx config test failed:"

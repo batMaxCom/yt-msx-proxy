@@ -85,10 +85,10 @@ app.use((req, res, next) => {
 });
 
 // Same CORS proxy, reachable under the main origin. The client now builds
-// PROXY_URL from window.location.origin (so it keeps working behind a TLS or
-// HTTP/3 front) and hits /proxy/<absolute-url>. This route forwards verbatim to
-// the cors-anywhere server defined below, which keeps the origin checks and the
-// cookie stripping in one place.
+// PROXY_URL from window.location.origin (so it keeps working behind any front,
+// plain or TLS-terminating) and hits /proxy/<absolute-url>. This route forwards
+// verbatim to the cors-anywhere server defined below, which keeps the origin
+// checks and the cookie stripping in one place.
 //
 // Registered before bodyParser on purpose: it has to see the raw request stream,
 // otherwise JSON POST bodies (the lounge pairing calls) would already be
@@ -199,8 +199,8 @@ function originIsAllowed(origin, req) {
     if (configured && origin === String(configured).replace(/\/+$/, '')) return true;
 
     // Same-origin pages only: the Origin host must match the host the request
-    // was addressed to. This covers the nginx front (plain or TLS/HTTP3)
-    // without having to enumerate every scheme and port combination.
+    // was addressed to. This covers the nginx front without having to enumerate
+    // every scheme and port combination.
     try {
         const originHost = new URL(origin).host;
         const reqHost = firstValue(req.headers['x-forwarded-host']) || req.headers.host;

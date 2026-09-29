@@ -95,46 +95,37 @@ costs a round trip, which is expensive on a high-latency link.
 
 ## Speed: running behind nginx
 
-The server normally sits abroad and the client cannot reach YouTube directly, so
-every video byte is relayed. Relaying through Node means the client's long-haul
-TCP connection carries the server's own TCP connection to YouTube inside it — this
-is TCP-over-TCP, where one lost packet on the outer connection stalls the inner
-one entirely. That, not Node itself, is what caps throughput.
+The server normally sits abroad, and in the relay fallback the client cannot
+reach YouTube directly, so video bytes have to be proxied through it. Relaying
+through Node means the client's long-haul TCP connection carries the server's own
+TCP connection to YouTube inside it — this is TCP-over-TCP, where one lost packet
+on the outer connection stalls the inner one entirely. That, not Node itself, is
+what caps throughput.
 
 The container therefore runs an nginx front next to the backend
-(`deploy/entrypoint.sh`, config in `deploy/nginx/`). It buys two things:
-
-- **HTTP/2 on :443** puts all of the player's range requests on one connection
-  instead of the browser's 6-per-host cap, which is what limits how much of the
-  bandwidth-delay product you can fill.
-- **nginx off the data path** — `sendfile`/`splice` move video bytes in the kernel
-  and one stalled connection no longer blocks the event loop.
+(`deploy/entrypoint.sh`, config in `deploy/nginx/`). **nginx sits off the data
+path**: `sendfile`/`splice` move video bytes in the kernel, and one stalled
+connection no longer blocks the Node event loop.
 
 It also gzips the text path, which is where the interface-load win is:
 `app-prod.js` goes from 1.32 MB to 275 KB, `app-prod.css` from 187 KB to 30 KB.
 
-HTTP/3 (QUIC) was dropped: the only client in production is the 2016 TV app,
-which speaks plain HTTP/1.1 over :8080 and cannot use it anyway.
+TLS/HTTP/2 and HTTP/3 (QUIC) are all gone from the deployment: the only client in
+production is the 2016 TV app, which speaks plain HTTP/1.1 over :8080 and can use
+none of them anyway. That is why the nginx front is HTTP only.
 
 ### Running it
 
 ```sh
 docker build -t 2016youtubetv .
 
-# HTTP only, on :8080
+# The only public entry is plain HTTP on :8080
 docker run -d -p 8080:8080 2016youtubetv
-
-# With TLS + HTTP/2 on :443
-docker run -d -p 443:443 \
-  -v /path/to/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro \
-  -v /path/to/privkey.pem:/etc/nginx/certs/privkey.pem:ro \
-  2016youtubetv
 ```
 
-Without a certificate the container still starts and serves plain HTTP on :8080 —
-compression, the zero-copy relay and connection coalescing are all independent of
-TLS. The TV client only ever uses plain HTTP on :8080 anyway, so this is the
-normal production mode.
+The container serves plain HTTP on :8080 — compression, the zero-copy relay and
+connection coalescing are independent of any transport upgrade. The TV client
+only ever uses this :8080 front, so it is the one and only production mode.
 
 Apply `deploy/sysctl.conf` on the host as well. BBR and a larger receive window
 matter on a lossy long-haul route, where the default 64 KB window cannot fill the

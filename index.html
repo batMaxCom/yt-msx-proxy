@@ -156,8 +156,8 @@
         var currentPort = window.location.port;
 
         // Derive every backend URL from the page origin so the app works
-        // unchanged whether it is reached directly on :8090, through a plain
-        // HTTP nginx front, or through an HTTPS front on :443.
+        // unchanged whether it is reached directly on :8090 or through the
+        // plain HTTP nginx front on :8080.
         var APP_URL = window.location.origin;
         var PROXY_URL = APP_URL + "/proxy";
 
