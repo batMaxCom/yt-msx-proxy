@@ -11,15 +11,14 @@
 #
 # Published ports:
 #   8080  plain HTTP  (always available)
-#   443   TLS + HTTP/2 + HTTP/3 (only when certs are mounted at /etc/nginx/certs)
+#   443   TLS + HTTP/2 (only when certs are mounted at /etc/nginx/certs)
 #   8090  Node, for direct access / debugging
 #   8070  standalone cors-anywhere; the client normally uses /proxy instead
 #
 # Base image is the official nginx image rather than node:* + apt nginx,
-# because the distribution package is nginx 1.22: it predates both the
-# `http2 on;` directive (1.25.1) and ships without --with-http_v3_module, so
-# HTTP/3 is simply not available there. The Node runtime is copied in from the
-# official node image instead of being installed twice.
+# because the distribution package is nginx 1.22 and predates the `http2 on;`
+# directive (1.25.1). The Node runtime is copied in from the official node
+# image instead of being installed twice.
 
 FROM node:22-bookworm-slim AS nodejs
 
@@ -74,7 +73,6 @@ ENV BIND_ADDR=0.0.0.0
 ENV CORS_PROXY_HOST=0.0.0.0
 
 EXPOSE 8080
-EXPOSE 443/udp
 EXPOSE 443
 EXPOSE 8090
 EXPOSE 8070

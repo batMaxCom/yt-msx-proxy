@@ -102,19 +102,19 @@ is TCP-over-TCP, where one lost packet on the outer connection stalls the inner
 one entirely. That, not Node itself, is what caps throughput.
 
 The container therefore runs an nginx front next to the backend
-(`deploy/entrypoint.sh`, config in `deploy/nginx/`). It buys three things:
+(`deploy/entrypoint.sh`, config in `deploy/nginx/`). It buys two things:
 
-- **HTTP/3 (QUIC) on :443** turns the client link into UDP with per-stream loss
-  recovery, so the inner TCP is no longer nested in an outer TCP. This is the
-  structural fix.
-- **HTTP/2** puts all of the player's range requests on one connection instead of
-  the browser's 6-per-host cap, which is what limits how much of the
+- **HTTP/2 on :443** puts all of the player's range requests on one connection
+  instead of the browser's 6-per-host cap, which is what limits how much of the
   bandwidth-delay product you can fill.
 - **nginx off the data path** — `sendfile`/`splice` move video bytes in the kernel
   and one stalled connection no longer blocks the event loop.
 
 It also gzips the text path, which is where the interface-load win is:
 `app-prod.js` goes from 1.32 MB to 275 KB, `app-prod.css` from 187 KB to 30 KB.
+
+HTTP/3 (QUIC) was dropped: the only client in production is the 2016 TV app,
+which speaks plain HTTP/1.1 over :8080 and cannot use it anyway.
 
 ### Running it
 
@@ -124,16 +124,17 @@ docker build -t 2016youtubetv .
 # HTTP only, on :8080
 docker run -d -p 8080:8080 2016youtubetv
 
-# With TLS + HTTP/2 + HTTP/3, on :443 (UDP too, for QUIC)
-docker run -d -p 443:443 -p 443:443/udp \
+# With TLS + HTTP/2 on :443
+docker run -d -p 443:443 \
   -v /path/to/fullchain.pem:/etc/nginx/certs/fullchain.pem:ro \
   -v /path/to/privkey.pem:/etc/nginx/certs/privkey.pem:ro \
   2016youtubetv
 ```
 
 Without a certificate the container still starts and serves plain HTTP on :8080 —
-you get the compression, the zero-copy relay and the connection coalescing, but not
-the QUIC fix. Mount certs to switch to the TLS front; no rebuild needed.
+compression, the zero-copy relay and connection coalescing are all independent of
+TLS. The TV client only ever uses plain HTTP on :8080 anyway, so this is the
+normal production mode.
 
 Apply `deploy/sysctl.conf` on the host as well. BBR and a larger receive window
 matter on a lossy long-haul route, where the default 64 KB window cannot fill the
@@ -145,14 +146,6 @@ sysctl -p deploy/sysctl.conf
 
 Run the container with `--network host` if the platform allows it; the default
 bridge adds a hop and its NAT can throttle a lot of small range requests.
-
-### If UDP is blocked
-
-QUIC needs UDP. When a middlebox eats it, put a WireGuard/AmneziaWG tunnel between
-client and server and run the app inside it: the outer leg becomes UDP either way,
-so you get the same relief from TCP-over-TCP, plus working MTU control and
-per-stream obfuscation. Run nginx inside the tunnel and keep `:8080` as the
-fallback entry point.
 
 ## The home page and your preferences
 

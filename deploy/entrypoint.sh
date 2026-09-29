@@ -1,11 +1,10 @@
 #!/bin/sh
 # Runs nginx in front of the Node backend inside one container.
 #
-# The TLS/HTTP3 server block is only enabled when a certificate is mounted at
+# The TLS/HTTP2 server block is only enabled when a certificate is mounted at
 # /etc/nginx/certs/fullchain.pem. Without one the container still works, just
-# over plain HTTP on :8080 - which keeps the brotli/sendfile/coalescing wins
-# but leaves the TCP-over-TCP problem in place. That is deliberate: rolling out
-# QUIC should not require a certificate on day one.
+# over plain HTTP on :8080. QUIC/HTTP/3 is not used anymore: the only client is
+# the 2016 TV app, which speaks plain HTTP/1.1 on :8080.
 
 set -eu
 
@@ -19,13 +18,13 @@ if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
     if [ -f "$TLS_CONF_DISABLED" ] && [ ! -f "$TLS_CONF" ]; then
         mv "$TLS_CONF_DISABLED" "$TLS_CONF"
     fi
-    echo "[entrypoint] TLS + HTTP/3 enabled on :443 (cert: $CERT_FILE)"
+    echo "[entrypoint] TLS + HTTP/2 enabled on :443 (cert: $CERT_FILE)"
 else
     if [ -f "$TLS_CONF" ]; then
         mv "$TLS_CONF" "$TLS_CONF_DISABLED"
     fi
     echo "[entrypoint] no certificate at $CERT_FILE - running plain HTTP on :8080"
-    echo "[entrypoint] mount certs to enable HTTP/3 (QUIC) and terminate TLS"
+    echo "[entrypoint] mount certs to terminate TLS (HTTP/2) on :443"
 fi
 
 # If nginx fails to start (bad cert, port taken) the container would otherwise

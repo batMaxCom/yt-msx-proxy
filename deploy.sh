@@ -1,10 +1,10 @@
 #!/bin/bash
 # Деплой 2016YouTubeTV на удалённый сервер.
 #
-# Образ теперь не один Node-процесс, а nginx впереди (HTTP/3 на :443,
+# Образ теперь не один Node-процесс, а nginx впереди (TLS+HTTP/2 на :443,
 # HTTP на :8080) и Node на :8090 позади. Поэтому:
 #   * :8080 публикуется всегда - это фронт без TLS;
-#   * :443 (tcp+udp) публикуется, только если есть сертификат И порт свободен;
+#   * :443 (tcp) публикуется, только если есть сертификат И порт свободен;
 #   * :8090 остаётся для прямого доступа к Node (диагностика, откат);
 #   * :8070 (cors-anywhere) наружу НЕ публикуется - клиент ходит через
 #     /proxy на том же origin, а открытый cors-anywhere на публичном IP это
@@ -104,7 +104,7 @@ fi
 #   * наш прошлый контейнер (docker-proxy от $CONTAINER) - это не помеха,
 #     порт освободится сам после docker rm;
 #   * любой другой процесс - это то, на чём скрипт обязан споткнуться.
-# TCP и UDP - разные пространства имён: QUIC нужен UDP, HTTP/2 нужен TCP.
+# QUIC (HTTP/3) убран: клиент только ТВ (MSX-2016, HTTP/1.1), а на 443 остаётся TLS+HTTP/2 по TCP.
 have_probe=1
 command -v ss >/dev/null 2>&1 || { have_probe=0; command -v netstat >/dev/null 2>&1 || have_probe=0; }
 
@@ -128,20 +128,18 @@ if docker inspect "$CONTAINER" >/dev/null 2>&1; then
         | tr ' ' '\n' | grep -q '^443/' && OURS_HOLDS_443=1
 fi
 
-TCP443=0; UDP443=0
+TCP443=0
 FOREIGN_HOLDER=0
 port_in_use tcp 443 && TCP443=1
-port_in_use udp 443 && UDP443=1
 [ "$have_probe" -eq 0 ] && echo "    ВНИМАНИЕ: нет ss/netstat, не смог проверить занятость 443"
 
-if [ "$TCP443" -eq 1 ] || [ "$UDP443" -eq 1 ]; then
+if [ "$TCP443" -eq 1 ]; then
     if [ "$OURS_HOLDS_443" -eq 1 ]; then
         echo "==> 443 держит наш прошлый контейнер ($CONTAINER) - это норма, порт освободится при сносе"
     else
         FOREIGN_HOLDER=1
         echo "==> 443 занят посторонним процессом:"
         [ "$TCP443" -eq 1 ] && { echo "      [tcp/443]"; probe_cmd tcp 443 | sed 's/^/        /'; }
-        [ "$UDP443" -eq 1 ] && { echo "      [udp/443]"; probe_cmd udp 443 | sed 's/^/        /'; }
     fi
 fi
 
@@ -163,17 +161,15 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 # Наши же порты после сноса освободились, поэтому перемеряем. Без этого
 # решение ниже опиралось бы на замер, сделанный пока контейнер ещё жил,
-# и 443 не опубликовался бы повторно - то есть QUIC пропал бы после
+# и 443 не опубликовался бы повторно - то есть TLS пропал бы после
 # первого же деплоя.
 if [ "$OURS_HOLDS_443" -eq 1 ]; then
-    TCP443=0; UDP443=0
+    TCP443=0
     port_in_use tcp 443 && TCP443=1
-    port_in_use udp 443 && UDP443=1
-    if [ "$TCP443" -eq 1 ] || [ "$UDP443" -eq 1 ]; then
+    if [ "$TCP443" -eq 1 ]; then
         # Наш контейнер снесён, значит держать порт больше некому.
         echo "!! ПОСЛЕ СНОСА 443 всё ещё занят - это уже точно чужой процесс:"
         probe_cmd tcp 443 | sed 's/^/      /'
-        probe_cmd udp 443 | sed 's/^/      /'
         FOREIGN_HOLDER=1
         if [ "$REQUIRE_FREE_443" = "yes" ]; then
             echo "!! ПРЕРЫВАЮ ДЕПЛОЙ (REQUIRE_FREE_443=yes). Прежний контейнер уже снесён."
@@ -203,19 +199,18 @@ if [ "$ENABLE_443" = "yes" ]; then
     PUBLISH_443=1
     [ "$HAVE_CERT" -eq 0 ] && echo "    ВНИМАНИЕ: 443 публикуется принудительно, но сертификата нет - nginx уйдёт в HTTP-режим"
 elif [ "$ENABLE_443" = "auto" ]; then
-    if [ "$HAVE_CERT" -eq 1 ] && [ "$TCP443" -eq 0 ] && [ "$UDP443" -eq 0 ]; then
+    if [ "$HAVE_CERT" -eq 1 ] && [ "$TCP443" -eq 0 ]; then
         PUBLISH_443=1
     fi
 fi
 
 if [ "$PUBLISH_443" -eq 1 ]; then
-    echo "==> публикуем 443 (TLS + HTTP/2 + HTTP/3)"
+    echo "==> публикуем 443 (TLS + HTTP/2)"
 else
     echo "==> 443 не публикуем:"
     [ "$HAVE_CERT" -eq 0 ] && echo "    - нет сертификата (задайте CERT_SRC)"
     [ "$TCP443" -eq 1 ] && echo "    - TCP/443 уже занят"
-    [ "$UDP443" -eq 1 ] && echo "    - UDP/443 уже занят (без него не будет QUIC)"
-    if [ "$TCP443" -eq 1 ] || [ "$UDP443" -eq 1 ]; then
+    if [ "$TCP443" -eq 1 ]; then
         echo "    Вариант: пусть хостовый nginx терминирует TLS и проксирует на 127.0.0.1:8080"
     fi
 fi
@@ -228,7 +223,7 @@ ARGS=(
     -p 8080:8080
     -p 8090:8090
 )
-[ "$PUBLISH_443" -eq 1 ] && ARGS+=(-p 443:443 -p 443:443/udp)
+[ "$PUBLISH_443" -eq 1 ] && ARGS+=(-p 443:443)
 [ "$PUBLISH_8070" = "yes" ] && ARGS+=(-p 8070:8070)
 [ -n "$MOUNT_CERT" ] && ARGS+=($MOUNT_CERT)
 ARGS+=(-v "$IMAGE-imgcache:/app/back/imgcache" -v "$IMAGE-logs:/app/back/logs")
@@ -256,18 +251,6 @@ for i in $(seq 1 40); do
     sleep 1
 done
 
-# --- 11. Проверяем, что QUIC действительно слушает ---------------------
-# Порт 443 в hex это 01BB; смотрим /proc/net/udp, чтобы не зависеть от ss
-# внутри образа. Это единственная проверка, которая ловит тихий сценарий
-# "сертификат смонтирован, но h3 не поднялся".
-if [ "$PUBLISH_443" -eq 1 ]; then
-    if docker exec "$CONTAINER" sh -c "grep -qi ':01BB' /proc/net/udp" >/dev/null 2>&1; then
-        echo "    QUIC слушает UDP/443 внутри контейнера (h3 включён)"
-    else
-        echo "    ВНИМАНИЕ: UDP/443 внутри контейнера не слушается - QUIC не работает."
-        echo "    Проверьте, что сертификат не битый и образ собран из nginx:1.27 (нужен http_v3_module)."
-    fi
-fi
 
 # --- 12. Откат -------------------------------------------------------
 if [ "$ok" -ne 1 ]; then
@@ -291,9 +274,9 @@ docker images "$IMAGE" --format '{{.Repository}}:{{.Tag}}' \
 echo
 echo "==> Деплой завершён"
 if [ "$PUBLISH_443" -eq 1 ]; then
-    echo "    https://<host>/           TLS + HTTP/2 + HTTP/3"
+    echo "    https://<host>/           TLS + HTTP/2"
 else
-    echo "    http://<host>:8080/      без TLS и без QUIC"
+    echo "    http://<host>:8080/      без TLS"
 fi
 echo "    http://<host>:8090/      напрямую Node (для сравнения)"
 REMOTE_SCRIPT

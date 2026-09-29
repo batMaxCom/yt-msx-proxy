@@ -157,7 +157,7 @@
 
         // Derive every backend URL from the page origin so the app works
         // unchanged whether it is reached directly on :8090, through a plain
-        // HTTP nginx front, or through an HTTPS/HTTP3 front on :443.
+        // HTTP nginx front, or through an HTTPS front on :443.
         var APP_URL = window.location.origin;
         var PROXY_URL = APP_URL + "/proxy";
 
