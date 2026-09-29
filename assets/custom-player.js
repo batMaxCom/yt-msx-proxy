@@ -904,6 +904,9 @@
         // a "waiting" event during playback means the device could not sustain the
         // stream, which is the signal the quality guard reacts to
         try { engEl.addEventListener('waiting', function () { noteStall(); }); } catch (e5) { }
+        try { engEl.addEventListener('playing', function () { trSyncIcon(); }); } catch (e6) { }
+        try { engEl.addEventListener('pause', function () { trSyncIcon(); }); } catch (e7) { }
+        try { engEl.addEventListener('ended', function () { trSyncIcon(); }); } catch (e8) { }
         resetHealth();
         chainAdvanceTo({ id: id, title: (conf.title || '') });
         loadVideoMeta(id);                  // the watch screen has no title of its own
@@ -1174,6 +1177,7 @@
             if (el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
             else el.pause();
         } catch (e) { }
+        trSyncIcon();
         beacon('CP_KBD', { k: 'space', t: Math.round((el.currentTime || 0) * 10) / 10 });
     }
 
@@ -1183,6 +1187,32 @@
         try {
             if (pause) el.pause();
             else if (el.paused) { var p = el.play(); if (p && p.catch) p.catch(function () { }); }
+        } catch (e) { }
+        trSyncIcon();
+    }
+
+    function trPlayButton() {
+        var tc = trEl();
+        if (!tc) return null;
+        var list = tc.querySelectorAll('#button-list > div');
+        for (var i = 0; i < list.length; i++) {
+            var cl = typeof list[i].className === 'string' ? list[i].className : '';
+            if (/icon-player-play/.test(cl)) return list[i];
+        }
+        return null;
+    }
+
+    /* The app's own player model never reports an isPlaying flip in our setup
+       (we own playback), so the transport play/pause glyph stays stuck on
+       "play". Drive the .toggle-selected class ourselves: the CSS renders the
+       pause glyph (e635) while it is present. */
+    function trSyncIcon() {
+        var b = trPlayButton();
+        if (!b) return;
+        var playing = !!(active && active.engEl && !active.engEl.paused && !active.engEl.ended);
+        try {
+            if (playing) b.classList.add('toggle-selected');
+            else b.classList.remove('toggle-selected');
         } catch (e) { }
     }
 
@@ -2225,6 +2255,7 @@
                 // player model never reports a state, we drive all of them
                 var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff, #button-list .icon-player-next, #button-list .icon-player-prev');
                 for (i = 0; i < sb.length; i++) try { sb[i].classList.remove('disabled'); } catch (err) { }
+                trSyncIcon();
                 // the 2016 app keeps its loading spinner forever because its own
                 // player model never reports "started" — hide it once we actually play
                 if (el.readyState >= 2 || (el.currentTime || 0) > 0) {
