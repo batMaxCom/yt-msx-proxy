@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261027';
+    global.__CUSTOM_PLAYER_VERSION = '20261030g';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -763,6 +763,7 @@
         chainFor = '';
         metaReq++;                            // drop any metadata still in flight
         hideVideoMeta();
+        closeRelPanel();                      // its rows described the video we just left
         chainLoadingFor = '';
     }
 
@@ -1292,6 +1293,7 @@
     var chainPrefetched = null;   // {id, text, at} - resolved up-next payload
     var chainWaiters = [];        // callbacks parked on an in-flight ranking request
     var chainEmptyFor = '';       // video we already asked about and got nothing back
+    var chainErrorFor = '';       // video whose ranking request failed outright
     var PREFETCH_TTL_MS = 10 * 60 * 1000;
     var chainPath = [];        // [{id,title}] in visit order
     var chainPathPos = -1;     // index of the video currently playing
@@ -1910,15 +1912,17 @@
         chainItems = [];
         chainLoadingFor = id;
         var req = ++chainRequest;
+        if (relOpenNow()) renderRelPanel();
         xhrText(base + '/api/related?videoId=' + encodeURIComponent(id) + '&limit=20', function (res) {
             if (req !== chainRequest) return;
             chainLoadingFor = '';
             var data = null;
-            try { data = JSON.parse(res); } catch (e) { beacon('CP_CHAIN_BADJSON', {}); chainFlushWaiters(null); return; }
+            try { data = JSON.parse(res); } catch (e) { beacon('CP_CHAIN_BADJSON', {}); chainFlushWaiters(null); relPanelRefresh(); return; }
             if (!data || !data.items || !data.items.length) {
                 beacon('CP_CHAIN_EMPTY', { id: id, src: data && data.source });
                 chainEmptyFor = id;          // don't keep re-asking for the same video
                 chainFlushWaiters(null);
+                relPanelRefresh();
                 return;
             }
             chainItems = data.items;
@@ -1927,7 +1931,24 @@
             var first = pickChainItem(id);
             if (first) chainPrefetch(first.id);
             chainFlushWaiters(chainItems);
+            relPanelRefresh();
         });
+    }
+
+    /* the panel is fed by the same list the chain walks, so it only ever needs
+       to re-read chainItems: a new ranking, a video switch, or the transport
+       waking up again */
+    function relPanelRefresh() {
+        if (!relOpenNow()) return;
+        var keep = relItems[relIdx] && relItems[relIdx].id;
+        renderRelPanel();
+        if (keep) {
+            for (var i = 0; i < relItems.length; i++) {
+                if (relItems[i].id === keep) { relIdx = i; break; }
+            }
+            highlightRelRow();
+        }
+        relLabelSync();
     }
 
     function chainFlushWaiters(items) {
@@ -2191,6 +2212,869 @@
         chainCheck();
     }
 
+    /* ---- related videos panel ----
+       The video fills the whole screen (both #watch and #player are 100%x100%
+       in this app), so there is no room "below" it: the list is a drawer over
+       the right edge, the way a TV client shows its queue. It is fed by the
+       ranking /api/related already resolves for the endless chain, so opening
+       the panel during playback costs nothing. */
+
+    var relPanel = null;
+    var relScroll = null;
+    var relStatus = null;
+    var relRows = [];          // row elements
+    var relItems = [];         // row payloads
+    var relIdx = 0;
+    var relOpen = false;
+    var relBtn = null;         // our transport button
+    var REL_MAX = 20;
+
+    function relOpenNow() { return !!(relPanel && relPanel.style.display !== 'none'); }
+
+    function relCandidates() {
+        var cur = active ? active.id : getVideoId();
+        var out = [], seen = {}, i, it;
+        for (i = 0; i < chainItems.length && out.length < REL_MAX; i++) {
+            it = chainItems[i];
+            if (!it || !it.id || it.id === cur || seen[it.id]) continue;
+            seen[it.id] = true;
+            out.push(it);
+        }
+        return out;
+    }
+
+    function relPanelStyle() {
+        var vw = global.innerWidth || 1280;
+        return 'position:fixed;right:0;top:0;bottom:0;z-index:2147482900;' +
+            'width:' + Math.round(Math.min(430, Math.max(300, vw * 0.3))) + 'px;' +
+            'display:none;flex-direction:column;box-sizing:border-box;' +
+            'background:rgba(18,18,18,.94);border-left:2px solid #3a3a3a;' +
+            'box-shadow:-4px 0 24px rgba(0,0,0,.6);pointer-events:auto;' +
+            'font:normal 18px/1.35 Roboto,Arial,Helvetica,sans-serif;color:#fff;';
+    }
+
+    function buildRelPanel() {
+        var host = relPanel && relPanel.parentNode ? relPanel.parentNode : null;
+        // the app re-renders the player's children, so a cached node can end up
+        // detached; drop it and rebuild rather than toggling a node nobody sees
+        if (relPanel && host !== menuHost()) {
+            relPanel = null;
+            relRows = [];
+            relScroll = null;
+            relStatus = null;
+        }
+        if (relPanel) return relPanel;
+        var doc = global.document;
+        if (!doc || !doc.createElement) return null;
+        host = menuHost();
+        if (!host) return null;
+        var el = doc.createElement('div');
+        el.id = 'yt-cp-related';
+        el.style.cssText = relPanelStyle();
+
+        var head = doc.createElement('div');
+        head.style.cssText = 'flex:0 0 auto;display:flex;align-items:center;gap:12px;' +
+            'padding:18px 20px 12px;border-bottom:1px solid #333;';
+        var title = doc.createElement('div');
+        title.id = 'yt-cp-related-title';
+        title.style.cssText = 'flex:1 1 auto;font-size:22px;font-weight:500;';
+        title.textContent = 'Похожие видео';
+        var close = doc.createElement('div');
+        close.className = 'yt-cp-rel-close';
+        close.style.cssText = 'flex:0 0 auto;padding:4px 12px;border:1px solid #555;border-radius:3px;' +
+            'color:#bbb;font-size:16px;cursor:pointer;';
+        close.textContent = '✕';
+        close.addEventListener('click', function (e) {
+            if (e && e.preventDefault) e.preventDefault();
+            if (e && e.stopPropagation) e.stopPropagation();
+            closeRelPanel();
+        });
+        head.appendChild(title);
+        head.appendChild(close);
+
+        relStatus = doc.createElement('div');
+        relStatus.id = 'yt-cp-related-status';
+        relStatus.style.cssText = 'flex:0 0 auto;padding:14px 20px;color:#9a9a9a;font-size:17px;display:none;';
+
+        relScroll = doc.createElement('div');
+        relScroll.id = 'yt-cp-related-list';
+        relScroll.style.cssText = 'flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:8px 10px 40%;';
+
+        el.appendChild(head);
+        el.appendChild(relStatus);
+        el.appendChild(relScroll);
+        try { host.appendChild(el); } catch (e) { return null; }
+        el.addEventListener('mousedown', function (e) { if (e.stopPropagation) e.stopPropagation(); }, true);
+        el.addEventListener('click', function (e) {
+            // the byline badge opens the channel; the rest of the row plays
+            var badge = e.target && e.target.closest ? e.target.closest('.yt-cp-rel-channel') : null;
+            if (badge) {
+                var brow = relRowOf(e.target);
+                if (!brow) return;
+                var bidx = parseInt(brow.getAttribute('data-idx'), 10);
+                if (isNaN(bidx)) return;
+                var bit = relItems[bidx];
+                if (bit && bit.authorId) {
+                    if (e.preventDefault) e.preventDefault();
+                    closeRelPanel();
+                    openChannel(bit.authorId);
+                }
+                return;
+            }
+            var row = relRowOf(e.target);
+            if (!row) return;
+            var idx = parseInt(row.getAttribute('data-idx'), 10);
+            if (isNaN(idx)) return;
+            relIdx = idx;
+            playRelRow(idx);
+        });
+        el.addEventListener('mousemove', function (e) {
+            var row = relRowOf(e.target);
+            if (!row) return;
+            var idx = parseInt(row.getAttribute('data-idx'), 10);
+            if (isNaN(idx) || idx === relIdx) return;
+            relIdx = idx;
+            highlightRelRow();
+        });
+        relPanel = el;
+        return relPanel;
+    }
+
+    function relRowOf(t) {
+        if (t && t.closest) return t.closest('.yt-cp-rel-row');
+        for (var n = t; n && n !== relPanel; n = n.parentNode) {
+            if (n && n.getAttribute && /(^|\s)yt-cp-rel-row(\s|$)/.test(n.getAttribute('class') || '')) return n;
+        }
+        return null;
+    }
+
+    function relRow(item, idx) {
+        var doc = global.document;
+        var row = doc.createElement('div');
+        row.className = 'yt-cp-rel-row';
+        row.setAttribute('data-idx', String(idx));
+        // focusable, or the app's own focus model keeps the remote and the
+        // cursor never moves (same reason the quality rows carry tabindex)
+        try { row.setAttribute('tabindex', '-1'); } catch (e) { }
+        row.style.cssText = 'display:flex;gap:12px;align-items:flex-start;padding:8px;' +
+            'margin-bottom:4px;border-radius:3px;cursor:pointer;color:#fff;';
+
+        var thumbWrap = doc.createElement('div');
+        thumbWrap.style.cssText = 'position:relative;flex:0 0 auto;width:168px;height:94px;' +
+            'background:#000;border-radius:3px;overflow:hidden;';
+        var img = doc.createElement('img');
+        img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+        if (item.thumb) img.src = item.thumb;
+        else img.alt = '';
+        thumbWrap.appendChild(img);
+        if (item.duration) {
+            var dur = doc.createElement('div');
+            dur.style.cssText = 'position:absolute;right:4px;bottom:4px;padding:1px 5px;' +
+                'background:rgba(0,0,0,.8);border-radius:2px;font-size:14px;color:#fff;';
+            dur.textContent = item.duration;
+            thumbWrap.appendChild(dur);
+        }
+
+        var box = doc.createElement('div');
+        box.style.cssText = 'flex:1 1 auto;min-width:0;';
+        var t = doc.createElement('div');
+        t.style.cssText = 'font-size:18px;line-height:1.25;max-height:2.6em;overflow:hidden;';
+        t.textContent = item.title || item.id;
+        var meta = [];
+        if (item.author) meta.push(item.author);
+        if (item.live) meta.push('эфир');
+        if (item.short) meta.push('Shorts');
+        if (item.autoplay) meta.push('YouTube: дальше');
+        // byline and the channel badge share a row: the text truncates instead of
+        // wrapping, otherwise a long author line pushes the badge out of the box
+        var by = doc.createElement('div');
+        by.className = 'yt-cp-rel-meta';
+        by.style.cssText = 'margin-top:5px;font-size:15px;color:#b0b0b0;' +
+            'display:flex;align-items:center;gap:8px;max-height:2.4em;overflow:hidden;';
+        var byText = doc.createElement('span');
+        byText.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;' +
+            'text-overflow:ellipsis;white-space:nowrap;';
+        byText.textContent = meta.join(' · ');
+        by.appendChild(byText);
+        box.appendChild(t);
+        box.appendChild(by);
+
+        // "open this channel" affordance, only where the byline actually named a
+        // channel (the bare autoplay endpoint has no authorId)
+        if (item.authorId) {
+            var ch = doc.createElement('span');
+            ch.className = 'yt-cp-rel-channel';
+            ch.style.cssText = 'flex:0 0 auto;padding:1px 8px;' +
+                'border:1px solid currentColor;border-radius:10px;font-size:13px;opacity:.75;';
+            ch.textContent = 'Канал';
+            by.appendChild(ch);
+        }
+
+        row.appendChild(thumbWrap);
+        row.appendChild(box);
+        return row;
+    }
+
+    function relSetStatus(text) {
+        if (!relStatus) return;
+        if (!text) { relStatus.style.display = 'none'; relStatus.textContent = ''; return; }
+        relStatus.textContent = text;
+        relStatus.style.display = 'block';
+    }
+
+    function renderRelPanel() {
+        if (!buildRelPanel()) return;
+        var items = relCandidates();
+        relItems = items;
+        while (relScroll.firstChild) relScroll.removeChild(relScroll.firstChild);
+        relRows = [];
+        if (!items.length) {
+            relSetStatus(relLoading() ? 'Загрузка подборки…' : 'Подборка недоступна');
+            highlightRelRow();
+            return;
+        }
+        relSetStatus('');
+        for (var i = 0; i < items.length; i++) {
+            var row = relRow(items[i], i);
+            relRows.push(row);
+            relScroll.appendChild(row);
+        }
+        if (relIdx >= items.length) relIdx = items.length - 1;
+        if (relIdx < 0) relIdx = 0;
+        highlightRelRow();
+    }
+
+    function relLoading() {
+        var cur = active ? active.id : getVideoId();
+        return !!(cur && chainLoadingFor === cur);
+    }
+
+    function highlightRelRow() {
+        var i, on;
+        for (i = 0; i < relRows.length; i++) {
+            on = (i === relIdx);
+            relRows[i].style.background = on ? '#fff' : 'transparent';
+            relRows[i].style.color = on ? '#111' : '#fff';
+            // only the byline carries its own colour; the title inherits the row
+            var meta = relRows[i].getElementsByClassName('yt-cp-rel-meta');
+            if (meta.length) meta[0].style.color = on ? '#555' : '#b0b0b0';
+            if (on) {
+                // hold the DOM focus so the app's keydown handler does not walk
+                // its own focus tree while our cursor sits still
+                try { relRows[i].focus(); } catch (e) { }
+                try { relRows[i].scrollIntoView({ block: 'nearest' }); } catch (e2) { }
+            }
+        }
+    }
+
+    function moveRelRow(dir) {
+        if (!relRows.length) return;
+        relIdx = ((relIdx + dir) % relRows.length + relRows.length) % relRows.length;
+        highlightRelRow();
+    }
+
+    function playRelRow(idx) {
+        var it = relItems[idx];
+        if (!it || !it.id) return;
+        beacon('CP_REL_PICK', { id: it.id, idx: idx, n: relItems.length });
+        closeRelPanel();
+        if (it.id === (active ? active.id : '')) { showTransport(); return; }
+        chainGo(it, 1, true);
+    }
+
+    function openRelPanel() {
+        if (!buildRelPanel()) return false;
+        relOpen = true;
+        relPanel.style.display = 'flex';
+        relIdx = 0;
+        renderRelPanel();
+        // the ranking may still be in flight when the panel is summoned
+        var cur = active ? active.id : getVideoId();
+        if (cur && !chainItems.length && !chainLoadingFor && chainEmptyFor !== cur) loadChain(cur);
+        if (relBtn) { try { relBtn.blur(); } catch (e) { } }
+        showTransport();
+        beacon('CP_REL_OPEN', { id: cur, n: relItems.length });
+        return true;
+    }
+
+    function closeRelPanel() {
+        if (!relPanel) return;
+        relPanel.style.display = 'none';
+        relOpen = false;
+        beacon('CP_REL_CLOSE', {});
+    }
+
+    function toggleRelPanel() {
+        if (relOpenNow()) { closeRelPanel(); return true; }
+        return openRelPanel();
+    }
+
+    function relPanelKey(e) {
+        if (!relOpenNow()) return false;
+        var code = e.keyCode || e.which || 0;
+        var map = { 8: 'Back', 13: 'Enter', 27: 'Escape', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown' };
+        var key = e.key || '';
+        if (map[code]) key = map[code];
+        if (key === 'Backspace') key = 'Back';
+        var handled = true;
+        switch (key) {
+            case 'ArrowDown':
+                moveRelRow(1);
+                break;
+            case 'ArrowUp':
+                moveRelRow(-1);
+                break;
+            case 'ArrowRight':
+            case 'ArrowLeft':
+            case 'Escape':
+            case 'Back':
+                closeRelPanel();
+                break;
+            case 'Enter':
+            case ' ':
+            case 'space':
+                playRelRow(relIdx);
+                break;
+            default:
+                handled = false;
+        }
+        if (!handled) return false;
+        // browsing the list counts as player activity, otherwise the transport
+        // (and with it the drawer) times out from under the user's finger
+        showTransport();
+        if (e.preventDefault) e.preventDefault();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        return true;
+    }
+
+    /* ---- channel panel ----
+       Opens a public channel by id, @handle or url, with the same drawer and
+       key model as the related panel so the remote behaves identically. The
+       body comes from /api/channel, which answers with shelves of videos; Left
+       and Right walk the channel's tabs, Down past the end pages in more. */
+
+    var chnPanel = null;
+    var chnScroll = null;
+    var chnStatus = null;
+    var chnRows = [];
+    var chnItems = [];        // flat row payloads, across shelves
+    var chnIdx = 0;
+    var chnOpen = false;
+    var chnKey = '';          // what the user asked for, for retries
+    var chnTabIdx = 0;
+    var chnData = null;       // last /api/channel answer
+    var chnLoading = false;
+    var chnRequest = 0;
+    var CHN_TABS = [
+        { key: 'home', label: 'Главная' },
+        { key: 'videos', label: 'Видео' },
+        { key: 'shorts', label: 'Shorts' },
+        { key: 'live', label: 'Эфиры' }
+    ];
+
+    function chnOpenNow() { return !!(chnPanel && chnPanel.style.display !== 'none'); }
+
+    function chnPanelStyle() {
+        var vw = global.innerWidth || 1280;
+        return 'position:fixed;right:0;top:0;bottom:0;z-index:2147482899;' +
+            'width:' + Math.round(Math.min(520, Math.max(320, vw * 0.36))) + 'px;' +
+            'display:none;flex-direction:column;box-sizing:border-box;' +
+            'background:rgba(15,15,15,.96);border-left:2px solid #3a3a3a;' +
+            'box-shadow:-4px 0 24px rgba(0,0,0,.6);pointer-events:auto;' +
+            'font:normal 18px/1.35 Roboto,Arial,Helvetica,sans-serif;color:#fff;';
+    }
+
+    function chnBuildPanel() {
+        var host = chnPanel && chnPanel.parentNode ? chnPanel.parentNode : null;
+        // same stale-host guard as the related drawer: the app re-renders the
+        // player's children, so a cached node can end up detached
+        if (chnPanel && host !== menuHost()) {
+            chnPanel = null;
+            chnRows = [];
+            chnScroll = null;
+            chnStatus = null;
+        }
+        if (chnPanel) return chnPanel;
+        var doc = global.document;
+        if (!doc || !doc.createElement) return null;
+        host = menuHost();
+        if (!host) return null;
+        var el = doc.createElement('div');
+        el.id = 'yt-cp-channel';
+        el.style.cssText = chnPanelStyle();
+
+        var head = doc.createElement('div');
+        head.style.cssText = 'flex:0 0 auto;display:flex;align-items:center;gap:10px;' +
+            'padding:14px 16px 10px;border-bottom:1px solid #333;';
+        var avatar = doc.createElement('img');
+        avatar.id = 'yt-cp-channel-avatar';
+        avatar.style.cssText = 'flex:0 0 auto;width:48px;height:48px;border-radius:50%;' +
+            'object-fit:cover;background:#222;display:none;';
+        var box = doc.createElement('div');
+        box.style.cssText = 'flex:1 1 auto;min-width:0;';
+        var title = doc.createElement('div');
+        title.id = 'yt-cp-channel-title';
+        title.style.cssText = 'font-size:21px;font-weight:500;overflow:hidden;' +
+            'text-overflow:ellipsis;white-space:nowrap;';
+        title.textContent = 'Канал';
+        var sub = doc.createElement('div');
+        sub.id = 'yt-cp-channel-sub';
+        sub.style.cssText = 'font-size:15px;color:#9a9a9a;margin-top:2px;';
+        var close = doc.createElement('div');
+        close.className = 'yt-cp-ch-close';
+        close.style.cssText = 'flex:0 0 auto;padding:4px 12px;border:1px solid #555;border-radius:3px;' +
+            'color:#bbb;font-size:16px;cursor:pointer;';
+        close.textContent = '✕';
+        close.addEventListener('click', function (e) {
+            if (e && e.preventDefault) e.preventDefault();
+            if (e && e.stopPropagation) e.stopPropagation();
+            closeChannel();
+        });
+        box.appendChild(title);
+        box.appendChild(sub);
+        head.appendChild(avatar);
+        head.appendChild(box);
+        head.appendChild(close);
+
+        var tabs = doc.createElement('div');
+        tabs.id = 'yt-cp-channel-tabs';
+        tabs.style.cssText = 'flex:0 0 auto;display:flex;gap:8px;padding:10px 16px;' +
+            'border-bottom:1px solid #2a2a2a;overflow:hidden;';
+        for (var i = 0; i < CHN_TABS.length; i++) {
+            (function (tab, n) {
+                var b = doc.createElement('div');
+                b.className = 'yt-cp-ch-tab';
+                b.setAttribute('data-tab', String(n));
+                b.setAttribute('tabindex', '-1');
+                b.style.cssText = 'padding:5px 12px;border:1px solid #444;border-radius:14px;' +
+                    'font-size:15px;color:#bbb;white-space:nowrap;';
+                b.textContent = tab.label;
+                b.addEventListener('click', function (e) {
+                    if (e && e.preventDefault) e.preventDefault();
+                    if (e && e.stopPropagation) e.stopPropagation();
+                    chnGoTab(n);
+                });
+                tabs.appendChild(b);
+            })(CHN_TABS[i], i);
+        }
+
+        chnStatus = doc.createElement('div');
+        chnStatus.id = 'yt-cp-channel-status';
+        chnStatus.style.cssText = 'flex:0 0 auto;padding:14px 16px;color:#9a9a9a;font-size:17px;display:none;';
+
+        chnScroll = doc.createElement('div');
+        chnScroll.id = 'yt-cp-channel-list';
+        chnScroll.style.cssText = 'flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:8px 10px 40%;';
+
+        el.appendChild(head);
+        el.appendChild(tabs);
+        el.appendChild(chnStatus);
+        el.appendChild(chnScroll);
+        try { host.appendChild(el); } catch (e) { return null; }
+        el.addEventListener('mousedown', function (e) { if (e.stopPropagation) e.stopPropagation(); }, true);
+        el.addEventListener('click', function (e) {
+            var row = chnRowOf(e.target);
+            if (row) {
+                var idx = parseInt(row.getAttribute('data-idx'), 10);
+                if (!isNaN(idx)) { chnIdx = idx; playChnRow(idx); }
+                return;
+            }
+            var tab = e.target && e.target.closest ? e.target.closest('.yt-cp-ch-tab') : null;
+            if (tab) {
+                var n = parseInt(tab.getAttribute('data-tab'), 10);
+                if (!isNaN(n)) chnGoTab(n);
+            }
+        });
+        el.addEventListener('mousemove', function (e) {
+            var row = chnRowOf(e.target);
+            if (!row) return;
+            var idx = parseInt(row.getAttribute('data-idx'), 10);
+            if (isNaN(idx) || idx === chnIdx) return;
+            chnIdx = idx;
+            chnHighlight();
+        });
+        chnPanel = el;
+        return chnPanel;
+    }
+
+    function chnRowOf(t) {
+        if (t && t.closest) return t.closest('.yt-cp-ch-row');
+        for (var n = t; n && n !== chnPanel; n = n.parentNode) {
+            if (n && n.getAttribute && /(^|\s)yt-cp-ch-row(\s|$)/.test(n.getAttribute('class') || '')) return n;
+        }
+        return null;
+    }
+
+    function chnRow(item, idx, shelfTitle, first) {
+        var doc = global.document;
+        var row = doc.createElement('div');
+        row.className = 'yt-cp-ch-row';
+        row.setAttribute('data-idx', String(idx));
+        // focusable, or the app's own focus model keeps the remote and the
+        // cursor never moves (same reason the related rows carry tabindex)
+        try { row.setAttribute('tabindex', '-1'); } catch (e) { }
+        row.style.cssText = 'display:flex;gap:12px;align-items:flex-start;padding:8px;' +
+            'margin-bottom:4px;border-radius:3px;cursor:pointer;color:#fff;';
+
+        var thumbWrap = doc.createElement('div');
+        // shorts are vertical, so give them a narrower box instead of cropping
+        var wide = !item.short;
+        thumbWrap.style.cssText = 'position:relative;flex:0 0 auto;width:' + (wide ? '168px' : '84px') +
+            ';height:94px;background:#000;border-radius:3px;overflow:hidden;';
+        var img = doc.createElement('img');
+        img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+        if (item.thumb) img.src = item.thumb;
+        else img.alt = '';
+        thumbWrap.appendChild(img);
+        if (item.duration) {
+            var dur = doc.createElement('div');
+            dur.style.cssText = 'position:absolute;right:4px;bottom:4px;padding:1px 5px;' +
+                'background:rgba(0,0,0,.8);border-radius:2px;font-size:14px;color:#fff;';
+            dur.textContent = item.duration;
+            thumbWrap.appendChild(dur);
+        }
+        if (item.live) {
+            var live = doc.createElement('div');
+            live.style.cssText = 'position:absolute;left:4px;top:4px;padding:1px 5px;' +
+                'background:#c00;border-radius:2px;font-size:13px;color:#fff;';
+            live.textContent = 'ЭФИР';
+            thumbWrap.appendChild(live);
+        }
+
+        var box = doc.createElement('div');
+        box.style.cssText = 'flex:1 1 auto;min-width:0;';
+        if (first && shelfTitle) {
+            var sh = doc.createElement('div');
+            sh.className = 'yt-cp-ch-shelf';
+            sh.style.cssText = 'font-size:14px;color:#8a8a8a;margin-bottom:5px;';
+            sh.textContent = shelfTitle;
+            box.appendChild(sh);
+        }
+        var t = doc.createElement('div');
+        t.style.cssText = 'font-size:18px;line-height:1.25;max-height:2.6em;overflow:hidden;';
+        t.textContent = item.title || item.id;
+        var meta = [];
+        if (item.author) meta.push(item.author);
+        else if (chnData && chnData.title) meta.push(chnData.title);
+        if (item.published) meta.push(item.published);
+        if (item.views && !item.published) meta.push(item.views);
+        if (item.short) meta.push('Shorts');
+        var by = doc.createElement('div');
+        by.className = 'yt-cp-ch-meta';
+        by.style.cssText = 'margin-top:5px;font-size:15px;color:#b0b0b0;' +
+            'max-height:2.4em;overflow:hidden;';
+        by.textContent = meta.join(' · ');
+        box.appendChild(t);
+        box.appendChild(by);
+
+        row.appendChild(thumbWrap);
+        row.appendChild(box);
+        return row;
+    }
+
+    function chnSetStatus(text) {
+        if (!chnStatus) return;
+        if (!text) { chnStatus.style.display = 'none'; chnStatus.textContent = ''; return; }
+        chnStatus.textContent = text;
+        chnStatus.style.display = 'block';
+    }
+
+    function chnFlatItems(data) {
+        var out = [];
+        var shelves = (data && data.shelves) || [];
+        for (var i = 0; i < shelves.length; i++) {
+            var items = shelves[i].items || [];
+            for (var j = 0; j < items.length; j++) {
+                out.push({ item: items[j], shelf: shelves[i].title || '' });
+            }
+        }
+        return out;
+    }
+
+    function chnRender() {
+        if (!chnBuildPanel()) return;
+        var flat = chnFlatItems(chnData);
+        chnItems = flat;
+        while (chnScroll.firstChild) chnScroll.removeChild(chnScroll.firstChild);
+        chnRows = [];
+
+        var doc = global.document;
+        var d = chnData;
+        if (d) {
+            var t = doc.getElementById('yt-cp-channel-title');
+            if (t) t.textContent = d.title || 'Канал';
+            var bits = [];
+            if (d.handle) bits.push(d.handle);
+            if (d.subscriberText) bits.push(d.subscriberText);
+            if (d.videosText) bits.push(d.videosText);
+            var s = doc.getElementById('yt-cp-channel-sub');
+            if (s) s.textContent = bits.join(' · ');
+            var av = doc.getElementById('yt-cp-channel-avatar');
+            if (av) {
+                if (d.avatar) { av.src = d.avatar; av.style.display = 'block'; }
+                else av.style.display = 'none';
+            }
+        }
+        chnSyncTabs();
+
+        if (chnLoading && !flat.length) {
+            chnSetStatus('Загрузка канала…');
+            return;
+        }
+        if (!flat.length) {
+            var why = 'В канале нет видео';
+            if (chnData && chnData.error) why = chnData.error;
+            chnSetStatus(chnLoading ? 'Загрузка канала…' : why);
+            chnHighlight();
+            return;
+        }
+        chnSetStatus('');
+
+        var lastShelf = '';
+        for (var i = 0; i < flat.length; i++) {
+            var first = flat[i].shelf !== lastShelf;
+            if (flat[i].shelf) lastShelf = flat[i].shelf;
+            var row = chnRow(flat[i].item, i, flat[i].shelf, first);
+            chnRows.push(row);
+            chnScroll.appendChild(row);
+        }
+        if (chnIdx >= flat.length) chnIdx = flat.length - 1;
+        if (chnIdx < 0) chnIdx = 0;
+        chnHighlight();
+    }
+
+    function chnSyncTabs() {
+        var doc = global.document;
+        if (!doc) return;
+        var host = doc.getElementById('yt-cp-channel-tabs');
+        if (!host) return;
+        var btns = host.getElementsByClassName('yt-cp-ch-tab');
+        for (var i = 0; i < btns.length; i++) {
+            var on = (i === chnTabIdx);
+            btns[i].style.background = on ? '#fff' : 'transparent';
+            btns[i].style.color = on ? '#111' : '#bbb';
+            btns[i].style.borderColor = on ? '#fff' : '#444';
+        }
+    }
+
+    function chnHighlight() {
+        for (var i = 0; i < chnRows.length; i++) {
+            var on = (i === chnIdx);
+            chnRows[i].style.background = on ? '#fff' : 'transparent';
+            chnRows[i].style.color = on ? '#111' : '#fff';
+            // only the byline carries its own colour; the title inherits the row
+            var meta = chnRows[i].getElementsByClassName('yt-cp-ch-meta');
+            if (meta.length) meta[0].style.color = on ? '#555' : '#b0b0b0';
+            var shelf = chnRows[i].getElementsByClassName('yt-cp-ch-shelf');
+            if (shelf.length) shelf[0].style.color = on ? '#777' : '#8a8a8a';
+            if (on) {
+                // hold the DOM focus so the app's keydown handler does not walk
+                // its own focus tree while our cursor sits still
+                try { chnRows[i].focus(); } catch (e) { }
+                try { chnRows[i].scrollIntoView({ block: 'nearest' }); } catch (e2) { }
+            }
+        }
+    }
+
+    function chnMove(dir) {
+        if (!chnRows.length) return;
+        var n = ((chnIdx + dir) % chnRows.length + chnRows.length) % chnRows.length;
+        chnIdx = n;
+        chnHighlight();
+        // one row past the end is the "load more" stop
+        if (dir > 0 && chnIdx >= chnRows.length - 1) chnLoadMore();
+    }
+
+    function playChnRow(idx) {
+        var entry = chnItems[idx];
+        var it = entry && entry.item;
+        if (!it || !it.id) return;
+        beacon('CP_CHN_PICK', { id: it.id, idx: idx, n: chnItems.length, ch: chnData && chnData.id });
+        closeChannel();
+        if (it.id === (active ? active.id : '')) { showTransport(); return; }
+        chainGo(it, 1, true);
+    }
+
+    function chnUrl(tab, continuation) {
+        var u = base + '/api/channel/' + encodeURIComponent(chnKey) + '?tab=' + encodeURIComponent(tab);
+        if (continuation) u += '&continuation=' + encodeURIComponent(continuation);
+        return u;
+    }
+
+    function chnFetch(tab, continuation) {
+        if (!chnKey) return;
+        chnLoading = true;
+        var req = ++chnRequest;
+        if (!continuation) {
+            chnData = null;
+            chnIdx = 0;
+            chnRender();
+        }
+        xhrText(chnUrl(tab, continuation), function (res) {
+            if (req !== chnRequest) return;
+            chnLoading = false;
+            if (!res) {
+                chnData = chnData || { shelves: [], error: 'Канал недоступен' };
+                if (chnOpenNow()) chnRender();
+                beacon('CP_CHN_FAIL', { ch: chnKey, tab: tab, paged: !!continuation });
+                return;
+            }
+            var data = null;
+            try { data = JSON.parse(res); } catch (e) {
+                beacon('CP_CHN_BADJSON', { ch: chnKey, tab: tab });
+                chnData = chnData || { shelves: [], error: 'Канал недоступен' };
+                if (chnOpenNow()) chnRender();
+                return;
+            }
+            var appended = false;
+            if (continuation) {
+                // keep what is on screen and append the page
+                var base0 = chnData || { shelves: [] };
+                var more = (data && data.shelves) || [];
+                for (var i = 0; i < more.length; i++) {
+                    base0.shelves.push({ title: more[i].title || '', items: more[i].items || [] });
+                }
+                chnData = base0;
+                chnData.continuation = data.continuation || null;
+                // the page answer counts only its own items, so the running
+                // total has to be rebuilt after appending
+                var total = 0;
+                for (var s = 0; s < chnData.shelves.length; s++) {
+                    total += (chnData.shelves[s].items || []).length;
+                }
+                chnData.videoCount = total;
+                appended = true;
+            } else {
+                chnData = data;
+            }
+            if (!chnOpenNow()) return;
+            // a re-render wipes the scroll position, so put it back or the list
+            // jumps to the top every time a page is appended
+            var keepScroll = appended ? chnScroll.scrollTop : 0;
+            chnRender();
+            if (keepScroll) { try { chnScroll.scrollTop = keepScroll; } catch (e) { } }
+        });
+    }
+
+    function chnLoadMore() {
+        if (chnLoading) return;
+        if (!chnData || !chnData.continuation) return;
+        beacon('CP_CHN_MORE', { ch: chnData.id, n: chnItems.length });
+        chnFetch((chnData && chnData.tab) || CHN_TABS[chnTabIdx].key, chnData.continuation);
+    }
+
+    function chnGoTab(n) {
+        if (n < 0 || n >= CHN_TABS.length || n === chnTabIdx) return;
+        chnTabIdx = n;
+        chnFetch(CHN_TABS[n].key, null);
+        chnSyncTabs();
+    }
+
+    function openChannel(key, tab) {
+        if (!key) return false;
+        if (!chnBuildPanel()) return false;
+        chnOpen = true;
+        chnPanel.style.display = 'flex';
+        chnKey = String(key);
+        if (tab) {
+            for (var i = 0; i < CHN_TABS.length; i++) {
+                if (CHN_TABS[i].key === tab) { chnTabIdx = i; break; }
+            }
+        } else {
+            chnTabIdx = 0;
+        }
+        chnFetch(CHN_TABS[chnTabIdx].key, null);
+        if (chnPanel.focus) { try { chnPanel.blur(); } catch (e) { } }
+        showTransport();
+        beacon('CP_CHN_OPEN', { ch: chnKey, tab: CHN_TABS[chnTabIdx].key });
+        return true;
+    }
+
+    function closeChannel() {
+        if (!chnPanel) return;
+        chnPanel.style.display = 'none';
+        chnOpen = false;
+        chnRequest++;                 // drop an in-flight answer for a closed panel
+        beacon('CP_CHN_CLOSE', {});
+    }
+
+    function chnPanelKey(e) {
+        if (!chnOpenNow()) return false;
+        var code = e.keyCode || e.which || 0;
+        var map = { 8: 'Back', 13: 'Enter', 27: 'Escape', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown' };
+        var key = e.key || '';
+        if (map[code]) key = map[code];
+        if (key === 'Backspace') key = 'Back';
+        var handled = true;
+        switch (key) {
+            case 'ArrowDown':
+                chnMove(1);
+                break;
+            case 'ArrowUp':
+                chnMove(-1);
+                break;
+            case 'ArrowRight':
+                chnGoTab(chnTabIdx + 1 >= CHN_TABS.length ? 0 : chnTabIdx + 1);
+                break;
+            case 'ArrowLeft':
+                chnGoTab(chnTabIdx - 1 < 0 ? CHN_TABS.length - 1 : chnTabIdx - 1);
+                break;
+            case 'Escape':
+            case 'Back':
+                closeChannel();
+                break;
+            case 'Enter':
+            case ' ':
+            case 'space':
+                playChnRow(chnIdx);
+                break;
+            default:
+                handled = false;
+        }
+        if (!handled) return false;
+        // browsing the list counts as player activity, otherwise the transport
+        // (and with it the drawer) times out from under the user's finger
+        showTransport();
+        if (e.preventDefault) e.preventDefault();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        return true;
+    }
+
+    /* Transport button. The app re-renders #button-list whenever its own player
+       model updates, so this is re-injected from syncUI instead of once. */
+    function ensureRelButton() {
+        var doc = global.document;
+        if (!doc) return null;
+        var list = doc.querySelector('#button-list');
+        if (!list) return null;
+        var b = list.querySelector('.yt-cp-relbtn');
+        if (b) { relBtn = b; return b; }
+        var el = doc.createElement('div');
+        el.className = 'yt-cp-relbtn icon-playlist button';
+        el.setAttribute('tabindex', '-1');
+        var lab = doc.createElement('span');
+        lab.className = 'label';
+        lab.textContent = 'Похожие';
+        el.appendChild(lab);
+        el.addEventListener('click', function (e) {
+            if (e && e.preventDefault) e.preventDefault();
+            if (e && e.stopPropagation) e.stopPropagation();
+            toggleRelPanel();
+        });
+        try { list.appendChild(el); } catch (e2) { return null; }
+        relBtn = el;
+        return el;
+    }
+
+    function relLabelSync() {
+        var b = relBtn;
+        if (!b) return;
+        var n = relCandidates().length;
+        var t = n ? 'Похожие (' + n + ')' : 'Похожие';
+        var lab = b.querySelector('.label');
+        if (lab && lab.textContent !== t) lab.textContent = t;
+    }
+
     readStoredQuality();
     readChainPref();
 
@@ -2219,6 +3103,7 @@
         if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
         if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
         if (/yt-cp-quality|icon-player-settings/.test(cl)) { return toggleQualityMenu(b); }
+        if (/yt-cp-relbtn/.test(cl)) { return toggleRelPanel(); }
         if (/icon-ellipsis/.test(cl)) return openMoreActions();
         if (/icon-home/.test(cl)) { goHome(); return true; }
         return false;
@@ -2241,6 +3126,7 @@
             bindInputElements();
             updateQualityLabel();
             samplePlaybackHealth();
+            if (ensureRelButton()) relLabelSync();
             var tc = trEl();
             if (!tc) { trSeen = false; return; }
             if (!trSeen) {
@@ -2253,6 +3139,7 @@
                     trVisible = false;
                     setTransport(false);
                     if (qMenuOpen()) closeQualityMenu();   // the menu hangs off the transport
+                    if (relOpenNow()) closeRelPanel();     // ...and so does the related drawer
                 } else setTransport(true);
             } else {
                 setTransport(false);
@@ -2534,9 +3421,10 @@
         var nm = dupeKeyName(code, e.key || '');
         var st = e.timeStamp ||
             (global.performance && global.performance.now ? global.performance.now() : Date.now());
-        // the quality list is exempt: walking a list has no side effects, and
-        // swallowing a fast press there just looks like broken navigation
-        if (!qMenuOpen() && nm && nm === lastKeyName && !e.repeat && (st - lastKeyAt) > 0 && (st - lastKeyAt) < KEY_DUP_MS) {
+        // the quality list and the related drawer are exempt: walking a list has
+        // no side effects, and swallowing a fast press there just looks like
+        // broken navigation
+        if (!qMenuOpen() && !relOpenNow() && !chnOpenNow() && nm && nm === lastKeyName && !e.repeat && (st - lastKeyAt) > 0 && (st - lastKeyAt) < KEY_DUP_MS) {
             if (e.preventDefault) e.preventDefault();
             if (e.stopImmediatePropagation) e.stopImmediatePropagation();
             return;
@@ -2554,14 +3442,23 @@
         // The quality dropdown swallows navigation while it is open, whatever
         // the rest of the player is doing (it lives outside the app's focus model).
         if (qMenuOpen() && qualityMenuKey(e)) return;
+        // ...and so does the related drawer, which must also win over the
+        // transport's own arrow handling while it is up
+        if (relOpenNow() && relPanelKey(e)) return;
+        // the channel drawer does too, and it closes the related one first so
+        // the two never fight over the same arrow key
+        if (chnOpenNow()) {
+            if (relOpenNow()) closeRelPanel();
+            if (chnPanelKey(e)) return;
+        }
 
         var w = watchSurface();
         var tc = trEl();
         if (!w || !tc) return;                     // only own keys while the watch surface exists
         var hash = '';
         try { hash = global.location && global.location.hash || ''; } catch (err) { }
-        if (hash.indexOf('/watch') === -1) { closeQualityMenu(); return; } // non-watch screens: let the app handle its own nav
-        if (!active) { closeQualityMenu(); return; } // no running session: let the app drive the screen
+        if (hash.indexOf('/watch') === -1) { closeQualityMenu(); closeRelPanel(); closeChannel(); return; } // non-watch screens: let the app handle its own nav
+        if (!active) { closeQualityMenu(); closeRelPanel(); closeChannel(); return; } // no running session: let the app drive the screen
         var snapped = false;
         try { snapped = w.classList.contains('snapped'); } catch (err) { }
         if (snapped) return;                       // let the app navigate the behind grid
@@ -2702,6 +3599,21 @@
         playRelated: chainNext,
         skipNext: chainSkipNext,
         skipPrev: chainSkipPrev,
+        openRelated: openRelPanel,
+        closeRelated: closeRelPanel,
+        toggleRelated: toggleRelPanel,
+        getRelated: function () { return relCandidates().slice(); },
+        openChannel: openChannel,
+        closeChannel: closeChannel,
+        isChannelOpen: chnOpenNow,
+        getChannel: function () { return chnData; },
+        getChannelItems: function () { return chnItems.map(function (e) { return e.item; }); },
+        setChannelTab: function (key) {
+            for (var i = 0; i < CHN_TABS.length; i++) {
+                if (CHN_TABS[i].key === key) { chnGoTab(i); return true; }
+            }
+            return false;
+        },
         getHistory: function () { return chainPath.slice(); },
         stop: stopActive,
         _remount: remount,

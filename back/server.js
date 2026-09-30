@@ -16,6 +16,7 @@ const { fetchGuideData } = require('./guide_api');
 const { handleSearchRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
 const { fetchRelated } = require('./related_api');
+const { handleChannelRequest } = require('./channel_api');
 const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest, getVideoInfoCached } = require('./get_video_info');
 
 // tv_cast pairing / lounge endpoints
@@ -848,6 +849,11 @@ async function handleRelatedRequest(req, res) {
 
 app.get('/api/related', handleRelatedRequest);
 app.get('/api/related/:videoId', handleRelatedRequest);
+
+// Channel pages: header plus shelves of videos, for the remote driven channel
+// view. The id is a channel id, a @handle or a channel url, and ?tab= picks
+// the uploads/live/shorts/playlists tab (default the channel home).
+app.get('/api/channel/:id', handleChannelRequest);
 
 
 // Metadata for the watch screen: title, author and thumbnail.

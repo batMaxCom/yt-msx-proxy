@@ -41,7 +41,7 @@ function getLocalIp() {
 function promptUser(query) {
     const rl = readline.createInterface({
         input: process.stdin,
-        output: process.stdout
+        output: process.stdouts
     });
 
     return new Promise((resolve) => {
