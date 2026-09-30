@@ -13,6 +13,12 @@ if (!fs.existsSync(logsDir)) {
  *   videoId, title, lengthText, views, publishedTime,
  *   shortBylineText.name, browseId.browseId, navigationEndpoint
  * Modern TVHTML5 Innertube search returns lockupViewModel instead of tileRenderer.
+ *
+ * Channel hits are NOT videos: the client has a real channelTile (innerTubeChannelParser
+ * in app-prod.js) that renders a round avatar and navigates to browseEndpoint. Folding a
+ * channel into a videoRenderer gave it a watchEndpoint on the UC… id, so OK started the
+ * player on a channel id and the thumbnail came out broken (ytimg /vi/ needs 11 chars).
+ * Those lockups are converted to compactChannelRenderer instead.
  */
 
 function textRuns(value) {
@@ -99,6 +105,85 @@ function extractMetadataParts(lockup) {
         channel: channel || 'Unknown Channel',
         views: views || '0 views',
         publishedTime: publishedTime || '',
+    };
+}
+
+function isChannelId(id) {
+    return typeof id === 'string' && /^UC[\w-]{22}$/.test(id);
+}
+
+function absoluteThumbUrl(url) {
+    if (typeof url !== 'string') return '';
+    // search sometimes hands back protocol-relative "//yt3.ggpht.com/..." URLs, which
+    // resolve against our own origin and never reach the image proxy
+    return url.startsWith('//') ? `https:${url}` : url;
+}
+
+function extractChannelAvatar(lockup) {
+    const sources = lockup?.contentImage?.thumbnailViewModel?.image?.sources || [];
+    if (sources.length) {
+        return sources
+            .filter(s => s && s.url)
+            .map(s => ({
+                url: absoluteThumbUrl(s.url),
+                width: s.width || 0,
+                height: s.height || 0,
+            }));
+    }
+    const menuThumbs =
+        lockup?.rendererContext?.commandContext?.onLongPress?.innertubeCommand
+            ?.showMenuCommand?.thumbnail?.thumbnails || [];
+    return menuThumbs
+        .filter(t => t && t.url)
+        .map(t => ({
+            url: absoluteThumbUrl(t.url),
+            width: t.width || 0,
+            height: t.height || 0,
+        }));
+}
+
+function extractChannelText(lockup) {
+    const rows =
+        lockup?.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel
+            ?.metadataRows || [];
+    const partsOf = row => (row?.metadataParts || []).map(p => textRuns(p.text)).filter(Boolean);
+
+    const handle = partsOf(rows[0]).find(t => t.startsWith('@')) || partsOf(rows[0])[0] || '';
+    const rest = [...partsOf(rows[1]), ...partsOf(rows[2])];
+    const subscribers =
+        rest.find(t => /subscriber|подписчик/i.test(t)) || rest.find(t => /\d/.test(t)) || '';
+
+    return { handle, subscribers };
+}
+
+function lockupToChannelRenderer(lockup) {
+    const onTap = lockup?.rendererContext?.commandContext?.onTap?.innertubeCommand;
+    const browseId = onTap?.browseEndpoint?.browseId || lockup?.contentId;
+    if (!isChannelId(browseId)) return null;
+
+    // the tile has no thumbnail fallback in the client parser: without it the row
+    // renders an empty circle, so drop the hit rather than show a blank one
+    const thumbnails = extractChannelAvatar(lockup);
+    if (!thumbnails.length) return null;
+
+    const title = textRuns(lockup?.metadata?.lockupMetadataViewModel?.title) || 'Channel';
+    const { handle, subscribers } = extractChannelText(lockup);
+
+    return {
+        compactChannelRenderer: {
+            channelId: browseId,
+            title,
+            handle,
+            subscriberCountText: subscribers,
+            thumbnail: { thumbnails },
+            navigationEndpoint: {
+                clickTrackingParams: onTap?.clickTrackingParams || '',
+                browseEndpoint: {
+                    browseId,
+                    params: onTap?.browseEndpoint?.params || '',
+                },
+            },
+        },
     };
 }
 
@@ -222,7 +307,11 @@ function convertSearchItem(item) {
     if (!item || typeof item !== 'object') return null;
 
     if (item.lockupViewModel) {
-        const videoRenderer = lockupToVideoRenderer(item.lockupViewModel);
+        const lockup = item.lockupViewModel;
+        if (lockup.contentType === 'LOCKUP_CONTENT_TYPE_CHANNEL' || isChannelId(lockup.contentId)) {
+            return lockupToChannelRenderer(lockup);
+        }
+        const videoRenderer = lockupToVideoRenderer(lockup);
         return videoRenderer ? { videoRenderer } : null;
     }
 

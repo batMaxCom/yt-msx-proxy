@@ -2091,9 +2091,27 @@
         }
         Wd.inject = ["navigateToWatch"];
 
+        /* Channel ids are handled by the custom player: it renders a channel web
+           interface (header, tabs, shelves, paging) from /api/channel. The stock
+           browse service cannot show them, because the browse response this
+           backend receives is a modern tvSurfaceContentRenderer. Everything else
+           (FEtopics, playlists, guides) keeps going to openBrowse. */
+        function ytCpChannelTab(a) {
+            if (!a) return null;
+            try {
+                var b = atob(String(a).replace(/-/g, "+").replace(/_/g, "/"));
+                if (b.indexOf("shorts") >= 0) return "shorts";
+                if (b.indexOf("videos") >= 0) return "videos";
+                if (b.indexOf("streams") >= 0) return "live"
+            } catch (b) { }
+            return null
+        }
         function Xd(a, b, c) {
             var e = b.browseEndpoint;
             if (e.browseId) {
+                if (/^UC[\w-]{22}$/.test(e.browseId) && window.YTCustomPlayer && window.YTCustomPlayer.openChannel) try {
+                    if (window.YTCustomPlayer.openChannel(e.browseId, ytCpChannelTab(e.params)) !== false) return
+                } catch (d) { }
                 var f;
                 e.params && (f = e.params);
                 var g;
@@ -25500,6 +25518,15 @@
 
         function Is(a) {
             return function (b, c) {
+                /* Every tile action (click, OK) is built here, so this is where a
+                   channel tile hands over to our channel web interface instead of
+                   to a watch page. See ytCpChannelTab above. */
+                try {
+                    var d = a && a.endpoint && a.endpoint.browseEndpoint;
+                    if (d && d.browseId && /^UC[\w-]{22}$/.test(d.browseId) && window.YTCustomPlayer && window.YTCustomPlayer.openChannel) {
+                        if (window.YTCustomPlayer.openChannel(d.browseId, ytCpChannelTab(d.params)) !== false) return
+                    }
+                } catch (e) { }
                 b.Ba("cmd-navigate-to-endpoint", [a, b, !!c])
             }
         }

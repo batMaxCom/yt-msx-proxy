@@ -397,7 +397,8 @@ app.get('/assets/:folder/*', (req, res) => {
     const redirectUrl = `/assets/${fileName}`;
     console.log(`Redirecting from /assets/${folder}/${requestedPath} to ${redirectUrl}`);
 
-    res.redirect(redirectUrl);
+    // keep ?v= so the asset cache bust in index.html actually reaches the file
+    return res.redirect(redirectUrl + (req.originalUrl.indexOf('?') >= 0 ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : ''));
 });
 
 app.get('/assets/:filename', (req, res) => {

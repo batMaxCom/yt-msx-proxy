@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261030g';
+    global.__CUSTOM_PLAYER_VERSION = '20261030i';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -1634,6 +1634,21 @@
         return doc.querySelector('#player') || doc.querySelector('#movie_player') || doc.body;
     }
 
+    /* The drawers also open from pages without a live player (a channel tile on
+       the search page), where #player is present but hidden, which would make
+       the drawer unrenderable. So they take the player only when it is on
+       screen, and fall back to the body otherwise. */
+    function overlayHost() {
+        var host = menuHost();
+        var body = global.document && global.document.body;
+        if (host && host !== body) {
+            try {
+                if (!host.getClientRects().length) host = null;
+            } catch (e) { }
+        }
+        return host || body;
+    }
+
     function qMenuOpen() {
         return !!(qMenu && qMenu.style && qMenu.style.display !== 'none');
     }
@@ -2257,7 +2272,7 @@
         var host = relPanel && relPanel.parentNode ? relPanel.parentNode : null;
         // the app re-renders the player's children, so a cached node can end up
         // detached; drop it and rebuild rather than toggling a node nobody sees
-        if (relPanel && host !== menuHost()) {
+        if (relPanel && host !== overlayHost()) {
             relPanel = null;
             relRows = [];
             relScroll = null;
@@ -2266,7 +2281,7 @@
         if (relPanel) return relPanel;
         var doc = global.document;
         if (!doc || !doc.createElement) return null;
-        host = menuHost();
+        host = overlayHost();
         if (!host) return null;
         var el = doc.createElement('div');
         el.id = 'yt-cp-related';
@@ -2588,7 +2603,7 @@
         var host = chnPanel && chnPanel.parentNode ? chnPanel.parentNode : null;
         // same stale-host guard as the related drawer: the app re-renders the
         // player's children, so a cached node can end up detached
-        if (chnPanel && host !== menuHost()) {
+        if (chnPanel && host !== overlayHost()) {
             chnPanel = null;
             chnRows = [];
             chnScroll = null;
@@ -2597,7 +2612,7 @@
         if (chnPanel) return chnPanel;
         var doc = global.document;
         if (!doc || !doc.createElement) return null;
-        host = menuHost();
+        host = overlayHost();
         if (!host) return null;
         var el = doc.createElement('div');
         el.id = 'yt-cp-channel';
