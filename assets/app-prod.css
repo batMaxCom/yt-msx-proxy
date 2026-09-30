@@ -9800,17 +9800,26 @@ h3.call-to-cast-text {
   pointer-events: auto
 }
 
+/*
+   The app centres its own glyphs with text-align:center plus a visible
+   .label; with the label hidden the icon would sit against the left edge of
+   the highlight (measured -12.76px horizontally) and ~1.4px low, so the box
+   centres the glyph itself. Height stays 1.3em + .8em + .4em = 2.5em, which
+   keeps the outer metrics of .player-controls #button-list .button.
+ */
 .yt-cp-nav-row .yt-cp-trbtn {
+  align-items: center;
   background-color: transparent;
   color: #aaa;
   cursor: pointer;
-  display: inline-block;
+  display: inline-flex;
   font-family: 'youtube-icons';
   font-size: 1.4em;
-  height: 1.3em;
+  height: 2.5em;
+  justify-content: center;
   margin: 1em 1em;
-  padding-bottom: .4em;
-  padding-top: .8em;
+  padding-bottom: 0;
+  padding-top: 0;
   speak: none;
   top: 0;
   vertical-align: middle;
