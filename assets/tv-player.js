@@ -16114,7 +16114,7 @@ isLoading = true;
                     var c = this.timing.D;
                     gA(this.timing);
                     this.timing.D - c >= .8 * this.A.D ? (this.J++, b = 5 <= this.J) : this.J = 0
-                } else b = this.timing, b = 5E3 < a - (b.g + 1E3 * b.F.delay);
+                } else b = this.timing, b = 5E3 < a - (b.g + 1E3 * (null == b.F ? 0 : b.F.delay));
                 b ? (b = this.timing, a = a > b.g && 4E12 > a ? a : A(), c = (a - b.g) / 1E3, 8192 <= b.b ? (b.B += (a - b.C) / 1E3, mA(b.o, b.H, b.B)) : oA(b.o, c), nA(b.o, c, b.b), pA(this), this.F = "net.timeout", dA(this, 7)) : this.C = S(y(this.Om, this),
                     this.A.D)
             }
@@ -16225,10 +16225,20 @@ isLoading = true;
         }
 
         function gA(a) {
+            /* a.F carries the network timing report. Without it there is nothing
+               to extrapolate from: the byterate term divides by zero, so a
+               zero-filled fallback produced Infinity/NaN and then armed the
+               stall watchdog with a nonsense deadline. Leave the deadline at 0
+               instead, which is what the caller treats as "not stalled". */
+            var F = a.F;
+            if (!F || !F.byterate) {
+                a.D = 0;
+                return
+            }
             var b = a.H - a.b,
-                b = 1E3 * (b * a.F.tailDelay + b / a.F.byterate),
+                b = 1E3 * (b * F.tailDelay + b / F.byterate),
                 c = A(),
-                b = 8192 <= a.b ? b + c : b + Math.max(c, a.g + 1E3 * a.F.delay);
+                b = 8192 <= a.b ? b + c : b + Math.max(c, a.g + 1E3 * F.delay);
             a.D = b
         };
 

@@ -1083,8 +1083,6 @@
     var SEEK_STEP = 10;
     var trSeen = false;
     var trVisible = false;
-    var trFocus = 'seekbar';   // 'seekbar' | 'buttons'
-    var trIdx = 0;
     var lastTrActive = 0;
 
     function trEl() { return global.document && global.document.querySelector('#transport-controls'); }
@@ -1099,7 +1097,6 @@
         return m + ':' + ('0' + ss).slice(-2);
     }
 
-    var trShown = null;                    // last visual transport state we applied
     function setTitleTray(visible) {
         var doc = global.document;
         var tray = doc && doc.getElementById('title-tray');
@@ -1109,23 +1106,21 @@
     }
 
     function setTransport(visible) {
-        if (trShown === visible) return;   // idempotent: called per mousemove/tick
-        trShown = visible;
         var tc = trEl();
         var w = watchSurface();
         if (visible) {
-            if (tc) tc.classList.remove('hidden');
+            if (tc) {
+                try { tc.classList.remove('hidden'); } catch (e) { }
+                try { tc.classList.remove('no-model'); } catch (e) { }
+            }
             if (w) w.classList.add('transport-showing');
-            setTitleTray(true);              // top title rides with the navigation
-            if (metaReady) metaShow();       // the panel lives and dies with the controls
-            // paint the freshly-shown transport with live values this frame, so a
-            // "0:00" flash from the app's own dead model can never be seen
-            try { syncUI(); } catch (e) { }
+            setTitleTray(true);
+            if (metaReady) metaShow();
         } else {
             if (tc) tc.classList.add('hidden');
             if (w) w.classList.remove('transport-showing');
             hideVideoMeta();
-            setTitleTray(false);             // ... and hides with it
+            setTitleTray(false);
         }
     }
 
@@ -1133,48 +1128,300 @@
         trVisible = true;
         lastTrActive = Date.now();
         setTransport(true);
-        if (trFocus !== 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); }
+        ensureNavRow();
+        renderTrFocus();
     }
 
-    function clearButtonFocus() {
-        var list = global.document && global.document.querySelectorAll('#button-list > div');
-        if (!list) return;
-        for (var i = 0; i < list.length; i++) {
-            try { list[i].classList.remove('focused'); list[i].classList.remove('selected'); } catch (e) { }
+    /* ---- transport navigation, in the order the user asked for ----
+         1. info, quality
+         2. the seek bar
+         3. previous, rewind, play/pause, forward, next, related
+
+       The app's own transport row cannot be used for this. Its #button-list is
+       not the skip/play row at all: on the watch screen it renders the More
+       Actions menu (subscribe / like / report / search), the previous / rewind /
+       play / forward / next entries only exist inside the player's own model,
+       and opening that menu takes the remote focus away for good. So the whole
+       row is ours: three zones walked with up/down, items within a zone with
+       left/right, and no dependency on what the app happens to have rendered. */
+    var TR_ZONE_TOP = 0;      // info, quality
+    var TR_ZONE_SEEK = 1;     // the seek bar
+    var TR_ZONE_ACTIONS = 2;  // prev, rew, play, ff, next, related
+
+    var trZone = TR_ZONE_SEEK;
+    var trZoneIdx = 0;
+    var trBtnEls = null;      // rebuilt by ensureNavRow()
+    // what the ring is currently painted on, so renderTrFocus() can skip the
+    // rewrite when nothing moved (syncUI polls it every 150ms)
+    var trFocusedEl = null, trFocusedCls = '', trPrevEl = null, trPrevCls = '';
+    var relBtn = null;        // our "Похожие" button
+
+    var TR_SPEC = [
+        { zone: TR_ZONE_TOP, id: 'yt-cp-infobtn', icon: 'icon-player-info', label: 'Инфо', act: 'info' },
+        { zone: TR_ZONE_TOP, id: 'yt-cp-qbtn', icon: 'icon-player-settings', label: 'Качество', act: 'quality' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-prevbtn', icon: 'icon-player-prev', label: 'Предыдущее', act: 'prev' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-rewbtn', icon: 'icon-player-rew', label: 'Назад', act: 'rew' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-playbtn', icon: 'icon-player-play', label: 'Играть', act: 'play' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-ffbtn', icon: 'icon-player-ff', label: 'Вперёд', act: 'ff' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-nextbtn', icon: 'icon-player-next', label: 'Следующее', act: 'next' },
+        { zone: TR_ZONE_ACTIONS, id: 'yt-cp-relbtn', icon: 'icon-playlist', label: 'Похожие', act: 'rel' }
+    ];
+
+    function trAct(name) {
+        switch (name) {
+            case 'info': return toggleInfoPanel();
+            case 'quality': return toggleQualityMenu();
+            case 'prev': return chainSkipPrev();
+            case 'next': return chainSkipNext();
+            case 'rel': return toggleRelPanel();
+            case 'rew': trSeek(-SEEK_STEP); return true;
+            case 'ff': trSeek(SEEK_STEP); return true;
+            case 'play': trTogglePlay(); return true;
+        }
+        return false;
+    }
+
+    function trSpecFor(zone, idx) {
+        var out = [], i;
+        for (i = 0; i < TR_SPEC.length; i++) if (TR_SPEC[i].zone === zone) out.push(TR_SPEC[i]);
+        if (!out.length) return null;
+        return out[((idx % out.length) + out.length) % out.length];
+    }
+
+    function trZoneCount(zone) {
+        var n = 0, i;
+        for (i = 0; i < TR_SPEC.length; i++) if (TR_SPEC[i].zone === zone) n++;
+        return n;
+    }
+
+    /* Index of a spec inside its own zone (the index the walk uses). */
+    function trSpecIndex(spec) {
+        var k = 0, i;
+        for (i = 0; i < TR_SPEC.length; i++) {
+            if (TR_SPEC[i].zone !== spec.zone) continue;
+            if (TR_SPEC[i] === spec) return k;
+            k++;
+        }
+        return 0;
+    }
+
+    /* The seek bar is the app's own element; it is only ever a focus target, and
+       the ring is ours so the walk stays visible whichever model is in charge. */
+    function seekBarEl() {
+        var tc = trEl();
+        if (!tc) return null;
+        return tc.querySelector('#progress-bar') || tc.querySelector('.progress-bar');
+    }
+
+    function renderTrFocus() {
+        var doc = global.document;
+        if (!doc) return;
+        // The element that is about to receive the ring, computed before anything
+        // is touched: syncUI runs every 150ms, and rewriting the classes and the
+        // inline shadow on every tick produced a steady stream of mutations for
+        // the app to react to, which is where the renderer spin came from.
+        var want = null, wantCls = '';
+        if (trZone === TR_ZONE_SEEK) {
+            var pb = seekBarEl();
+            if (pb) {
+                want = pb;
+                wantCls = 'yt-cp-focus';
+            }
+        } else {
+            var sp = trSpecFor(trZone, trZoneIdx);
+            if (sp && trBtnEls) {
+                want = trBtnEls[sp.id] || null;
+                wantCls = 'yt-cp-focus' + (sp.act === 'play' ? ' selected' : '');
+            }
+        }
+        if (want === trFocusedEl && wantCls === trFocusedCls) return;   // already painted
+        var i;
+        for (i = 0; i < 2; i++) {
+            var prev = i ? trFocusedEl : (trPrevEl || null);
+            var prevCls = i ? trFocusedCls : (trPrevCls || '');
+            if (!prev) continue;
+            try { prev.classList.remove('yt-cp-focus'); } catch (e) { }
+            try { prev.classList.remove('selected'); } catch (e) { }
+            trBlurStyle(prev);
+            try { prev.removeAttribute('data-yt-cp-pos'); } catch (e) { }
+        }
+        trPrevEl = trFocusedEl; trPrevCls = trFocusedCls;
+        trFocusedEl = want; trFocusedCls = wantCls;
+        if (!want) return;
+        // start from a clean slate: two rings at once is what made the selection
+        // look like it had jumped into an unrelated field
+        var old = doc.querySelectorAll('.yt-cp-focus');
+        for (i = 0; i < old.length; i++) {
+            try { old[i].classList.remove('yt-cp-focus'); } catch (e) { }
+            trBlurStyle(old[i]);
+        }
+        var sel = doc.querySelectorAll('.yt-cp-trbtn.selected');
+        for (i = 0; i < sel.length; i++) { try { sel[i].classList.remove('selected'); } catch (e) { } }
+        try { want.classList.add('yt-cp-focus'); } catch (e) { }
+        trFocusStyle(want);
+        if (wantCls.indexOf('selected') >= 0) {
+            try { want.classList.add('selected'); } catch (e) { }
+        }
+        if (wantCls === 'yt-cp-focus') {
+            var n = trZoneCount(trZone);
+            if (n > 1) {
+                try { want.setAttribute('data-yt-cp-pos', (trZoneIdx % n) + 1 + '/' + n); } catch (e) { }
+            }
         }
     }
 
-    function enabledButtons() {
-        var list = global.document && global.document.querySelectorAll('#button-list > div');
-        var out = [];
-        if (!list) return out;
-        for (var i = 0; i < list.length; i++) {
-            var cl = (typeof list[i].className === 'string') ? list[i].className : '';
-            if (/disabled/.test(cl)) continue;
-            out.push(list[i]);
-        }
-        return out;
+    /* Focus is styled by app-prod.css; the old inline glow is only cleared here. */
+    function trFocusStyle(el) {
+        // no visual work here: the ring used to be an inline glow, which painted a
+        // white halo over the 2px progress line and over the icon font. The look now
+        // comes from app-prod.css (.yt-cp-focus), same as the app's own buttons.
+        try { if (el && el.style) el.style.boxShadow = ''; } catch (e) { }
     }
 
-    function focusButton(idx) {
-        var bs = enabledButtons();
-        if (!bs.length) return;
-        trIdx = ((idx % bs.length) + bs.length) % bs.length;
-        clearButtonFocus();
-        var b = bs[trIdx];
-        try { b.classList.add('focused'); } catch (e) { }
-        if (/icon-player-play/.test(typeof b.className === 'string' ? b.className : '')) {
-            try { b.classList.add('selected'); } catch (e) { }
-        }
+    function trBlurStyle(el) {
+        try { if (el && el.style) el.style.boxShadow = ''; } catch (e) { }
     }
 
-    function navButtons(dir) {
-        var bs = enabledButtons();
-        if (!bs.length) return;
-        var cur = -1, i;
-        for (i = 0; i < bs.length; i++) { if (bs[i].classList.contains('focused')) cur = i; }
-        if (cur < 0) cur = trIdx;
-        focusButton(cur + dir);
+    function trFocusZone(zone, idx) {
+        trZone = zone;
+        if (idx !== undefined && idx !== null) trZoneIdx = idx;
+        var n = trZoneCount(zone);
+        if (n && trZoneIdx >= n) trZoneIdx = n - 1;
+        if (trZoneIdx < 0) trZoneIdx = 0;
+        renderTrFocus();
+    }
+
+    /* Left/right inside a zone; on the seek bar that still means scrubbing. */
+    function trNavHoriz(dir) {
+        if (trZone === TR_ZONE_SEEK) { trSeek(dir * SEEK_STEP); return; }
+        var n = trZoneCount(trZone);
+        if (!n) return;
+        trZoneIdx = ((trZoneIdx + dir) % n + n) % n;
+        renderTrFocus();
+    }
+
+    /* Up/down between the three zones, in the order the user listed them.
+       Entering a zone always starts at its first item: carrying the index over
+       from the zone above landed the remote on an unrelated control (play or
+       related instead of "Предыдущее видео"), which is how focus used to end up
+       somewhere the user had never pointed at. */
+    function trNavVert(dir) {
+        if (dir < 0) {
+            if (trZone === TR_ZONE_ACTIONS) trFocusZone(TR_ZONE_SEEK);
+            else trFocusZone(TR_ZONE_TOP, 0);
+            return;
+        }
+        if (trZone === TR_ZONE_TOP) trFocusZone(TR_ZONE_SEEK);
+        else if (trZone === TR_ZONE_SEEK) trFocusZone(TR_ZONE_ACTIONS, 0);
+    }
+
+    function trActivate() {
+        if (trZone === TR_ZONE_SEEK) { trTogglePlay(); return true; }
+        var sp = trSpecFor(trZone, trZoneIdx);
+        if (!sp) return false;
+        return trAct(sp.act);
+    }
+
+    /* Our transport, in two rows around the app's own seek bar:
+           row 1  info, quality
+           seek   the app's own #progress-bar
+           row 2  previous, rewind, play/pause, forward, next, related
+
+       The app's #button-list stays in the document but is not a navigation
+       target: the app re-renders it on every model update (on the watch screen
+       it is the More Actions menu, not the playback row), so anything we track
+       there is gone on the next tick. */
+    function ensureNavRow() {
+        var doc = global.document;
+        var tc = trEl();
+        if (!doc || !tc) return null;
+        var holder = tc;
+        var seek = seekBarEl();
+        var sb = (seek && seek.parentNode) ? seek.parentNode : null;   // .player-seekbar
+        if (sb && sb.parentNode) holder = sb.parentNode;
+
+        var top = doc.getElementById('yt-cp-nav-top');
+        var act = doc.getElementById('yt-cp-nav-actions');
+        if (!top || top.parentNode !== holder) {
+            if (top) { try { top.parentNode.removeChild(top); } catch (e0) { } }
+            top = doc.createElement('div');
+            top.id = 'yt-cp-nav-top';
+            trRowStyle(top);
+            if (sb && sb.parentNode) { try { sb.parentNode.insertBefore(top, sb); } catch (e) { } }
+            else { try { holder.insertBefore(top, holder.firstChild); } catch (e) { } }
+        }
+        if (!act || act.parentNode !== holder) {
+            if (act) { try { act.parentNode.removeChild(act); } catch (e0) { } }
+            act = doc.createElement('div');
+            act.id = 'yt-cp-nav-actions';
+            trRowStyle(act);
+            if (sb) { try { sb.parentNode.insertBefore(act, sb.nextSibling); } catch (e) { } }
+            else { try { holder.appendChild(act); } catch (e) { } }
+        }
+
+        var i, sp, el;
+        for (i = 0; i < TR_SPEC.length; i++) {
+            sp = TR_SPEC[i];
+            var host = sp.zone === TR_ZONE_ACTIONS ? act : top;
+            el = doc.getElementById(sp.id);
+            if (!el || el.parentNode !== host) {
+                var fresh = doc.createElement('div');
+                fresh.id = sp.id;
+                fresh.className = sp.icon + ' yt-cp-trbtn button';
+                fresh.setAttribute('tabindex', '-1');
+                fresh.setAttribute('aria-label', sp.label);
+                fresh.setAttribute('title', sp.label);
+                (function (spec) {
+                    var lab = doc.createElement('span');
+                    lab.className = 'label';
+                    lab.textContent = spec.label;
+                    fresh.appendChild(lab);
+                    // clicking a button moves the remote there first, so a mouse
+                    // user and a remote user always agree on where focus is
+                    fresh.addEventListener('mouseover', function () {
+                        var k = trSpecIndex(spec);
+                        trFocusZone(spec.zone, k);
+                    }, true);
+                    fresh.addEventListener('click', function (e) {
+                        if (e && e.preventDefault) e.preventDefault();
+                        if (e && e.stopPropagation) e.stopPropagation();
+                        trFocusZone(spec.zone, trSpecIndex(spec));
+                        trAct(spec.act);
+                        pokeTransport();
+                    });
+                })(sp);
+                try { host.appendChild(fresh); } catch (e2) { continue; }
+                el = fresh;
+                // a replaced node invalidates the painted ring
+                trFocusedEl = trPrevEl = null;
+                trFocusedCls = trPrevCls = '';
+            }
+            trBtnEls = trBtnEls || {};
+            trBtnEls[sp.id] = el;
+            if (sp.act === 'rel') relBtn = el;
+        }
+        trBtnEls = trBtnEls || {};
+        // The app's row is not a navigation target any more. It is left in the
+        // document but emptied, because the app re-renders it on every model
+        // update and would otherwise keep re-adding the "Похожие" button we
+        // used to inject into it as a duplicate.
+        var bl = doc.querySelector('#button-list');
+        if (bl) {
+            try { if (bl.style.display !== 'none') bl.style.display = 'none'; } catch (e) { }
+            if (bl.querySelector('.yt-cp-relbtn')) {
+                var stale = bl.querySelectorAll('.yt-cp-relbtn');
+                for (var s = 0; s < stale.length; s++) {
+                    try { if (stale[s].parentNode) stale[s].parentNode.removeChild(stale[s]); } catch (e2) { }
+                }
+            }
+        }
+        return act;
+    }
+
+    /* The rows carry no geometry of their own: app-prod.css gives them the app's
+       own button metrics, so nothing here can drift away from the native look. */
+    function trRowStyle(row) {
+        try { row.className = 'yt-cp-nav-row'; } catch (e) { }
     }
 
     function trSeek(delta) {
@@ -1208,29 +1455,21 @@
         trSyncIcon();
     }
 
-    function trPlayButton() {
-        var tc = trEl();
-        if (!tc) return null;
-        var list = tc.querySelectorAll('#button-list > div');
-        for (var i = 0; i < list.length; i++) {
-            var cl = typeof list[i].className === 'string' ? list[i].className : '';
-            if (/icon-player-play/.test(cl)) return list[i];
-        }
-        return null;
-    }
-
     /* The app's own player model never reports an isPlaying flip in our setup
-       (we own playback), so the transport play/pause glyph stays stuck on
-       "play". Drive the .toggle-selected class ourselves: the CSS renders the
-       pause glyph (e635) while it is present. */
+       (we own playback), so the play/pause glyph has to be driven here. The CSS
+       renders the pause glyph (e635) while .toggle-selected is present. */
     function trSyncIcon() {
-        var b = trPlayButton();
+        var b = trBtnEls && trBtnEls['yt-cp-playbtn'];
+        if (!b) b = global.document && global.document.getElementById('yt-cp-playbtn');
         if (!b) return;
         var playing = !!(active && active.engEl && !active.engEl.paused && !active.engEl.ended);
         try {
             if (playing) b.classList.add('toggle-selected');
             else b.classList.remove('toggle-selected');
         } catch (e) { }
+        var lab = b.querySelector('.label');
+        var t = playing ? 'Пауза' : 'Играть';
+        if (lab && lab.textContent !== t) lab.textContent = t;
     }
 
     function goHome() {
@@ -1600,14 +1839,13 @@
         healthStepUp();
     }
 
+    /* The quality label lives on our own transport button (ensureTopButtons);
+       this only keeps the app's own settings button in step, in case it ever
+       renders one. */
+    /* The app's own list is not a navigation target any more, so the level is
+       shown on our own quality button instead of on the app's hidden entry. */
     function updateQualityLabel() {
-        try {
-            var span = global.document && global.document.querySelector('#button-list .icon-player-settings .label');
-            if (span) {
-                var text = 'Quality: ' + qualityLabel();
-                if (span.textContent !== text) span.textContent = text;
-            }
-        } catch (e) { }
+        trQualityLabelSync();
     }
 
     /* ---- quality dropdown ----
@@ -1624,7 +1862,8 @@
     function qualityButton() {
         var doc = global.document;
         if (!doc) return null;
-        return doc.querySelector('#button-list .icon-player-settings') ||
+        return doc.querySelector('#yt-cp-qbtn') ||
+            doc.querySelector('#button-list .icon-player-settings') ||
             doc.querySelector('.icon-player-settings');
     }
 
@@ -2041,12 +2280,57 @@
        The top title-tray (#title-tray) still renders its round avatar + title, so
        the old bottom thumbnail/title/author panel (#yt-cp-meta) is now dead code
        and intentionally disabled: it only duplicated info at the bottom of the
-       player. */
+       player.
+
+       What is still needed is the app's own diagnostics panel: it is rendered on
+       every watch screen with live stream data, and settings.json can turn it off.
+       The transport's "Info" button drives it, so the toggle is honoured there
+       rather than being forced off from the tick. */
     var metaReq = 0;
     var metaReady = false;
+    var infoPanelUser = false;      // set once the user opened the panel themselves
+    var infoPanelShown = false;     // what the user last asked for, tracked explicitly
 
     function loadVideoMeta(id) {
         void id;   // bottom metadata panel disabled: keep the top title-tray only
+    }
+
+    function infoPanelEls() {
+        var doc = global.document;
+        if (!doc) return [];
+        var out = [], i, list = doc.querySelectorAll('#html5-video-info-panel, .html5-video-info-panel, #movie_player .html5-video-info, .video-info-panel');
+        for (i = 0; i < list.length; i++) out.push(list[i]);
+        return out;
+    }
+
+    function infoPanelOpen() {
+        var els = infoPanelEls(), i;
+        for (i = 0; i < els.length; i++) {
+            try { if (els[i].style.display !== 'none') return true; } catch (e) { }
+        }
+        return false;
+    }
+
+    function setInfoPanel(show) {
+        var els = infoPanelEls(), i;
+        for (i = 0; i < els.length; i++) {
+            try { els[i].style.display = show ? '' : 'none'; } catch (e) { }
+        }
+        var tvi = global.document && global.document.querySelector('.legend-item.toggle-video-info');
+        if (tvi) { try { tvi.style.display = show ? '' : 'none'; } catch (e) { } }
+        infoPanelUser = !!show;
+        infoPanelShown = !!show;
+        pokeTransport();
+        try { beacon('CP_INFO', { open: !!show }); } catch (e) { }
+    }
+
+    /* Toggled against our own state, not against the panel's computed style:
+       the app renders that panel on its own on some screens, so reading it back
+       meant the first press of the Info button could close a panel the user had
+       never opened. */
+    function toggleInfoPanel() {
+        setInfoPanel(!infoPanelShown);
+        return true;
     }
 
     function metaStyle() {
@@ -2132,6 +2416,9 @@
     /* One place that actually switches video: rewrites the hash (so the app's
        watch screen follows), drops the finished session and starts the target.
        dir is +1 for forward, -1 for backward. */
+    var CHAIN_SKIP_TRIES = 8;    // how many dead candidates a manual skip may roll through
+    var chainSkipTries = 0;
+
     function chainGo(entry, dir, manual) {
         if (!entry || !entry.id || chainBusy) return false;
         var cur = active ? active.id : getVideoId();
@@ -2140,6 +2427,11 @@
         chainPendingFor = '';
         chainAdvanceTo(entry);
         beacon(dir < 0 ? 'CP_CHAIN_PREV' : 'CP_CHAIN_NEXT', { from: cur, to: entry.id, title: entry.title });
+        /* Keep the ranking we are walking plus the video it belongs to: if the
+           target turns out to be dead we have to carry on down THIS list, not
+           ask for the dead video's own (empty) one. */
+        var fromId = cur || '';
+        var fromList = chainItems.slice();
           chainNavigate(entry.id);
           var el = global.document && global.document.querySelector('.html5-main-video');
           stopActive();                     // clears chainItems and chainBusy, so set it again
@@ -2151,7 +2443,32 @@
 
             startById(entry.id, el, function (ok) {
                 chainBusy = false;
-                if (ok) chainToast(entry, dir);
+                /* Rewriting the hash makes the app re-enter the watch screen, and
+                   its idle takeover starts the target on its own. startFromInfo
+                   then bails out with cb(false) because a session already exists,
+                   which is a success, not a dead candidate: rolling on here used
+                   to skip through the whole ranking and leave the user on some
+                   unrelated video. */
+                if (ok || (active && active.id === entry.id)) {
+                    chainSkipTries = 0;
+                    chainToast(entry, dir);
+                    return;
+                }
+                /* A candidate the backend cannot resolve (removed, private,
+                   region locked) used to leave the remote on a dead screen with
+                   no session: the hash moved but nothing ever started. Roll on to
+                   the next entry of the list we came from, for as long as the
+                   user keeps skipping. */
+                if (manual && dir > 0 && chainSkipTries < CHAIN_SKIP_TRIES) {
+                    chainSkipTries++;
+                    chainItems = fromList.filter(function (it) { return it && it.id !== entry.id; });
+                    chainFor = fromId;
+                    beacon('CP_CHAIN_SKIP_FAIL', { id: entry.id, try: chainSkipTries, left: chainItems.length });
+                    chainNext(fromId, true);
+                } else {
+                    chainSkipTries = 0;
+                    chainNotice('Видео недоступно');
+                }
             });
         } else {
             chainBusy = false;
@@ -3055,32 +3372,6 @@
         return true;
     }
 
-    /* Transport button. The app re-renders #button-list whenever its own player
-       model updates, so this is re-injected from syncUI instead of once. */
-    function ensureRelButton() {
-        var doc = global.document;
-        if (!doc) return null;
-        var list = doc.querySelector('#button-list');
-        if (!list) return null;
-        var b = list.querySelector('.yt-cp-relbtn');
-        if (b) { relBtn = b; return b; }
-        var el = doc.createElement('div');
-        el.className = 'yt-cp-relbtn icon-playlist button';
-        el.setAttribute('tabindex', '-1');
-        var lab = doc.createElement('span');
-        lab.className = 'label';
-        lab.textContent = 'Похожие';
-        el.appendChild(lab);
-        el.addEventListener('click', function (e) {
-            if (e && e.preventDefault) e.preventDefault();
-            if (e && e.stopPropagation) e.stopPropagation();
-            toggleRelPanel();
-        });
-        try { list.appendChild(el); } catch (e2) { return null; }
-        relBtn = el;
-        return el;
-    }
-
     function relLabelSync() {
         var b = relBtn;
         if (!b) return;
@@ -3090,39 +3381,18 @@
         if (lab && lab.textContent !== t) lab.textContent = t;
     }
 
+    /* The quality button carries the level in effect, so the row answers the
+       "what am I watching right now" question without opening the menu. */
+    function trQualityLabelSync() {
+        var b = trBtnEls && trBtnEls['yt-cp-qbtn'];
+        if (!b) return;
+        var lab = b.querySelector('.label');
+        var t = 'Качество: ' + qualityLabel();
+        if (lab && lab.textContent !== t) lab.textContent = t;
+    }
+
     readStoredQuality();
     readChainPref();
-
-    function openMoreActions() {
-        var list = global.document && global.document.querySelector('#button-list');
-        var view = list && list.Xb;
-        var component = view && view.parent;
-        if (component && typeof component.VU === 'function') {
-            try { component.VU(); return true; } catch (err) { }
-        }
-        var b = list && list.querySelector('.icon-ellipsis');
-        if (!b) return false;
-        try { b.click(); return true; } catch (err) { return false; }
-    }
-
-    function activateFocusedButton() {
-        var bs = enabledButtons();
-        if (!bs.length) return false;
-        var i, b = null;
-        for (i = 0; i < bs.length; i++) { if (bs[i].classList.contains('focused')) { b = bs[i]; break; } }
-        if (!b) return false;
-        var cl = typeof b.className === 'string' ? b.className : '';
-        if (/icon-player-play/.test(cl)) { trTogglePlay(); return true; }
-        if (/icon-player-next/.test(cl)) { return chainSkipNext(); }
-        if (/icon-player-prev/.test(cl)) { return chainSkipPrev(); }
-        if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); return true; }
-        if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); return true; }
-        if (/yt-cp-quality|icon-player-settings/.test(cl)) { return toggleQualityMenu(b); }
-        if (/yt-cp-relbtn/.test(cl)) { return toggleRelPanel(); }
-        if (/icon-ellipsis/.test(cl)) return openMoreActions();
-        if (/icon-home/.test(cl)) { goHome(); return true; }
-        return false;
-    }
 
     function syncUI() {
         try {
@@ -3141,7 +3411,11 @@
             bindInputElements();
             updateQualityLabel();
             samplePlaybackHealth();
-            if (ensureRelButton()) relLabelSync();
+            if (ensureNavRow()) {
+                relLabelSync();
+                trQualityLabelSync();
+                renderTrFocus();
+            }
             var tc = trEl();
             if (!tc) { trSeen = false; return; }
             if (!trSeen) {
@@ -3166,49 +3440,60 @@
                 var dur = el.duration;
                 var live = !(isFinite(dur) && dur > 0);
                 var pct = (!live && dur > 0) ? Math.min(100, ((ct / dur) * 100)) : 0;
+                // Every one of these writes is guarded: syncUI runs every 150ms
+                // and re-assigning an unchanged width/text still counts as a
+                // mutation, which the app reacts to on every tick.
                 var played = global.document.querySelector('#progress-bar .progress-bar-played');
                 var disc = global.document.querySelector('#progress-bar .progress-bar-disc');
                 var loaded = global.document.querySelector('#progress-bar .progress-bar-loaded');
-                if (played) played.style.width = pct + '%';
-                if (disc) disc.style.left = pct + '%';
+                var wPct = pct + '%';
+                if (played && played.style.width !== wPct) played.style.width = wPct;
+                if (disc && disc.style.left !== wPct) disc.style.left = wPct;
                 if (loaded) {
                     var bEnd = 0, i;
                     if (el.buffered) for (i = 0; i < el.buffered.length; i++) bEnd = Math.max(bEnd, el.buffered.end(i));
-                    loaded.style.width = (!live && dur > 0 ? Math.min(100, (bEnd / dur) * 100) : 0) + '%';
+                    var lPct = (!live && dur > 0 ? Math.min(100, (bEnd / dur) * 100) : 0) + '%';
+                    if (loaded.style.width !== lPct) loaded.style.width = lPct;
                 }
                 var et = global.document.querySelector('#player-time-elapsed');
                 var tt = global.document.querySelector('.player-time-total');
-                if (et) { et.textContent = fmtTime(ct); try { et.classList.remove('no-model'); } catch (err) { } }
-                if (tt) tt.textContent = live ? '' : fmtTime(dur);
+                if (et) {
+                    var etx = fmtTime(ct);
+                    if (et.textContent !== etx) et.textContent = etx;
+                    try { if (et.className.indexOf('no-model') >= 0) et.classList.remove('no-model'); } catch (err) { }
+                }
+                if (tt) {
+                    var ttx = live ? '' : fmtTime(dur);
+                    if (tt.textContent !== ttx) tt.textContent = ttx;
+                }
                 try { tc.classList.toggle('live-playback', !!live); } catch (err) { }
                 // the app renders skip/rewind/forward greyed out because its own
                 // player model never reports a state, we drive all of them
-                var sb = global.document.querySelectorAll('#button-list .icon-player-rew, #button-list .icon-player-ff, #button-list .icon-player-next, #button-list .icon-player-prev');
-                for (i = 0; i < sb.length; i++) try { sb[i].classList.remove('disabled'); } catch (err) { }
                 trSyncIcon();
                 // the 2016 app keeps its loading spinner forever because its own
                 // player model never reports "started" — hide it once we actually play
                 if (el.readyState >= 2 || (el.currentTime || 0) > 0) {
                     var spin = global.document.querySelector('#spinner');
-                    if (spin) spin.style.display = 'none';
+                    if (spin && spin.style.display !== 'none') spin.style.display = 'none';
                     var lid = global.document.querySelector('.loading-indicator');
-                    if (lid) lid.style.display = 'none';
+                    if (lid && lid.style.display !== 'none') lid.style.display = 'none';
                     var fid = global.document.querySelector('.fallback-loading-indicator');
-                    if (fid) fid.style.display = 'none';
+                    if (fid && fid.style.display !== 'none') fid.style.display = 'none';
                 }
             }
             if (appSettings.hideOnScreenNav) {
                 var legend = global.document.querySelector('#legend');
-                if (legend) legend.style.display = 'none';
+                if (legend && legend.style.display !== 'none') legend.style.display = 'none';
             }
-            if (!appSettings.showToggleVideoInfo) {
-                var tvi = global.document.querySelector('.legend-item.toggle-video-info');
-                if (tvi) tvi.style.display = 'none';
-                // NOTE: #title-tray and .player-video-text (top title + round avatar) are
-                // intentionally NOT hidden here — they are the persistent top header now.
-                var info = global.document.querySelectorAll('#html5-video-info-panel, .html5-video-info-panel, #movie_player .html5-video-info, .video-info-panel');
+            // NOTE: #title-tray and .player-video-text (top title + round avatar) are
+            // intentionally NOT hidden here — they are the persistent top header now.
+            if (!appSettings.showToggleVideoInfo && !infoPanelUser) {
+                // the setting only decides whether the panel can be opened from the
+                // app's own legend; once the user pressed our Info button the panel
+                // is theirs and must survive this tick
+                var info = infoPanelEls();
                 for (var ii = 0; ii < info.length; ii++) {
-                    try { info[ii].style.display = 'none'; } catch (e2) { }
+                    try { if (info[ii].style.display !== 'none') info[ii].style.display = 'none'; } catch (e2) { }
                 }
             }
         } catch (e) { }
@@ -3229,11 +3514,6 @@
                        swipe up/down = volume, drag the seekbar to scrub */
 
     function isWatchSurface() { return !!(watchSurface() && trEl()); }
-
-    function moreActionsOpen() {
-        var bl = global.document && global.document.querySelector('#button-list');
-        return !!(bl && bl.querySelector('.icon-ellipsis') && !bl.querySelector('.icon-player-play'));
-    }
 
     function isSnapped() {
         var w = watchSurface();
@@ -3304,8 +3584,10 @@
             var t = e.target;
             if (!t || !t.closest || !t.closest('#player,#movie_player')) return;
             changeVolume(e.deltaY < 0 ? 0.05 : -0.05);
+            // without passive:false the browser marks this listener passive and
+            // refuses the preventDefault, so the page scrolled behind the player
             if (e.preventDefault) e.preventDefault();
-        }, true);
+        }, { capture: true, passive: false });
 
         var tX = 0, tY = 0, tT = 0;
         doc.addEventListener('touchstart', function (e) {
@@ -3330,48 +3612,11 @@
         }, true);
     }
 
-    var btnEl = null, barEl = null;
+    var barEl = null;
 
     function bindInputElements() {
         var doc = global.document;
         if (!doc) return;
-
-        var bl = doc.querySelector('#button-list');
-        if (bl && bl !== btnEl) {
-            btnEl = bl;
-            bl.addEventListener('mouseover', function (e) {
-                    if (!isWatchSurface() || isSnapped()) return;
-                    var b = e.target && e.target.closest && e.target.closest('#button-list > div');
-                    if (!b) return;
-                    trVisible = true;
-                    trFocus = 'buttons';
-                    var bs = enabledButtons(), i;
-                    for (i = 0; i < bs.length; i++) if (bs[i] === b) { focusButton(i); break; }
-                    lastTrActive = Date.now();
-                }, true);
-                bl.addEventListener('click', function (e) {
-                    if (!isWatchSurface() || isSnapped()) return;
-                    var b = e.target && e.target.closest && e.target.closest('#button-list > div');
-                    if (!b) return;
-                    var cl = typeof b.className === 'string' ? b.className : '';
-                    var handled = false;
-                    if (/icon-player-play/.test(cl)) { trTogglePlay(); handled = true; }
-                    else if (/icon-player-next/.test(cl)) { chainSkipNext(); handled = true; }
-                    else if (/icon-player-prev/.test(cl)) { chainSkipPrev(); handled = true; }
-                    else if (/icon-player-rew/.test(cl)) { trSeek(-SEEK_STEP); handled = true; }
-                    else if (/icon-player-ff/.test(cl)) { trSeek(SEEK_STEP); handled = true; }
-                    else if (/yt-cp-quality|icon-player-settings/.test(cl)) { toggleQualityMenu(b); handled = true; }
-                    else if (/icon-home/.test(cl)) { goHome(); handled = true; }
-                    else if (/icon-ellipsis/.test(cl)) {
-                        trFocus = 'buttons';
-                    }
-                    pokeTransport();
-                    if (handled) {
-                        if (e.preventDefault) e.preventDefault();
-                        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-                    }
-                }, true);
-        }
 
         var bar = doc.querySelector('#progress-bar');
         if (bar && bar !== barEl) {
@@ -3449,6 +3694,12 @@
         handleKey(e);
     }
 
+    function isBackKey(e) {
+        var code = e.keyCode || e.which || 0;
+        return e.key === 'Escape' || e.key === 'Backspace' ||
+            code === 8 || code === 27 || code === 461 || code === 462;
+    }
+
     function handleKey(e) {
         var tgt = e.target;
         var tag = (tgt && (tgt.tagName || '')) || '';
@@ -3460,6 +3711,15 @@
         // ...and so does the related drawer, which must also win over the
         // transport's own arrow handling while it is up
         if (relOpenNow() && relPanelKey(e)) return;
+        // The info panel is a plain overlay without its own key handler, so it
+        // has to be closed here: otherwise Back/Escape would quit the video with
+        // the panel still covering it, and the user could not get the video back
+        if (infoPanelOpen() && isBackKey(e)) {
+            setInfoPanel(false);
+            if (e.preventDefault) e.preventDefault();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+            return;
+        }
         // the channel drawer does too, and it closes the related one first so
         // the two never fight over the same arrow key
         if (chnOpenNow()) {
@@ -3477,7 +3737,10 @@
         var snapped = false;
         try { snapped = w.classList.contains('snapped'); } catch (err) { }
         if (snapped) return;                       // let the app navigate the behind grid
-        if (moreActionsOpen()) return;
+        // The app's More Actions menu used to be a dead end: it re-rendered
+        // #button-list, took the remote focus, and every key we saw was answered
+        // with a bare return. Our navigation no longer reads that list at all, so
+        // there is nothing to recover from - the keys below are simply ours.
 
         var k = e.key || '';
         var code = e.keyCode || e.which || 0;
@@ -3547,27 +3810,26 @@
                 break;
             case 'ArrowLeft':
                 showTransport();
-                if (trFocus === 'buttons') navButtons(-1);
-                else trSeek(-SEEK_STEP);
+                trNavHoriz(-1);
                 eat();
                 break;
             case 'ArrowRight':
                 showTransport();
-                if (trFocus === 'buttons') navButtons(1);
-                else trSeek(SEEK_STEP);
+                trNavHoriz(1);
                 eat();
                 break;
             case 'ArrowDown':
                 showTransport();
-                if (trFocus === 'seekbar') { trFocus = 'buttons'; focusButton(0); eat(); }
+                trNavVert(1);
+                eat();
                 break;
             case 'ArrowUp':
                 showTransport();
-                if (openMoreActions()) { trFocus = 'buttons'; eat(); }
-                else if (trFocus === 'buttons') { trFocus = 'seekbar'; clearButtonFocus(); eat(); }
+                trNavVert(-1);
+                eat();
                 break;
             case 'Enter':
-                if (trVisible && trFocus === 'buttons' && activateFocusedButton()) eat();
+                if (trVisible && trActivate()) eat();
                 break;
             case 'Back':
             case 'Backspace':

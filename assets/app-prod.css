@@ -9787,6 +9787,98 @@ h3.call-to-cast-text {
 }
 
 /*
+   The app hides its own transport on this build, so the rows below are the
+   remote-driven ones from custom-player.js. They reuse the metrics of
+   .player-controls #button-list .button and the app's focus colours, so the
+   player keeps the native look instead of growing a custom widget.
+*/
+.yt-cp-nav-row {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: center;
+  pointer-events: auto
+}
+
+.yt-cp-nav-row .yt-cp-trbtn {
+  background-color: transparent;
+  color: #aaa;
+  cursor: pointer;
+  display: inline-block;
+  font-family: 'youtube-icons';
+  font-size: 1.4em;
+  height: 1.3em;
+  margin: 1em 1em;
+  padding-bottom: .4em;
+  padding-top: .8em;
+  speak: none;
+  top: 0;
+  vertical-align: middle;
+  width: 2.3em
+}
+
+.yt-cp-nav-row .yt-cp-trbtn .label {
+  display: none
+}
+
+.yt-cp-nav-row .yt-cp-trbtn:hover {
+  -webkit-border-radius: .05em;
+  background-color: #9d9495;
+  border-radius: .05em;
+  color: #000
+}
+
+.yt-cp-nav-row .yt-cp-trbtn.yt-cp-focus {
+  -webkit-border-radius: .05em;
+  background-color: #fff;
+  border-radius: .05em;
+  color: #222
+}
+
+#transport-controls.focused .yt-cp-nav-row .yt-cp-trbtn {
+  color: #fff
+}
+
+#transport-controls.focused .yt-cp-nav-row .yt-cp-trbtn.yt-cp-focus {
+  color: #222
+}
+
+/*
+   The seek bar is the app's own element, but the app's offset (-9em) assumed its
+   own button row, which this build no longer renders. The bar is anchored inside
+   the flow gap between the two remote rows so it keeps its native width, colours
+   and 2px line, and the focused state reuses the app's own progress palette
+   instead of a custom ring.
+*/
+#transport-controls .player-seekbar {
+  flex: 0 0 auto;
+  height: 24px
+}
+
+#transport-controls .player-seekbar .progress-bar {
+  height: 24px;
+  top: 0
+}
+
+#transport-controls .player-seekbar .progress-bar .progress-bar-playhead,
+#transport-controls .player-seekbar .progress-bar .progress-bar-line {
+  top: 11px
+}
+
+#progress-bar.yt-cp-focus .progress-bar-line div,
+#progress-bar.yt-cp-focus .progress-bar-playhead {
+  height: .242em
+}
+
+#progress-bar.yt-cp-focus .progress-bar-line .progress-bar-background {
+  background-color: rgba(255, 255, 255, .45)
+}
+
+#progress-bar.yt-cp-focus .progress-bar-line .progress-bar-loaded {
+  background-color: #fff
+}
+
+/*
    FILE ARCHIVED ON 02:14:33 Feb 28, 2016 AND RETRIEVED FROM THE
    INTERNET ARCHIVE ON 17:05:18 Jan 22, 2025.
    JAVASCRIPT APPENDED BY WAYBACK MACHINE, COPYRIGHT INTERNET ARCHIVE.
