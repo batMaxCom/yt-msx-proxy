@@ -13,7 +13,7 @@ const { configure: configurePublicOrigin, resolve: resolvePublicOrigin, createRe
 
 const { fetchGuideData } = require('./guide_api');
 
-const { handleSearchRequest } = require('./search_api');
+const { handleSearchRequest, handleSearchPageRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
 const { fetchRelated } = require('./related_api');
 const { handleChannelRequest } = require('./channel_api');
@@ -825,6 +825,11 @@ app.post('/api/next', async (req, res) => {
 
 
 app.post('/api/search', handleSearchRequest);
+
+// Same row, one page at a time: the client asks with a query for the first page
+// and with the token from the previous answer for every next one. Both halves go
+// to /search - /browse answers 400 on a search token. See back/search_api.js.
+app.post('/api/search/page', handleSearchPageRequest);
 
 
 // Related videos for the endless ("chain") playback mode: InnerTube /next with a

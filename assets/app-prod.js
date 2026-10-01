@@ -3594,7 +3594,12 @@
                     projection: k,
                     continuationData: a,
                     interpretRawResponse: x(this.zY, this),
-                    service: c
+                    service: c,
+                    /* Without a threshold the collection continuer never compares
+                       the window against the end of the model, so the row would sit
+                       at the twenty hits the first answer carried. One is enough:
+                       it fetches the page as the selection reaches the last tile. */
+                    continuerThresholdDistance: 1
                 }));
                 a = this.h.gK();
                 a && a["@inflater"] === b && a["@service"] === c || (this.h.model = null, a = x(b.f, b, c), a["@inflater"] = b, a["@service"] = c,
