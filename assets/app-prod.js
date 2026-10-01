@@ -31731,7 +31731,23 @@
             } else this.H.appendChild(a.H), this.sb(a)
         };
         d.Xt = function (a, b) {
-            return this.j ? this.j(a, b) : this.I.f(a, b)
+            if (this.j) {
+                /* this.j is the markup captured from the first child, so it can only
+                   ever rebuild that child's tile. Search rows mix channels and
+                   videos, so when the pooled tile's template disagrees with the
+                   renderer we have to drop it and inflate a fresh one. The raw item
+                   carries its renderer key rather than a pa, hence the lookup. */
+                if (b && a && b.oa) {
+                    var c = this.I.g.get("inflaterConfig", null),
+                        d = c && c[ub(a)];
+                    if (d && d.oa && d.oa !== b.oa) {
+                        var e = ze(d.oa, this.I.g);
+                        return e.model = a, e
+                    }
+                }
+                return this.j(a, b)
+            }
+            return this.I.f(a, b)
         };
         d.ready = function () {
             this.g.uS(this);
