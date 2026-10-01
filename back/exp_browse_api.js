@@ -641,7 +641,20 @@ function convertToV5(data, browseId) {
                             if (videoItem.tileRenderer) {
 
                                 const videoId = videoItem.tileRenderer.onSelectCommand?.watchEndpoint?.videoId || "";
-                               
+
+                                /* Music shelves mix two different things. A music video
+                                   is a tileRenderer with a watchEndpoint and is playable.
+                                   An album, playlist or mix has only a browseEndpoint
+                                   (browseId VL.../RD..., pageType MUSIC_PAGE_TYPE_*),
+                                   so videoId comes out empty and the tile we would
+                                   build is permanently dead: no thumbnail, no watch
+                                   target. Drop those instead of rendering a placeholder. */
+                                if (!videoId) {
+                                    console.log(`Dropping non-video tile in Item ${index}, Video ${videoIndex}: ${videoItem.tileRenderer.contentType || 'no contentType'}`);
+                                    delete videoItem.tileRenderer;
+                                    return;
+                                }
+
                                 const thumbnail = {
                                     thumbnails: [
                                         { url: `https://i.ytimg.com/vi/${videoId}/default.jpg`, width: 120, height: 90 },
@@ -653,13 +666,31 @@ function convertToV5(data, browseId) {
                                     ]
                                 };
 
-                                const metadata = videoItem.tileRenderer.metadata?.tileMetadataRenderer || {};
+const metadata = videoItem.tileRenderer.metadata?.tileMetadataRenderer || {};
 
-                                const titleText = metadata.title?.simpleText || "Untitled Video";
-                              
+                                /* TILE_STYLE_YTLR_CAROUSEL tiles carry no metadata block at all -
+                                   their title and byline live in the spotlight that the tile
+                                   paints when focused. Reading only `metadata` left every one
+                                   of them titled "Untitled Video". */
+                                const spotlight = videoItem.tileRenderer.onFocusCommand
+                                    ?.commandExecutorCommand?.commands
+                                    ?.map(c => c.updateCarouselHeaderCommand?.spotlight?.entityMetadataRenderer)
+                                    ?.find(Boolean) || {};
+                                const spotlightTexts = (spotlight.bylines || [])
+                                    .flatMap(b => (b.lineRenderer?.items || []).map(i => i.lineItemRenderer?.text))
+                                    .filter(Boolean);
+                                const spotlightPlain = spotlightTexts
+                                    .map(t => t.simpleText || t.runs?.map(r => r.text || '').join('') || '')
+                                    .filter(Boolean);
+
+                                const titleText = metadata.title?.simpleText
+                                    || spotlight.title?.runs?.map(r => r.text || '').join('')
+                                    || videoId;
+
                                 const viewCountText = (
                                     metadata.lines?.[1]?.lineRenderer?.items?.find(item => item.lineItemRenderer?.text?.simpleText?.includes('views'))?.lineItemRenderer?.text?.simpleText ||
                                     metadata.lines?.[1]?.lineRenderer?.items?.find(item => item.lineItemRenderer?.text?.accessibility?.accessibilityData?.label?.includes('views'))?.lineItemRenderer?.text?.accessibility?.accessibilityData?.label ||
+                                    spotlightPlain.find(t => /views/i.test(t)) ||
                                     "0 views"
                                 );
                                 
@@ -682,6 +713,13 @@ function convertToV5(data, browseId) {
                                     
                                     if (channelInfo && channelInfo.lineItemRenderer.text.runs[0]?.text) {
                                         channelName = channelInfo.lineItemRenderer.text.runs[0].text; // Extracting the channel name
+                                    }
+                                } else {
+                                    /* byline 0 is the artist/channel, byline 1 the view
+                                       count - take whichever is left. */
+                                    const spotByline = spotlightPlain.find(t => !/views|ago|song|episode/i.test(t));
+                                    if (spotByline) {
+                                        channelName = spotByline;
                                     }
                                 }
 
@@ -727,10 +765,19 @@ function convertToV5(data, browseId) {
                                 delete videoItem.tileRenderer; 
 
                                 console.log(`Converted tileRenderer to gridVideoRenderer in Item ${index}, Video ${videoIndex}, VideoId: ${videoId}`);
-                            } else {
-                                videoItem.gridVideoRenderer = {};
                             }
                         });
+
+                        /* Tiles we dropped above were left key-less, and a shelf whose
+                           every tile was an album/playlist would otherwise render as an
+                           empty row with a header. Purge both. */
+                        item.shelfRenderer.content.horizontalListRenderer.items =
+                            horizontalList.filter(v => v && Object.keys(v).length > 0);
+
+                        if (item.shelfRenderer.content.horizontalListRenderer.items.length === 0) {
+                            item.shelfRenderer.__drop = true;
+                            console.log(`Shelf ${index} (${headerText}) has no playable videos, dropping it`);
+                        }
                     }
 
                     console.log(`Processed shelfRenderer for Item ${index}: ${headerText}`);
@@ -741,6 +788,14 @@ function convertToV5(data, browseId) {
                 console.error(`Error processing item ${index}:`, err);
             }
         });
+
+        for (let i = sectionListRendererContents.length - 1; i >= 0; i--) {
+            if (sectionListRendererContents[i]?.shelfRenderer?.__drop) {
+                sectionListRendererContents[i].shelfRenderer = undefined;
+                delete sectionListRendererContents[i].shelfRenderer;
+                sectionListRendererContents.splice(i, 1);
+            }
+        }
     } else {
         console.warn('sectionListRenderer.contents is missing or not an array');
     }
