@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261002f';
+    global.__CUSTOM_PLAYER_VERSION = '20261002h';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -306,7 +306,22 @@
             manifestLoadingRetryDelay: 1000,
             levelLoadingTimeOut: 20000,
             fragLoadingTimeOut: 30000,
-            fragLoadingMaxRetry: 6
+            fragLoadingMaxRetry: 6,
+            // Buffering for a link that is not fast. The defaults assume a
+            // 30s/60MB forward buffer and give up on a segment after 4s, which
+            // on a slow connection is exactly the "it loads for a while and then
+            // freezes" failure. A deeper forward buffer plus a longer patience
+            // window turns those stalls into invisible waits.
+            maxBufferLength: 60,
+            maxMaxBufferLength: 120,
+            maxBufferSize: 120 * 1000 * 1000,
+            backBufferLength: 60,
+            maxLoadingDelay: 10000,
+            // Pull the first segment before the player asks for it, so the
+            // first frame does not wait on a full request/response round trip.
+            startFragPrefetch: true,
+            lowLatencyMode: false,
+            progressive: false
         });
         this._hls = hls;
         this._pendingQ = null;
@@ -323,6 +338,15 @@
         });
         hls.on(Hls.Events.ERROR, function (evt, data) {
             beacon('HLSJS_ERROR', { type: data && data.type, details: data && data.details, fatal: data && data.fatal });
+            // A rejected append is recoverable in place: repairing the buffer
+            // keeps the playhead and the download alive, whereas letting it
+            // escalate ends in a hard stop that the user sees as a freeze.
+            var details = data && data.details;
+            var ED = Hls.ErrorDetails || {};
+            if (details === ED.BUFFER_APPEND_ERROR || details === ED.MEDIA_ERROR) {
+                try { hls.recoverMediaError(); } catch (e1) { }
+                return;
+            }
             if (data && data.fatal) {
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR) try { hls.startLoad(); } catch (e) { }
             }
@@ -353,12 +377,25 @@
         var idx = -1, i;
         if (h) {
             for (i = 0; i < hls.levels.length; i++) if (hls.levels[i].height === h) { idx = i; break; }
+            // No exact rung: take the nearest one rather than silently dropping
+            // back to Auto, which used to make the menu look like a dead key.
+            if (idx < 0) {
+                var bestGap = Infinity;
+                for (i = 0; i < hls.levels.length; i++) {
+                    var gap = Math.abs(hls.levels[i].height - h);
+                    if (gap < bestGap) { bestGap = gap; idx = i; }
+                }
+            }
+            // A hand-picked level is not a ceiling: lifting the cap lets a later
+            // Auto selection climb again instead of staying pinned at this rung.
+            try { hls.autoLevelCapping = -1; } catch (e3) { }
         } else {
-            // auto = best available rendition: the manifest is already sorted
-            // ascending by BANDWIDTH, so the last level is the top quality.
-            // Cap ABR there too, otherwise the player could climb past it.
-            idx = hls.levels.length - 1;
-            try { hls.autoLevelCapping = idx; } catch (e2) { }
+            // Auto: hand the decision back to hls.js ABR. The cap is lifted
+            // rather than pinned to the top rung - ABR measures the link and
+            // settles where it can actually keep up, which is the whole point
+            // of having more than one level in the playlist.
+            idx = -1;
+            try { hls.autoLevelCapping = -1; } catch (e2) { }
         }
         try { hls.currentLevel = idx; } catch (e) { }
         beacon('HLSJS_Q', { h: h || 0, idx: idx, levels: hls.levels.length, auto: !h });
@@ -374,6 +411,12 @@
     var MSE_CHUNK = 4 * 1024 * 1024;      // steady state chunk
     var MSE_TARGET_AHEAD = 30;            // seconds of buffer to keep downloaded
     var MSE_POLL_MS = 500;
+    /* A rendition change on the MSE/progressive engines cannot be hidden: the
+       new stream starts at byte 0, so the buffer has to be rebuilt and the
+       playhead restored. That is a real stall every time, so a burst of
+       requests (a user cycling the menu, or the health guard reacting to the
+       stall it just caused) is collapsed into a single rebuild. */
+    var Q_SWITCH_DEBOUNCE_MS = 400;
     var MSE_CHUNK_TIMEOUT_MS = 45000;
     var MSE_MAX_RETRIES = 6;
 
@@ -446,6 +489,8 @@
         Engine.prototype.close.call(this);
         this._clearMetadata();
         this._stopPump();
+        if (this._qTimer) { clearTimeout(this._qTimer); this._qTimer = null; }
+        this._qPending = null;
         this._feeds = [];
         this._abortRequests();
         if (this._ms) {
@@ -769,10 +814,19 @@
         var video = this._selectVideo(h);
         if (!video || video === this._currentVideo) return;
         var el = this.conf && this.conf.el;
-        this._restoreTime = el ? (el.currentTime || 0) : 0;
-        this._shouldPlay = !!(el && el.paused === false);
-        this._openSource(video);
-        beacon('MSE_Q', { h: formatHeight(video) || 0, requested: h || 0 });
+        var self = this;
+        if (this._qTimer) clearTimeout(this._qTimer);
+        this._qPending = video;
+        this._qTimer = setTimeout(function () {
+            self._qTimer = null;
+            var target = self._qPending;
+            self._qPending = null;
+            if (!target || self.stopped || target === self._currentVideo) return;
+            self._restoreTime = el ? (el.currentTime || 0) : 0;
+            self._shouldPlay = !!(el && el.paused === false);
+            self._openSource(target);
+            beacon('MSE_Q', { h: formatHeight(target) || 0, requested: h || 0 });
+        }, Q_SWITCH_DEBOUNCE_MS);
     };
 
     function EngineNoop() { Engine.call(this); }
@@ -857,16 +911,27 @@
         var source = this._selectSource(h);
         if (!source || source === this._currentSource) return;
         var el = this.conf && this.conf.el;
-        this._restoreTime = el ? (el.currentTime || 0) : 0;
-        this._shouldPlay = !!(el && el.paused === false);
-        this._loadSource(source);
-        beacon('PROGRESSIVE_Q', { h: formatHeight(source) || 0, requested: h || 0 });
+        var self = this;
+        if (this._qTimer) clearTimeout(this._qTimer);
+        this._qPending = source;
+        this._qTimer = setTimeout(function () {
+            self._qTimer = null;
+            var target = self._qPending;
+            self._qPending = null;
+            if (!target || self.stopped || target === self._currentSource) return;
+            self._restoreTime = el ? (el.currentTime || 0) : 0;
+            self._shouldPlay = !!(el && el.paused === false);
+            self._loadSource(target);
+            beacon('PROGRESSIVE_Q', { h: formatHeight(target) || 0, requested: h || 0 });
+        }, Q_SWITCH_DEBOUNCE_MS);
     };
 
     EngineProgressive.prototype.close = function () {
         Engine.prototype.close.call(this);
         this._clearMetadata();
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+        if (this._qTimer) { clearTimeout(this._qTimer); this._qTimer = null; }
+        this._qPending = null;
     };
 
     /* ---------------- format picking ---------------- */
@@ -1166,6 +1231,18 @@
         hlsUrl = absUrl(hlsUrl);
         beacon('CP_START', { id: id, engine: null, hlsUrl: hlsUrl.slice(0, 80) });
         histBegin(id);                          // real playback started, unlike a prefetch
+        // hls.js must be handed the FULL ladder (see the engine branch below),
+        // never the ?q= pinned single rendition the other engines ask for:
+        // with ?q= present the backend serves exactly one variant and hls.js
+        // is back to a single level, with no ABR and nothing to switch to.
+        // A stored preference is applied through setPendingQ instead.
+        var hlsLevelsUrl = function (u) {
+            u = String(u || '');
+            u = u.replace(/([?&])q=\d+/gi, function (m, sep) { return sep === '?' ? '?' : ''; })
+                 .replace(/[?&]$/, '');
+            if (/[?&]levels=1\b/.test(u)) return u;
+            return u + (u.indexOf('?') < 0 ? '?' : '&') + 'levels=1';
+        };
 
         var eng = null;
         var engEl = el;
@@ -1188,8 +1265,15 @@
             qualityMode = 'hls';
             // hls.js on desktop: every TS segment is a small, fresh upstream
             // request proxied by /api/hls — no sustained-download throttling.
+            //
+            // The plain master playlist is trimmed to the single best rendition,
+            // which left hls.js with exactly ONE level: no ABR to fall back on
+            // and no level to switch to, so every quality change was a no-op and
+            // a slow link simply starved. levels=1 serves the whole ladder, and
+            // with it hls.js can switch rendition on a segment boundary without
+            // ever tearing down the buffer - that is the seamless path.
             engEl = makeOwnEl();
-            eng = new EngineHlsJs({ el: engEl, hlsUrl: hlsUrl });
+            eng = new EngineHlsJs({ el: engEl, hlsUrl: hlsLevelsUrl(hlsUrl) });
             if (eng._ok) eng.setPendingQ(wantH);
             beacon('CP_ENGINE', { k: 'hlsjs', id: id });
         } else {
@@ -1855,7 +1939,7 @@
        So starvation is measured on its own terms, and any one of the three signals
        is enough. Only ever touches Auto, and only a few times per video, so a single
        busy scene cannot walk a whole ladder and a struggling device cannot flap. */
-    var health = { at: 0, started: 0, progress: 0, media: -1, dropped: 0, total: 0, stalls: 0, bad: 0, good: 0, steps: 0, moves: 0, cycles: 0, id: '', own: false };
+    var health = { at: 0, started: 0, progress: 0, media: -1, dropped: 0, total: 0, stalls: 0, bad: 0, good: 0, steps: 0, moves: 0, cycles: 0, id: '', own: false, lastMove: 0 };
     var HEALTH_MS = 3000;            // sampling window
     var HEALTH_WARMUP_MS = 6000;     // wall clock, deliberately NOT currentTime: a
                                      // stream that dies before 6s must still be
@@ -1865,12 +1949,15 @@
     var HEALTH_STARVE_HARD_MS = 2400;// this much starving needs no second window
     var HEALTH_DROP_RATIO = 0.08;    // >8% dropped frames counts as "cannot keep up"
     var HEALTH_STALLS = 2;           // or this many rebuffer events in one window
-    var HEALTH_BAD_RUN = 2;          // bad windows before stepping down
+    var HEALTH_BAD_RUN = 3;          // bad windows before stepping down
     var HEALTH_CLEAN_RATIO = 0.02;   // and this clean, with no stalls, before stepping up
     var HEALTH_GOOD_RUN = 5;         // clean windows before climbing - deliberately slower
     var HEALTH_MAX_STEPS = 3;        // downgrades per cycle
     var HEALTH_MAX_MOVES = 8;        // level changes per cycle
     var HEALTH_MAX_CYCLES = 2;       // down-and-up round trips per video, then it stops
+    var HEALTH_COOLDOWN_MS = 15000;  // quiet period after a move: without it the
+                                     // guard reacts to its own consequences and
+                                     // walks the ladder while the stream recovers
 
 
     /* ---- continuous ("endless") playback state ---- */
@@ -2055,7 +2142,7 @@
         health.at = 0; health.started = 0; health.progress = 0; health.media = -1;
         health.dropped = 0; health.total = 0;
         health.stalls = 0; health.bad = 0; health.good = 0;
-        health.steps = 0; health.moves = 0; health.cycles = 0; health.own = false;
+        health.steps = 0; health.moves = 0; health.cycles = 0; health.own = false; health.lastMove = 0;
         health.id = active ? active.id : '';
     }
 
@@ -2063,17 +2150,33 @@
         if (active) health.stalls++;
     }
 
+    /* When hls.js is driving a real multi-level playlist it already measures the
+       link and drops a rung on its own, at a segment boundary, without touching
+       the buffer. Pinning a level from here would override a better mechanism
+       with a worse one, so the guard stands down and only guards the engines
+       that have no ABR of their own. */
+    function abrOwnsQuality() {
+        if (qualityMode !== 'hls') return false;
+        var eng = active && active.engine;
+        return !!(eng && eng._hls && eng._hls.levels && eng._hls.levels.length > 1);
+    }
+
     /* The guard may only act on Auto, or on a rung it moved to itself. A level the
        user picked by hand is off limits in both directions. */
     function healthMayAct() {
+        if (abrOwnsQuality()) return false;
         if (health.cycles > HEALTH_MAX_CYCLES) return false;
         if (health.moves >= HEALTH_MAX_MOVES) return false;
+        // Right after a move the buffer is still filling at the new rung; the
+        // windows that follow are the recovery, not evidence of a bad choice.
+        if (Date.now() - (health.lastMove || 0) < HEALTH_COOLDOWN_MS) return false;
         return qualityIdx < 0 || health.own;
     }
 
     function healthApply(idx) {
         health.moves++;
         health.own = true;
+        health.lastMove = Date.now();
         qualityIdx = idx;
         applyQuality();
         updateQualityLabel();
