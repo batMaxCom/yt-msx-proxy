@@ -959,7 +959,17 @@ app.get('/api/video-meta/:videoId', async (req, res) => {
  * the home feed re-ranking. The client groups the list into Today / Yesterday /
  * Earlier itself, so the answer is a flat newest-first array.
  */
+/* The journal is off until it is keyed on the viewer's own Google account
+   instead of a caller-supplied profile id - see back/history_store.js for the
+   reasoning. These routes answer "nothing stored" rather than 404 so the
+   client journal keeps working once the store is switched back on. */
+function historyDisabled(res) {
+    res.json({ ok: true, disabled: true, recorded: false, items: [], channels: [], videos: [] });
+    return true;
+}
+
 app.post('/api/history/play', async (req, res) => {
+    if (!historyStore.enabled) return historyDisabled(res);
     const profileId = resolveProfileId(req);
     const body = req.body || {};
     const videoId = String(body.video_id || '').trim();
@@ -995,6 +1005,7 @@ app.post('/api/history/play', async (req, res) => {
 });
 
 app.get('/api/history', async (req, res) => {
+    if (!historyStore.enabled) return historyDisabled(res);
     const profileId = resolveProfileId(req);
     try {
         const items = await historyStore.listHistory(profileId, req.query.limit);
@@ -1010,6 +1021,7 @@ app.get('/api/history', async (req, res) => {
 
 // Channel affinity derived from the journal: what the home feed should lean on.
 app.get('/api/history/affinity', async (req, res) => {
+    if (!historyStore.enabled) return historyDisabled(res);
     const profileId = resolveProfileId(req);
     try {
         const channels = await historyStore.affinity(profileId, req.query);
@@ -1025,6 +1037,7 @@ app.get('/api/history/affinity', async (req, res) => {
 });
 
 app.get('/api/history/stats', (req, res) => {
+    if (!historyStore.enabled) return historyDisabled(res);
     res.json({ profile_id: resolveProfileId(req), ...historyStore.stats(resolveProfileId(req)) });
 });
 

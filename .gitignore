@@ -10,3 +10,5 @@ node_modules/
 /screenshots/
 .ai/
 /back/streams/
+# OAuth client of our own GCP project for viewer sign-in. Secrets, never commit.
+/back/viewer_auth.env

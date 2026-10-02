@@ -594,6 +594,7 @@ function browseEnvelope(shelves) {
 }
 
 async function localHistoryBrowse(profileId) {
+    if (!historyStore.enabled) return [];
     const items = await historyStore.listHistory(profileId, 300);
     const buckets = new Map();
     for (const rec of items) {
@@ -733,6 +734,7 @@ function personalizeHomeShelves(data, affinityChannels, watched) {
 /* Applies the journal to a home feed. Without a profile - or with an empty
    journal - the feed is returned exactly as it came in. */
 async function personalizeHome(data, profileId) {
+    if (!historyStore.enabled) return data;
     if (!profileId) return data;
     try {
         const [channels, watched] = await Promise.all([

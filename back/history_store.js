@@ -357,7 +357,27 @@ function stats(profileId) {
     return { records: entry.records.size, counted, watch_seconds: seconds, min_watch_seconds: MIN_WATCH_SECONDS };
 }
 
+/* Local watch journal - OFF.
+ *
+ * The journal is keyed by a profile id that the caller supplies, and nothing
+ * proves the caller owns it. On a public host that means whoever names an id
+ * reads that profile's rows, and `default` - the historical fallback - is a
+ * well-known id anyone can type. Storage location does not help: the id travels
+ * in the request, and cookie or localStorage is not proof of anything to the
+ * server. Rows already on disk stay where they are, for the migration.
+ *
+ * The replacement keys the journal on the viewer's own Google account: the
+ * client proves who it is with an OAuth token, the server resolves the identity
+ * through the official API, and only then is a file read or written.
+ *
+ * One switch for the whole feature, because the Home feed and the History tab
+ * read this store directly and would otherwise keep serving rows after the API
+ * routes were closed. Every caller must consult historyStore.enabled.
+ */
+const ENABLED = false;
+
 module.exports = {
+    ENABLED,
     MIN_WATCH_SECONDS,
     isValidProfileId,
     recordPlay,
