@@ -5,3 +5,16 @@ logs
 .idea
 *.log
 /tmp
+
+# Runtime state. `COPY . .` would otherwise bake whatever happens to be on the
+# build host into the image, and the running container would then write over its
+# own layer. These come back through the named volumes in docker-compose.yml.
+# back/token holds OAuth tokens, which must never end up in an image layer.
+# settings.json is bind-mounted from the host (it is a file, not a directory);
+# without a bind mount the server recreates it with serverIp = localhost.
+/back/history/
+/back/token/
+/back/imgcache/
+/back/logs/
+/back/streams/
+/back/settings.json

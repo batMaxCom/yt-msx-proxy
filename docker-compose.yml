@@ -1,0 +1,66 @@
+# 2016YouTubeTV — single container (deploy/entrypoint.sh runs nginx + Node).
+#
+#   docker compose up -d --build      start
+#   docker compose logs -f            backend + nginx logs
+#   docker compose restart            keeps the volumes, so history/tokens stay
+#   docker compose down               keeps the volumes too
+#
+# The named volumes are the point of this file. Everything the backend writes at
+# runtime lands in the container's writable layer, which Docker throws away on
+# `docker rm`, `--force-recreate`, a rebuild or `docker system prune` - while the
+# per-device profile id lives in the browser's localStorage and does NOT survive
+# that. Without the volumes a recreate leaves every device pointing at a profile
+# whose file no longer exists, and its History looks permanently empty.
+#
+#   /app/back/token   OAuth tokens per paired account (device_<code>_oauth_token.json).
+#                     Losing this means re-pairing every account on the TV, so it
+#                     matters more than the history.
+#   /app/back/history per-profile watch history.
+#
+# All four directories are created by the app on first write
+# (history_store.js, oauth_api_v3_api.js, image_proxy.js, logger.js), so an empty
+# volume is a valid starting state.
+services:
+  youtubetv:
+    build: .
+    image: 2016youtubetv:latest
+    container_name: 2016youtubetv
+    restart: unless-stopped
+
+    ports:
+      # The only public entry: nginx in front, per the Dockerfile's port table.
+      - "8080:8080"
+      # Node directly, for debugging from the host. Bound to loopback on purpose:
+      # the TV never needs :8090, so it should not be reachable from the network.
+      - "127.0.0.1:8090:8090"
+      # 8070 (standalone cors-anywhere) is deliberately NOT published. The client
+      # uses /proxy on the backend, and exposing cors-anywhere turns this box into
+      # an open proxy. Uncomment only for local debugging.
+      # - "127.0.0.1:8070:8070"
+
+    volumes:
+      - history:/app/back/history
+      - token:/app/back/token
+      - imgcache:/app/back/imgcache
+      - logs:/app/back/logs
+      # settings.json is a file, so it needs a bind mount - a named volume would
+      # create a *directory* at this path and the server would fail to read it.
+      # The host copy must exist before the first `up`; it does today.
+      - ./back/settings.json:/app/back/settings.json
+
+    sysctls:
+      # Only the namespaced knobs are accepted here. net.core.* and the
+      # tcp_{r,w}mem triples from deploy/sysctl.conf are rejected by Docker
+      # ("sysctl is not allowed in this container"), so apply those on the host:
+      #   sudo sysctl -p deploy/sysctl.conf
+      net.ipv4.tcp_congestion_control: bbr
+
+    # BIND_ADDR=0.0.0.0 and CORS_PROXY_HOST=0.0.0.0 are already ENV in the
+    # Dockerfile; they must stay 0.0.0.0 or the backend binds to serverIp alone
+    # and nothing reaches it from outside the container.
+
+volumes:
+  history:
+  token:
+  imgcache:
+  logs:

@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261002h';
+    global.__CUSTOM_PLAYER_VERSION = '20261002j';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -63,28 +63,64 @@
        ?profile=<id> in the address bar picks one and remembers it. The id is
        mirrored into a cookie because the 2016 app builds its own /api/browse
        URLs and cannot be given a header - without the cookie the History tab
-       would always show the default profile's rows. */
+       would always show the default profile's rows.
+
+       When nothing has been chosen we mint a random id instead of settling for
+       "default". "default" is one shared bucket on the server, so every device
+       that never picked a name would otherwise pile its viewing into the same
+       list and each would see what the others watched. A per-device id is what
+       makes the histories separate without anyone having to do anything. */
     function histProfileId() {
         try {
             var ls = global.localStorage;
+            // An explicit ?profile= is a deliberate choice, so it outranks
+            // whatever is already stored. It is also the only way to switch or
+            // rename a profile later: if the stored id always won, the first
+            // value ever picked could never be changed.
+            var m = /[?&]profile=([A-Za-z0-9._-]{1,64})/.exec(String((global.location && global.location.search) || ''));
+            var v = m ? m[1] : null;
             if (ls) {
-                var v = ls.getItem(HIST_PROFILE_KEY);
-                if (!v) {
-                    var m = /[?&]profile=([A-Za-z0-9._-]{1,64})/.exec(String((global.location && global.location.search) || ''));
-                    if (m) { ls.setItem(HIST_PROFILE_KEY, m[1]); v = m[1]; }
-                }
-                if (v && /^[A-Za-z0-9._-]{1,64}$/.test(v)) {
-                    try {
-                        if (cookieValue('yt_profile_id') !== v) {
-                            global.document.cookie = 'yt_profile_id=' + encodeURIComponent(v) +
-                                '; path=/; max-age=31536000; SameSite=Lax';
-                        }
-                    } catch (e) { }
-                    return v;
+                if (v) {
+                    try { ls.setItem(HIST_PROFILE_KEY, v); } catch (e0) { }
+                } else {
+                    v = ls.getItem(HIST_PROFILE_KEY);
+                    if (!v) {
+                        v = newHistProfileId();
+                        try { ls.setItem(HIST_PROFILE_KEY, v); } catch (e1) { }
+                        beacon('CP_PROFILE_NEW', { profile: v });
+                    }
                 }
             }
+            if (v && /^[A-Za-z0-9._-]{1,64}$/.test(v)) {
+                try {
+                    if (cookieValue('yt_profile_id') !== v) {
+                        global.document.cookie = 'yt_profile_id=' + encodeURIComponent(v) +
+                            '; path=/; max-age=31536000; SameSite=Lax';
+                    }
+                } catch (e) { }
+                return v;
+            }
         } catch (e) { }
+        // No usable storage (private mode, storage disabled). Falling back to the
+        // shared "default" is honest here: without localStorage there is nothing
+        // stable to keep a generated id in, so per-viewer history cannot work.
         return 'default';
+    }
+
+    /* 128 bits of entropy, hex, so the id is unguessable and matches the
+       /^[A-Za-z0-9._-]{1,64}$/ shape the server accepts. */
+    function newHistProfileId() {
+        try {
+            var c = global.crypto;
+            if (c && typeof c.getRandomValues === 'function') {
+                var b = new Uint8Array(16);
+                c.getRandomValues(b);
+                var s = '';
+                for (var i = 0; i < b.length; i++) s += (b[i] + 0x100).toString(16).slice(1);
+                return 'p' + s;
+            }
+        } catch (e) { }
+        return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
     }
 
     function cookieValue(name) {
@@ -4356,6 +4392,9 @@
                 ? { id: histSession.id, watched: Math.round(histSession.watched), reported: Math.round(histSession.reported), profile: histProfileId() }
                 : null;
         },
+        /* Which profile this browser is writing under, so it can be told apart
+           from the others sharing the backend. */
+        getProfile: function () { return histProfileId(); },
         stop: stopActive,
         _remount: remount,
         _engineEl: function () { return active ? active.engEl : null; }
