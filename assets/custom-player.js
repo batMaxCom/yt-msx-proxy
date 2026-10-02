@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261002d';
+    global.__CUSTOM_PLAYER_VERSION = '20261002f';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -39,20 +39,6 @@
         x.open('GET', url, true);
         x.onreadystatechange = function () { if (x.readyState === 4) cb(x.status >= 200 && x.status < 400 ? (x.responseText || '') : null); };
         x.send(null);
-    }
-
-    function xhrArray(url, ok, fail) {
-        var x = new XMLHttpRequest();
-        x.open('GET', url, true);
-        x.responseType = 'arraybuffer';
-        x.onreadystatechange = function () {
-            if (x.readyState === 4) {
-                if (x.status >= 200 && x.status < 400) ok(x.response);
-                else if (fail) fail(x.status);
-            }
-        };
-        x.send(null);
-        return x;
     }
 
     /* ---- local watch journal ----
@@ -378,6 +364,19 @@
         beacon('HLSJS_Q', { h: h || 0, idx: idx, levels: hls.levels.length, auto: !h });
     };
 
+    /* Incremental fetch tuning for the MSE engine.
+       The engine used to pull each stream in a single response, so a long video
+       had to arrive in full before the first frame was appended - on a slow link
+       that simply never finished. Streams are now read in bounded Range chunks
+       and the download is throttled to stay a little ahead of playback, which
+       also keeps memory flat instead of holding the whole file in one buffer. */
+    var MSE_FIRST_CHUNK = 1024 * 1024;   // init segment + first clusters: fast start
+    var MSE_CHUNK = 4 * 1024 * 1024;      // steady state chunk
+    var MSE_TARGET_AHEAD = 30;            // seconds of buffer to keep downloaded
+    var MSE_POLL_MS = 500;
+    var MSE_CHUNK_TIMEOUT_MS = 45000;
+    var MSE_MAX_RETRIES = 6;
+
     function EngineMseWebm(conf) {
         this.conf = conf;
         Engine.call(this);
@@ -385,6 +384,8 @@
         if (!this._videoLinks.length && conf.video) this._videoLinks = [conf.video];
         this._audio = conf.audio || null;
         this._requests = [];
+        this._feeds = [];
+        this._pump = null;
         this._generation = 0;
         this._objectUrl = '';
         this._videoSb = null;
@@ -434,9 +435,18 @@
         this._requests = [];
     };
 
+    EngineMseWebm.prototype._stopPump = function () {
+        if (this._pump) {
+            clearInterval(this._pump);
+            this._pump = null;
+        }
+    };
+
     EngineMseWebm.prototype.close = function () {
         Engine.prototype.close.call(this);
         this._clearMetadata();
+        this._stopPump();
+        this._feeds = [];
         this._abortRequests();
         if (this._ms) {
             try { if (this._ms.readyState === 'open') this._ms.endOfStream(); } catch (e) { }
@@ -451,6 +461,8 @@
         if (this.stopped) return;
         if (!video || !video.url) { beacon('MSE_SOURCE_FAIL', { reason: 'video' }); return; }
         var generation = ++this._generation;
+        this._stopPump();
+        this._feeds = [];
         this._abortRequests();
         this._clearMetadata();
         var self = this;
@@ -492,49 +504,221 @@
             catch (e) { beacon('MSE_VIDEOSB_FAIL', { m: videoMime, e: String(e) }); return; }
             try { if (self._audio) self._audioSb = ms.addSourceBuffer(audioMime); }
             catch (e) { self._audioSb = null; }
-            self._loadStream(video.url, self._videoSb, function () {
+            // Audio no longer waits for the whole video file: it is pulled as
+            // soon as the video has its first chunk, otherwise a long video
+            // would stay silent until it finished downloading.
+            var audioStarted = false;
+            var startAudio = function () {
+                if (audioStarted) return;
+                audioStarted = true;
                 if (self.stopped || generation !== self._generation) return;
                 if (self._audioSb && self._audio) self._loadStream(self._audio.url, self._audioSb, null, null, generation);
-            }, function () { self._boot(generation); }, generation);
+            };
+            self._loadStream(video.url, self._videoSb, null, function () {
+                startAudio();
+                self._boot(generation);
+            }, generation);
         });
     };
 
+    /* ---- incremental Range feed ------------------------------------------
+           One stream = one SourceBuffer fed by successive bounded Range reads.
+           `next` is the resume point, so a dropped connection costs one chunk,
+           not the whole file. Nothing is requested while the buffer is already
+           comfortably ahead of the playhead. */
+
     EngineMseWebm.prototype._loadStream = function (url, sb, done, onFirst, generation) {
-        var self = this, firstFired = false, finished = false;
-        var current = function () { return !self.stopped && generation === self._generation; };
+        var self = this;
         this._pending++;
-        var fireFirst = function () {
-            if (firstFired || !current()) return;
-            firstFired = true;
-            beacon('MSE_FIRST_APPEND', { len: sb.buffered && sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : -1 });
-            if (onFirst) onFirst();
-        };
-        var finish = function () {
-            if (finished) return;
-            finished = true;
-            // done() may start the audio stream, which bumps _pending again
-            if (done && current()) done();
-            self._pending--;
-            self._endOfStreamWhenComplete();
-        };
-        var append = function (buf) {
-            if (!current()) { finish(); return; }
-            var go = function () {
-                if (!current()) { finish(); return; }
-                try { sb.appendBuffer(buf); }
-                catch (e) { beacon('MSE_APPEND_FAIL', { e: String(e), bytes: buf.byteLength }); finish(); return; }
-                beacon('MSE_FULL', { bytes: buf.byteLength, b: sb.buffered && sb.buffered.length ? +sb.buffered.end(sb.buffered.length - 1).toFixed(1) : -1, rs: self.conf.el.readyState });
-                fireFirst();
-                finish();
-            };
-            if (sb.updating) sb.addEventListener('updateend', function h() { sb.removeEventListener('updateend', h); go(); });
-            else go();
-        };
-        var request = xhrArray(url, append, function (st) {
-            if (current()) beacon('MSE_FETCH_FAIL', { s: st });
-            finish();
+        this._feeds.push({
+            url: url,
+            sb: sb,
+            next: 0,
+            total: 0,
+            firstDone: false,
+            firedFirst: false,
+            done: false,
+            eof: false,
+            fails: 0,
+            xhr: null,
+            onFirst: onFirst || null,
+            doneCb: done || null,
         });
-        if (request) this._requests.push(request);
+        beacon('MSE_FEED', { url: String(url).slice(-46) });
+        this._maybeStartPump();
+        this._pumpFeeds(generation);
+    };
+
+    /* Seconds of media buffered past the playhead, or -1 when nothing is
+       buffered around it yet. */
+    EngineMseWebm.prototype._bufferedAhead = function () {
+        var el = this.conf && this.conf.el;
+        if (!el || !el.buffered || !el.buffered.length) return -1;
+        var ct = el.currentTime || 0, end = -1;
+        for (var i = 0; i < el.buffered.length; i++) {
+            if (el.buffered.start(i) <= ct + 0.25 && el.buffered.end(i) > end) end = el.buffered.end(i);
+        }
+        return end < 0 ? -1 : end - ct;
+    };
+
+    EngineMseWebm.prototype._wantsMore = function (st) {
+        if (st.eof || st.done) return false;
+        // Once the last byte is in there must be no further request: asking for
+        // bytes=total- would only earn a 416 from upstream.
+        if (st.total && st.next >= st.total) return false;
+        if (!st.firstDone) return true;
+        var ahead = this._bufferedAhead();
+        if (ahead < 0) return true;
+        return ahead < MSE_TARGET_AHEAD;
+    };
+
+    EngineMseWebm.prototype._maybeStartPump = function () {
+        if (this._feeds.length && !this._pump && !this.stopped) {
+            var self = this;
+            this._pump = setInterval(function () { self._pumpFeeds(self._generation); }, MSE_POLL_MS);
+        }
+    };
+
+    EngineMseWebm.prototype._pumpFeeds = function (generation) {
+        if (this.stopped || generation !== this._generation) return;
+        for (var i = 0; i < this._feeds.length; i++) {
+            var st = this._feeds[i];
+            if (st.done || st.xhr) continue;
+            if (st.sb.updating) continue;      // let the previous append drain
+            if (!this._wantsMore(st)) continue;
+            this._fetchChunk(st, generation);
+        }
+    };
+
+    EngineMseWebm.prototype._fetchChunk = function (st, generation) {
+        var self = this;
+        var size = st.firstDone ? MSE_CHUNK : MSE_FIRST_CHUNK;
+        var start = st.next, end = start + size - 1;
+        var x = new XMLHttpRequest();
+        var settled = false;
+        st.xhr = x;
+
+        x.open('GET', st.url, true);
+        x.responseType = 'arraybuffer';
+        try { x.timeout = MSE_CHUNK_TIMEOUT_MS; } catch (e0) { }
+        try { x.setRequestHeader('Range', 'bytes=' + start + '-' + end); } catch (e1) { }
+
+        var settle = function (fn) {
+            if (settled) return;
+            settled = true;
+            st.xhr = null;
+            // A settled request can no longer be aborted, so stop tracking it:
+            // one entry per chunk would otherwise pile up for the whole file.
+            var qi = self._requests.indexOf(x);
+            if (qi >= 0) self._requests.splice(qi, 1);
+            if (self.stopped || generation !== self._generation) return;
+            fn();
+        };
+        x.onreadystatechange = function () {
+            if (x.readyState !== 4) return;
+            if (x.status >= 200 && x.status < 300) settle(function () { self._onChunk(st, x, generation); });
+            else settle(function () { self._onChunkFail(st, 'http_' + x.status, generation); });
+        };
+        x.onerror = function () { settle(function () { self._onChunkFail(st, 'network', generation); }); };
+        x.ontimeout = function () { settle(function () { self._onChunkFail(st, 'timeout', generation); }); };
+
+        this._requests.push(x);
+        try { x.send(null); } catch (e2) { settle(function () { self._onChunkFail(st, 'send', generation); }); }
+    };
+
+    /* Run `cb` once the SourceBuffer is not mid-append. */
+    EngineMseWebm.prototype._afterAppend = function (st, cb) {
+        if (!st.sb.updating) { cb(); return; }
+        var h = function () {
+            try { st.sb.removeEventListener('updateend', h); } catch (e) { }
+            cb();
+        };
+        try { st.sb.addEventListener('updateend', h); } catch (e2) { cb(); }
+    };
+
+    EngineMseWebm.prototype._onChunk = function (st, x, generation) {
+        var self = this;
+        var cr = x.getResponseHeader('Content-Range') || '';
+        var m = /\/(\d+)\s*$/.exec(cr);
+        if (m) st.total = parseInt(m[1], 10);
+        var buf = x.response;
+
+        if (!buf || !buf.byteLength) {
+            if (st.total && st.next >= st.total) this._finishFeed(st);
+            else this._onChunkFail(st, 'empty', generation);
+            return;
+        }
+
+        this._afterAppend(st, function () {
+            if (self.stopped || generation !== self._generation) return;
+            try { st.sb.appendBuffer(buf); }
+            catch (e) {
+                beacon('MSE_APPEND_FAIL', { e: String(e), bytes: buf.byteLength, next: st.next });
+                self._onChunkFail(st, 'append', generation);
+                return;
+            }
+            var onUp = function () {
+                try { st.sb.removeEventListener('updateend', onUp); } catch (e) { }
+                st.next += buf.byteLength;
+                st.firstDone = true;
+                st.fails = 0;
+                beacon('MSE_CHUNK', {
+                    bytes: buf.byteLength,
+                    next: st.next,
+                    total: st.total,
+                    pct: st.total ? Math.round(st.next * 100 / st.total) : -1,
+                    ahead: self._bufferedAhead(),
+                });
+                if (!st.firedFirst) {
+                    st.firedFirst = true;
+                    beacon('MSE_FIRST_APPEND', { len: self._bufferedAhead() });
+                    if (st.onFirst) st.onFirst();
+                }
+                if (st.total && st.next >= st.total) {
+                    st.eof = true;
+                    self._finishFeed(st);
+                }
+            };
+            try {
+                if (st.sb.updating) st.sb.addEventListener('updateend', onUp);
+                else onUp();
+            } catch (e3) { self._onChunkFail(st, 'updateend', generation); }
+        });
+    };
+
+    EngineMseWebm.prototype._onChunkFail = function (st, reason, generation) {
+        if (this.stopped || generation !== this._generation) return;
+        // A response that lands after the feed was already retired (e.g. a late
+        // 416 for a range past EOF) must not log a retry or restart the pump.
+        if (st.done) return;
+        st.fails++;
+        if (st.fails > MSE_MAX_RETRIES) {
+            beacon('MSE_FEED_GIVEUP', { reason: reason, next: st.next, total: st.total });
+            this._finishFeed(st);
+            return;
+        }
+        var delay = Math.min(5000, 700 * Math.pow(2, st.fails - 1));
+        beacon('MSE_RETRY', { reason: reason, next: st.next, fails: st.fails, delay: delay });
+        var self = this;
+        setTimeout(function () { self._pumpFeeds(generation); }, delay);
+    };
+
+    EngineMseWebm.prototype._finishFeed = function (st) {
+        if (st.done) return;
+        st.done = true;
+        this._pending = Math.max(0, this._pending - 1);
+        var idx = this._feeds.indexOf(st);
+        if (idx >= 0) this._feeds.splice(idx, 1);
+        beacon('MSE_FEED_DONE', { next: st.next, total: st.total, pct: st.total ? Math.round(st.next * 100 / st.total) : -1 });
+        var cb = st.doneCb;
+        st.doneCb = null;
+        if (cb) { try { cb(); } catch (e) { } }
+        if (!this._feeds.length) this._stopPump();
+        this._endOfStreamWhenComplete();
+    };
+
+    EngineMseWebm.prototype._feedsBusy = function () {
+        return this._feeds.length > 0;
     };
 
     EngineMseWebm.prototype._endOfStreamWhenComplete = function () {
@@ -559,7 +743,20 @@
             if (!self._shouldPlay) return;
             var p = el.play();
             if (p && p.catch) p.catch(function () { });
-            if (tries++ < 10) setTimeout(kick, 2500);
+            tries++;
+            // While chunks are still arriving the decoder legitimately has
+            // nothing to show, so keep waiting patiently: remounting here would
+            // throw away the partial buffer and restart the download - exactly
+            // the failure this engine had on slow links.
+            if (self._feedsBusy()) {
+                if (tries <= 60) setTimeout(kick, 2000);
+                else {
+                    try { beacon('MSE_SLOW_WAIT', { t: Math.round((el.currentTime || 0) * 10) / 10, rs: rs }); } catch (e) { }
+                    setTimeout(kick, 5000);
+                }
+                return;
+            }
+            if (tries <= 10) setTimeout(kick, 2500);
             else {
                 try { beacon('MSE_REMOUNT', { t: Math.round((el.currentTime || 0) * 10) / 10, rs: rs }); } catch (e) { }
                 if (global.YTCustomPlayer && global.YTCustomPlayer._remount) global.YTCustomPlayer._remount(self.conf.el);
