@@ -34,6 +34,8 @@ const bodyParser = require('body-parser');
 const oauthRouter = require('./oauth_api_v3_api.js');
 
 const watchPageInteractions = require('./watch_page_interactions_apis');
+const historyStore = require('./history_store');
+const tokenStore = require('./token_store');
 const { registerMsxRoutes, isMsxPath } = require('./msx');
 
 
@@ -552,7 +554,7 @@ app.get('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req));
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), resolveProfileId(req));
         res.json(browseData);
     } catch (error) {
         console.error('Error:', error.message);
@@ -738,11 +740,46 @@ app.all('/api/lounge/bc/bind', async (req, res) => {
 
 
 
-// The 2016 client sends its OAuth bearer when the user paired an account.
+// The 2016 client sends its OAuth bearer when the user paired an account. If it
+// did not, fall back to the newest saved token, refreshing it when it is close to
+// expiry - see back/token_store.js. Token values are never logged.
 function bearerOf(req) {
     const h = req.headers.authorization || req.headers.Authorization;
-    if (!h || typeof h !== 'string') return null;
-    return h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (h && typeof h === 'string') {
+        const v = h.trim();
+        if (v.startsWith('Bearer ') && v.length > 7) return v.slice(7);
+    }
+    return tokenStore.getAccessToken();
+}
+
+// Local watch journal. The backend is shared by several viewers, so every request
+// has to say who it is: the profile id picks the file under back/history/, and an
+// absent or malformed one falls back to the shared "default" profile.
+//
+// The client mirrors the id into a cookie (see histProfileId in
+// assets/custom-player.js) because the 2016 app builds its own /api/browse URLs
+// and cannot be given a header - without the cookie only the journal requests,
+// which do send the header, would be per-viewer.
+const DEFAULT_PROFILE_ID = 'default';
+
+function cookieValue(req, name) {
+    const raw = req.headers && req.headers.cookie;
+    if (!raw || typeof raw !== 'string') return '';
+    const needle = `${name}=`;
+    for (const part of raw.split(';')) {
+        const trimmed = part.trim();
+        if (trimmed.indexOf(needle) === 0) {
+            try { return decodeURIComponent(trimmed.slice(needle.length)); } catch (e) { return trimmed.slice(needle.length); }
+        }
+    }
+    return '';
+}
+
+function resolveProfileId(req) {
+    const raw = (req.headers['x-yt-profile-id'] || (req.query && req.query.profile_id) ||
+        (req.body && req.body.profile_id) || cookieValue(req, 'yt_profile_id') || '');
+    const value = String(raw).trim();
+    return historyStore.isValidProfileId(value) ? value : DEFAULT_PROFILE_ID;
 }
 
 // Optional: a YouTube session cookie header, so the "For you" feed is built from
@@ -762,7 +799,7 @@ app.post('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req));
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), resolveProfileId(req));
 
         res.json(browseData);
     } catch (error) {
@@ -778,9 +815,9 @@ app.post('/api/browse', async (req, res) => {
 async function handleGuideRequest(req, res) {
     console.log(`Received ${req.method} request for /api/guide`);
 
-
-    const authHeader = req.headers['authorization'];
-    const authToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+    // Same fallback as /api/browse: without a usable token the guide would
+    // silently drop every account-only row.
+    const authToken = bearerOf(req);
 
     try {
         const guideData = await fetchGuideData(authToken);
@@ -916,6 +953,97 @@ app.get('/api/video-meta/:videoId', async (req, res) => {
 });
 
 
+/*
+ * Local watch journal, per profile. The player reports a session when playback
+ * really happened (not on a prefetch), and the journal feeds the History tab and
+ * the home feed re-ranking. The client groups the list into Today / Yesterday /
+ * Earlier itself, so the answer is a flat newest-first array.
+ */
+app.post('/api/history/play', async (req, res) => {
+    const profileId = resolveProfileId(req);
+    const body = req.body || {};
+    const videoId = String(body.video_id || '').trim();
+    if (!/^[\w-]{6,20}$/.test(videoId)) {
+        return res.status(400).json({ error: 'A valid video_id is required.' });
+    }
+    try {
+        const record = await historyStore.recordPlay(profileId, {
+            video_id: videoId,
+            title: body.title,
+            channel_id: body.channel_id,
+            channel: body.channel,
+            thumbnail: body.thumbnail,
+            duration: body.duration,
+            watch_seconds: body.watch_seconds,
+            plays: body.plays,
+        });
+        res.json({
+            ok: true,
+            profile_id: profileId,
+            recorded: !!record,
+            counted: !!record && record.watch_seconds >= historyStore.MIN_WATCH_SECONDS,
+            watch_seconds: record ? record.watch_seconds : 0,
+        });
+    } catch (error) {
+        logger.error('history', 'play record failed', {
+            profile_id: profileId,
+            video_id: videoId,
+            message: logger.truncateStderr(String(error.message || error)),
+        });
+        res.status(500).json({ error: 'Failed to record playback.' });
+    }
+});
+
+app.get('/api/history', async (req, res) => {
+    const profileId = resolveProfileId(req);
+    try {
+        const items = await historyStore.listHistory(profileId, req.query.limit);
+        res.json({ profile_id: profileId, min_watch_seconds: historyStore.MIN_WATCH_SECONDS, items });
+    } catch (error) {
+        logger.error('history', 'list failed', {
+            profile_id: profileId,
+            message: logger.truncateStderr(String(error.message || error)),
+        });
+        res.status(500).json({ error: 'Failed to load history.' });
+    }
+});
+
+// Channel affinity derived from the journal: what the home feed should lean on.
+app.get('/api/history/affinity', async (req, res) => {
+    const profileId = resolveProfileId(req);
+    try {
+        const channels = await historyStore.affinity(profileId, req.query);
+        const videos = await historyStore.topVideos(profileId, req.query);
+        res.json({ profile_id: profileId, channels, videos });
+    } catch (error) {
+        logger.error('history', 'affinity failed', {
+            profile_id: profileId,
+            message: logger.truncateStderr(String(error.message || error)),
+        });
+        res.status(500).json({ error: 'Failed to compute affinity.' });
+    }
+});
+
+app.get('/api/history/stats', (req, res) => {
+    res.json({ profile_id: resolveProfileId(req), ...historyStore.stats(resolveProfileId(req)) });
+});
+
+// Pending debounced writes must not be lost when the server goes down.
+function flushHistoryOnExit() {
+    try {
+        historyStore.flushAll();
+    } catch (error) {
+        console.error('Error flushing history on exit:', error.message);
+    }
+}
+process.on('exit', flushHistoryOnExit);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+        flushHistoryOnExit();
+        process.exit(0);
+    });
+}
+
 process.on('unhandledRejection', (reason) => {
     logger.error('process', 'Unhandled promise rejection', {
         message: reason && reason.message ? String(reason.message) : String(reason),
@@ -931,14 +1059,33 @@ process.on('uncaughtException', (err) => {
     });
 });
 
-const mainServer = app.listen(port, bindAddr, () => {
-    console.log(`Server running at http://` + serverIp + `:` + port);
-});
-
-mainServer.on('error', (err) => {
-    logger.error('process', 'Server listen error', {
-        message: err && err.message ? String(err.message) : String(err),
-        code: err && err.code ? String(err.code) : undefined,
+// Bring the stored account token up before taking traffic, so the first request
+// never goes out with a stale bearer. tokenStore.prepare() is time-bounded, so a
+// slow or unreachable token endpoint delays startup by seconds at most and never
+// prevents the server from coming up.
+async function startMainServer() {
+    await tokenStore.prepare();
+    const mainServer = app.listen(port, bindAddr, () => {
+        console.log(`Server running at http://` + serverIp + `:` + port);
     });
-    console.error(`Server error on :${port}:`, err && err.message ? err.message : err);
+    mainServer.on('error', (err) => {
+        logger.error('process', 'Server listen error', {
+            message: err && err.message ? String(err.message) : String(err),
+            code: err && err.code ? String(err.code) : undefined,
+        });
+        console.error(`Server error on :${port}:`, err && err.message ? err.message : err);
+    });
+    // Keep it warm from here on; the initial load already happened in prepare().
+    tokenStore.startBackgroundRefresh();
+    return mainServer;
+}
+
+const mainServerReady = startMainServer();
+
+mainServerReady.catch((err) => {
+    logger.error('process', 'Server startup failed', {
+        message: err && err.message ? String(err.message) : String(err),
+    });
+    console.error('Server startup failed:', err && err.message ? err.message : err);
+    process.exitCode = 1;
 });

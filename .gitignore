@@ -3,6 +3,7 @@ node_modules/
 .idea/
 /back/logs/
 /back/imgcache/
+/back/history/
 /back/token/
 /back/settings.json
 /logs/

@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const logger = require('./logger');
+const historyStore = require('./history_store');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 
@@ -70,12 +71,22 @@ function filterCookies(cookieHeader) {
    page felt like it was ignoring the account entirely. */
 const HOME_BROWSE_ID = 'FEwhat_to_watch';
 
-async function fetchBrowseData(browseId, authHeader = null, reqCookie = null) { 
+/* The guide's "History" entry. YouTube serves this one from the account's real
+   history, which needs a browser session this TV never has - the response comes
+   back generic or empty. The journal in back/history_store.js is the substitute,
+   so this id is answered locally instead of going upstream. */
+const LOCAL_HISTORY_BROWSE_ID = 'FEhistory';
+
+async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, profileId = null) { 
     const apiKey = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
     const apiUrl = `https://www.googleapis.com/youtubei/v1/browse?key=${apiKey}`;
 
     if (browseId == "home") {
         browseId = HOME_BROWSE_ID;
+    }
+
+    if (browseId === LOCAL_HISTORY_BROWSE_ID || browseId === 'FElibrary') {
+        return localHistoryBrowse(profileId || 'default');
     }
 
     const postData = {
@@ -171,6 +182,11 @@ async function fetchBrowseData(browseId, authHeader = null, reqCookie = null) {
             });
         }
 
+        // After the fallback decision, so the local journal still gets its say
+        // when upstream home answered with a "personalize your feed" nudge.
+        // Home only: a topic row must keep its own curation.
+        if (isHomeId) updatedData = await personalizeHome(updatedData, profileId);
+
         const logsDir = path.join(__dirname, 'logs');
         if (!fs.existsSync(logsDir)) {
             fs.mkdirSync(logsDir); 
@@ -205,7 +221,7 @@ async function fetchBrowseData(browseId, authHeader = null, reqCookie = null) {
                     shelves: fallbackSummary.shelves,
                     cards: fallbackSummary.cards,
                 });
-                return fallbackData;
+                return await personalizeHome(fallbackData, profileId);
             } catch (fallbackError) {
                 logger.error('browse', 'BROWSE_FALLBACK_ERROR', {
                     browseId,
@@ -471,6 +487,279 @@ async function searchShelves(query) {
     });
 
     return cards;
+}
+
+/* ---- the local History tab ----
+   Same envelope the home feed uses, so the 2016 renderer needs no special case:
+   a sectionListRenderer of shelves, each a horizontalListRenderer of
+   gridVideoRenderer cards. Records come from the local journal (see
+   back/history_store.js) grouped into the same buckets the YouTube history page
+   uses. Metadata the journal does not carry is left empty rather than invented -
+   /api/video-meta fills the real title once the video is opened. */
+
+function relativeWatchText(watchedAt) {
+    const ms = Date.now() - watchedAt;
+    if (!(ms >= 0)) return '';
+    const minutes = Math.floor(ms / 60000);
+    if (minutes < 1) return 'just now';
+    if (minutes < 60) return `${minutes} minute${minutes > 1 ? 's' : ''} ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 7) return `${days} day${days > 1 ? 's' : ''} ago`;
+    const weeks = Math.floor(days / 7);
+    if (days < 30) return `${weeks} week${weeks > 1 ? 's' : ''} ago`;
+    const months = Math.floor(days / 30);
+    if (months < 12) return `${months} month${months > 1 ? 's' : ''} ago`;
+    const years = Math.floor(days / 365);
+    return `${years} year${years > 1 ? 's' : ''} ago`;
+}
+
+function clockText(seconds) {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+    const ss = String(sec).padStart(2, '0');
+    return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function watchTimeText(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.round((total % 3600) / 60);
+    if (hours > 0) return `Watched ${hours}h ${minutes}m`;
+    if (minutes > 0) return `Watched ${minutes} minute${minutes > 1 ? 's' : ''}`;
+    return 'Watched';
+}
+
+function historyBucket(watchedAt) {
+    const now = new Date();
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    if (watchedAt >= startToday) return 'Today';
+    if (watchedAt >= startToday - 24 * 60 * 60 * 1000) return 'Yesterday';
+    return 'Earlier';
+}
+
+function historyCard(rec) {
+    const videoId = rec.video_id;
+    const title = rec.title || videoId;
+    const channel = rec.channel || 'Unknown channel';
+    const length = clockText(rec.duration);
+    const when = relativeWatchText(rec.watched_at);
+
+    return {
+        gridVideoRenderer: {
+            videoId,
+            thumbnail: { thumbnails: thumbnailsFor(videoId) },
+            title: { runs: [{ text: title }] },
+            viewCountText: { runs: [{ text: watchTimeText(rec.watch_seconds) }] },
+            publishedTimeText: { runs: [{ text: when }] },
+            lengthText: {
+                runs: [{ text: length }],
+                accessibility: { accessibilityData: { label: length } }
+            },
+            navigationEndpoint: {
+                clickTrackingParams: '',
+                watchEndpoint: { videoId, params: '', playerParams: '' }
+            },
+            shortBylineText: {
+                runs: [{
+                    text: channel,
+                    navigationEndpoint: {
+                        clickTrackingParams: '',
+                        browseEndpoint: rec.channel_id
+                            ? { browseId: rec.channel_id, canonicalBaseUrl: `/channel/${rec.channel_id}` }
+                            : undefined
+                    }
+                }]
+            }
+        }
+    };
+}
+
+function browseEnvelope(shelves) {
+    return {
+        contents: {
+            tvBrowseRenderer: {
+                content: {
+                    tvSurfaceContentRenderer: {
+                        content: { sectionListRenderer: { contents: shelves } }
+                    }
+                }
+            }
+        }
+    };
+}
+
+async function localHistoryBrowse(profileId) {
+    const items = await historyStore.listHistory(profileId, 300);
+    const buckets = new Map();
+    for (const rec of items) {
+        const key = historyBucket(rec.watched_at);
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(historyCard(rec));
+    }
+
+    const shelves = [];
+    for (const label of ['Today', 'Yesterday', 'Earlier']) {
+        const cards = buckets.get(label);
+        if (!cards || !cards.length) continue;
+        shelves.push({
+            shelfRenderer: {
+                title: { runs: [{ text: label }] },
+                content: {
+                    horizontalListRenderer: {
+                        items: cards,
+                        collapsedItemCount: cards.length,
+                        visibleItemCount: cards.length
+                    }
+                }
+            }
+        });
+    }
+
+    if (shelves.length === 0) {
+        logger.info('browse', 'HISTORY_EMPTY', { profileId });
+    } else {
+        logger.info('browse', 'HISTORY_BROWSE', {
+            profileId,
+            shelves: shelves.length,
+            items: items.length,
+        });
+    }
+
+    return browseEnvelope(shelves);
+}
+
+/* ---- home re-ranking from the local journal ----
+   YouTube's own recommendation profile is keyed off browser session cookies that
+   this client does not have, so a bearer token alone gets the generic
+   "what to watch" list. The journal is the only signal about the viewer we
+   actually own, so videos they watched recently are put in front of the feed and
+   shelves they watch a lot are moved up. Anything without a journal is left
+   untouched, which keeps the anonymous experience byte-identical. */
+
+function channelIdOfCard(card) {
+    const g = card?.gridVideoRenderer;
+    const byline = g?.shortBylineText?.runs?.[0];
+    const browseId = byline?.navigationEndpoint?.browseEndpoint?.browseId;
+    if (browseId && /^UC[\w-]{22}$/.test(browseId)) return browseId;
+    const title = g?.title?.runs?.[0]?.text || '';
+    return title || null;
+}
+
+function personalizeHomeShelves(data, affinityChannels, watched) {
+    const contents = data?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer?.contents;
+    if (!Array.isArray(contents) || !contents.length) return 0;
+
+    const scoreOf = new Map();
+    for (const row of affinityChannels) {
+        if (row.channel_id) scoreOf.set(row.channel_id, row.score);
+    }
+
+    // A channel name we only know from the journal still counts for re-ordering.
+    const nameScore = new Map();
+    for (const row of affinityChannels) {
+        if (row.channel && !row.channel_id) nameScore.set(row.channel.toLowerCase(), row.score);
+    }
+
+    const rank = shelf => {
+        let best = 0;
+        const items = shelf?.content?.horizontalListRenderer?.items || [];
+        for (const card of items) {
+            const g = card?.gridVideoRenderer;
+            if (!g) continue;
+            const byline = (g.shortBylineText?.runs?.[0]?.text || '').toLowerCase();
+            let score = scoreOf.get(channelIdOfCard(card)) || 0;
+            if (!score && byline) score = nameScore.get(byline) || 0;
+            if (score > best) best = score;
+        }
+        return best;
+    };
+
+    // Already in the feed is good: it means YouTube agrees, we do not duplicate.
+    const presentIds = new Set();
+    for (const shelf of contents) {
+        const items = shelf?.content?.horizontalListRenderer?.items || [];
+        for (const card of items) {
+            const id = card?.gridVideoRenderer?.videoId;
+            if (id) presentIds.add(id);
+        }
+    }
+
+    const extra = watched
+        .filter(rec => !presentIds.has(rec.video_id))
+        .slice(0, 12)
+        .map(historyCard);
+
+    let changed = 0;
+    if (extra.length > 0) {
+        contents.unshift({
+            shelfRenderer: {
+                title: { runs: [{ text: 'Because you watched' }] },
+                content: {
+                    horizontalListRenderer: {
+                        items: extra,
+                        collapsedItemCount: extra.length,
+                        visibleItemCount: extra.length
+                    }
+                }
+            }
+        });
+        changed += extra.length;
+    }
+
+    if (scoreOf.size > 0 || nameScore.size > 0) {
+        const ordered = contents
+            .map((shelf, i) => ({ shelf, i, score: rank(shelf) }))
+            .sort((a, b) => (b.score - a.score) || (a.i - b.i))
+            .map(x => x.shelf);
+        let moved = 0;
+        for (let i = 0; i < ordered.length; i++) {
+            if (ordered[i] !== contents[i]) moved += 1;
+        }
+        if (moved > 0) {
+            contents.length = 0;
+            contents.push(...ordered);
+            changed += moved;
+        }
+    }
+
+    return changed;
+}
+
+/* Applies the journal to a home feed. Without a profile - or with an empty
+   journal - the feed is returned exactly as it came in. */
+async function personalizeHome(data, profileId) {
+    if (!profileId) return data;
+    try {
+        const [channels, watched] = await Promise.all([
+            historyStore.affinity(profileId, { limit: 20 }),
+            historyStore.topVideos(profileId, { limit: 12 }),
+        ]);
+        if (channels.length === 0 && watched.length === 0) return data;
+        const changed = personalizeHomeShelves(data, channels, watched);
+        const after = sectionSummaries(data);
+        logger.info('browse', 'HOME_PERSONALIZED', {
+            profileId,
+            channels: channels.length,
+            watched: watched.length,
+            changed,
+            shelves: after.shelves,
+            cards: after.cards,
+        });
+        return data;
+    } catch (error) {
+        // Personalization is an addition: a failure here must not cost the
+        // viewer their feed.
+        logger.warn('browse', 'HOME_PERSONALIZE_FAILED', {
+            profileId,
+            reason: error.message,
+        });
+        return data;
+    }
 }
 
 async function fallbackHomeShelves() {

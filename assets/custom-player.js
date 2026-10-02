@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261030i';
+    global.__CUSTOM_PLAYER_VERSION = '20261002d';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -54,6 +54,161 @@
         x.send(null);
         return x;
     }
+
+    /* ---- local watch journal ----
+       The 2016 client cannot write into YouTube's own watch history (that path
+       needs session cookies this server does not have), so the journal is kept
+       here and lives next to the other per-profile state on the server.
+
+       A /get_video_info call is NOT a view: the same request serves the chain
+       prefetch and the idle takeover, so it would log videos nobody ever saw.
+       What counts is wall time the media element was actually playing, sampled
+       from poll() and reported in deltas - a heartbeat while the video runs, a
+       final flush when playback stops - so a crash or a power cut loses at most
+       one heartbeat window, and the server adds the deltas up per video. */
+
+    var HIST_PROFILE_KEY = 'yt_profile_id';
+    var HIST_HEARTBEAT_SECONDS = 60;
+    var histMetaFor = {};           // videoId -> metadata, so a heartbeat is cheap
+    var histSession = null;         // the session in progress, null when idle
+
+    /* One backend serves several viewers, so the journal is keyed by profile.
+       The TV has no login, so the profile is whatever localStorage holds; a
+       ?profile=<id> in the address bar picks one and remembers it. The id is
+       mirrored into a cookie because the 2016 app builds its own /api/browse
+       URLs and cannot be given a header - without the cookie the History tab
+       would always show the default profile's rows. */
+    function histProfileId() {
+        try {
+            var ls = global.localStorage;
+            if (ls) {
+                var v = ls.getItem(HIST_PROFILE_KEY);
+                if (!v) {
+                    var m = /[?&]profile=([A-Za-z0-9._-]{1,64})/.exec(String((global.location && global.location.search) || ''));
+                    if (m) { ls.setItem(HIST_PROFILE_KEY, m[1]); v = m[1]; }
+                }
+                if (v && /^[A-Za-z0-9._-]{1,64}$/.test(v)) {
+                    try {
+                        if (cookieValue('yt_profile_id') !== v) {
+                            global.document.cookie = 'yt_profile_id=' + encodeURIComponent(v) +
+                                '; path=/; max-age=31536000; SameSite=Lax';
+                        }
+                    } catch (e) { }
+                    return v;
+                }
+            }
+        } catch (e) { }
+        return 'default';
+    }
+
+    function cookieValue(name) {
+        try {
+            var raw = String((global.document && global.document.cookie) || '');
+            var parts = raw.split(';'), i, p;
+            for (i = 0; i < parts.length; i++) {
+                p = parts[i].trim();
+                if (p.indexOf(name + '=') === 0) return decodeURIComponent(p.slice(name.length + 1));
+            }
+        } catch (e) { }
+        return '';
+    }
+
+    function histBody(id, seconds, meta, plays) {
+        var m = meta || histMetaFor[id] || {};
+        return {
+            profile_id: histProfileId(),
+            video_id: id,
+            title: m.title || '',
+            channel: m.author || '',
+            channel_id: m.channelId || '',
+            thumbnail: m.thumbnail || '',
+            duration: m.duration || 0,
+            watch_seconds: Math.max(0, Math.round(seconds)),
+            // only the piece that ends the session is a play, not every heartbeat
+            plays: plays ? 1 : 0,
+        };
+    }
+
+    function histPost(id, seconds, meta, plays) {
+        if (!id || seconds < 1) return false;
+        var payload = JSON.stringify(histBody(id, seconds, meta, plays));
+        try {
+            if (global.navigator && global.navigator.sendBeacon) {
+                // survives the page going away, which is exactly the case a
+                // plain XHR does not: the TV gets powered off mid-video
+                var blob = new Blob([payload], { type: 'application/json' });
+                if (global.navigator.sendBeacon(base + '/api/history/play', blob)) return true;
+            }
+        } catch (e) { }
+        var x = new XMLHttpRequest();
+        x.open('POST', base + '/api/history/play', true);
+        x.setRequestHeader('Content-Type', 'application/json');
+        try { x.setRequestHeader('X-YT-Profile-Id', histProfileId()); } catch (e) { }
+        x.send(payload);
+        beacon('CP_HIST', { id: id, s: Math.round(seconds), via: 'xhr' });
+        return true;
+    }
+
+    function histLoadMeta(id) {
+        if (!id || histMetaFor[id]) return;
+        histMetaFor[id] = null;                 // in flight
+        xhrText(base + '/api/video-meta/' + encodeURIComponent(id), function (t) {
+            if (!t) { delete histMetaFor[id]; return; }
+            try {
+                var m = JSON.parse(t);
+                histMetaFor[id] = (m && m.id) ? m : {};
+            } catch (e) { histMetaFor[id] = {}; }
+        });
+    }
+
+    function histBegin(id) {
+        if (!id) return;
+        if (histSession && histSession.id === id) return;
+        histEnd();
+        histSession = { id: id, watched: 0, reported: 0, lastAt: Date.now() };
+        histLoadMeta(id);
+    }
+
+    /* Report everything watched since the last post and zero the counter, so a
+       crash mid-video keeps at most one heartbeat window unwritten. */
+    function histFlush(plays) {
+        var s = histSession;
+        if (!s) return;
+        var pending = s.watched - s.reported;
+        if (pending < 1) return;
+        s.reported = s.watched;
+        histPost(s.id, pending, histMetaFor[s.id], plays);
+    }
+
+    function histEnd() {
+        if (!histSession) return;
+        histFlush(1);
+        histSession = null;
+    }
+
+    /* Sampled from poll(): only counts while the element is really running, and
+       a long gap (tab hidden, engine stalled) is clamped so a frozen player does
+       not accumulate hours of "watched" time. */
+    function histTick() {
+        var s = histSession;
+        if (!s || !active || active.id !== s.id) return;
+        var el = active.engEl;
+        if (!el) return;
+        var now = Date.now();
+        var dt = (now - s.lastAt) / 1000;
+        s.lastAt = now;
+        if (dt <= 0 || dt > 10) return;
+        var playing = false;
+        try { playing = !el.paused && !el.ended && el.readyState >= 2; } catch (e) { }
+        if (!playing) return;
+        s.watched += dt;
+        if (s.watched - s.reported >= HIST_HEARTBEAT_SECONDS) histFlush();
+    }
+
+    try {
+        global.addEventListener('pagehide', function () { histFlush(); }, false);
+        global.addEventListener('beforeunload', function () { histFlush(); }, false);
+    } catch (e) { }
 
     function absUrl(u) {
         if (!u) return u;
@@ -740,6 +895,7 @@
     }
 
     function stopActive() {
+        histEnd();                              // flush the time actually played
         qualityRequest++;
         var el = active && active.engEl;
         if (el) {
@@ -812,6 +968,7 @@
         var hlsUrl = conf.hlsUrl || (base + '/api/hls/' + id);
         hlsUrl = absUrl(hlsUrl);
         beacon('CP_START', { id: id, engine: null, hlsUrl: hlsUrl.slice(0, 80) });
+        histBegin(id);                          // real playback started, unlike a prefetch
 
         var eng = null;
         var engEl = el;
@@ -1012,6 +1169,7 @@
 
     function poll() {
         setTimeout(function () {
+            histTick();
             stopIfLeftWatch('poll');
             var id = getVideoId();
             var el = global.document && global.document.querySelector('.html5-main-video');
@@ -3892,12 +4050,22 @@
             return false;
         },
         getHistory: function () { return chainPath.slice(); },
+        getWatchJournal: function () {
+            // diagnostics only: the journal is otherwise invisible from the page
+            return histSession
+                ? { id: histSession.id, watched: Math.round(histSession.watched), reported: Math.round(histSession.reported), profile: histProfileId() }
+                : null;
+        },
         stop: stopActive,
         _remount: remount,
         _engineEl: function () { return active ? active.engEl : null; }
     };
 
     global.YTCustomPlayer = Api;
+
+    // Publish the profile before the app issues its first /api/browse, so the
+    // History tab is asked for as the right viewer.
+    histProfileId();
 
     if (global.document) {
         if (global.document.readyState === 'complete' || global.document.readyState === 'interactive') {
