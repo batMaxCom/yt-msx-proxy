@@ -24,6 +24,17 @@
 # создаёт само при первой записи (back/history_store.js, back/token_store.js
 # через back/oauth_api_v3_api.js, back/image_proxy.js, back/logger.js).
 #
+# accounts - новый том: refresh-токены привязки зрителей (back/viewer_accounts.js).
+# Он в отдельном томе, а не в writable layer, по той же причине, что и token:
+# `docker rm -f` на шаге сноса не должен заставлять всех зрителей на ТВ заново
+# проходить device flow.
+#
+# Секрет клиента (back/viewer_auth.env) НЕ копируется в образ и не едет в
+# git. Он передаётся только через --env-file, а сам файл живёт на сервере с
+# правами 600 и в .gitignore/.dockerignore. Без него сервис входа поднимается,
+# но /api/auth/login отвечает "sign-in not configured" - это осознанно: деплой
+# без секрета лучше, чем деплой с секретом в слое образа.
+#
 # Локальные запуски через docker-compose.yml используют те же пути внутри
 # контейнера, но префикс томов у них другой (compose добавляет к имени проекта
 # подчёркивание: 2016youtubetv_history против 2016youtubetv-history), так что
@@ -101,18 +112,18 @@ fi
 # --- 5. Готовим тома и переносим состояние из старого контейнера ------
 # Порядок важен: всё это ДО `docker rm -f`, иначе состояние пропадёт.
 echo "==> тома"
-for d in history token imgcache logs; do
+for d in history token accounts imgcache logs; do
     docker volume create "$IMAGE-$d" >/dev/null
     echo "    $IMAGE-$d"
 done
 
 MIGRATE=".deploy-migrate"
 rm -rf "$MIGRATE"
-mkdir -p "$MIGRATE/history" "$MIGRATE/token"
+mkdir -p "$MIGRATE/history" "$MIGRATE/token" "$MIGRATE/accounts"
 
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     echo "==> переносим состояние из старого контейнера в тома"
-    for d in history token; do
+    for d in history token accounts; do
         # Точка в конце копирует содержимое каталога, а не сам каталог.
         if docker cp "$CONTAINER:/app/back/$d/." "$MIGRATE/$d" 2>/dev/null; then
             n=$(find "$MIGRATE/$d" -type f 2>/dev/null | wc -l)
@@ -133,7 +144,7 @@ fi
 
 # Наполняем тома. cp -n ничего не перезаписывает, поэтому повторный деплой не
 # откатывает историю на состояние, которое было в контейнере месяц назад.
-for d in history token; do
+for d in history token accounts; do
     if [ -n "$(find "$MIGRATE/$d" -type f 2>/dev/null | head -1)" ]; then
         # --entrypoint sh обязателен: у образа свой ENTRYPOINT, и без него
         # `sh -c ...` уйдёт ему аргументом - запустится сервер, а копирования
@@ -169,9 +180,21 @@ ARGS=(
 [ "$PUBLISH_8070" = "yes" ] && ARGS+=(-p 8070:8070)
 ARGS+=(-v "$IMAGE-history:/app/back/history")
 ARGS+=(-v "$IMAGE-token:/app/back/token")
+ARGS+=(-v "$IMAGE-accounts:/app/back/accounts")
 ARGS+=(-v "$IMAGE-imgcache:/app/back/imgcache")
 ARGS+=(-v "$IMAGE-logs:/app/back/logs")
 ARGS+=(-v "$PWD/back/settings.json:/app/back/settings.json")
+
+# Ключи OAuth-клиента: env-file, не слой образа. Файла может не быть - тогда
+# вход просто не сконфигурирован, и это не повод валить деплой.
+if [ -f back/viewer_auth.env ]; then
+    chmod 600 back/viewer_auth.env
+    ARGS+=(--env-file "$PWD/back/viewer_auth.env")
+    echo "==> OAuth-ключи зрителей: back/viewer_auth.env (600, через --env-file)"
+else
+    echo "!! back/viewer_auth.env нет - вход зрителей будет отключён"
+    echo "   (журнал и подписки останутся анонимными, приложение не сломается)"
+fi
 
 echo "==> docker run ${ARGS[*]} $IMAGE:$TS"
 docker run "${ARGS[@]}" "$IMAGE:$TS"
@@ -215,7 +238,7 @@ fi
 # --- 10. Отчёт о состоянии -------------------------------------------
 echo
 echo "==> тома с состоянием"
-for d in history token; do
+for d in history token accounts; do
     n=$(docker run --rm --entrypoint sh -v "$IMAGE-$d:/d" "$IMAGE:$TS" \
             -c 'ls -1 /d 2>/dev/null | wc -l' 2>/dev/null || echo '?')
     echo "    $IMAGE-$d: $n профил/файл(ов)"
@@ -233,5 +256,5 @@ case "$PUBLISH_8090" in
     loopback) echo "    http://127.0.0.1:8090/  Node, только с самого сервера" ;;
     *)        echo "    http://<host>:8090/      напрямую Node (диагностика)" ;;
 esac
-echo "    история и токены: $IMAGE-history, $IMAGE-token (переживают пересборку)"
+echo "    история, токены, привязки: $IMAGE-history, $IMAGE-token, $IMAGE-accounts (переживают пересборку)"
 REMOTE_SCRIPT

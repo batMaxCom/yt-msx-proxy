@@ -43,10 +43,20 @@ services:
       - token:/app/back/token
       - imgcache:/app/back/imgcache
       - logs:/app/back/logs
+      # Per-account viewer refresh tokens and the session signing key. Losing
+      # accounts means everyone signs in again; losing the signing key signs out
+      # everyone even though their accounts are still on disk.
+      - accounts:/app/back/accounts
       # settings.json is a file, so it needs a bind mount - a named volume would
       # create a *directory* at this path and the server would fail to read it.
       # The host copy must exist before the first `up`; it does today.
       - ./back/settings.json:/app/back/settings.json
+
+    # The OAuth client for viewer sign-in. Read as environment variables, so the
+    # secret never has to exist as a file inside the container. The file is
+    # gitignored and excluded from the build context; it arrives here at run time.
+    env_file:
+      - ./back/viewer_auth.env
 
     sysctls:
       # Only the namespaced knobs are accepted here. net.core.* and the
@@ -64,3 +74,4 @@ volumes:
   token:
   imgcache:
   logs:
+  accounts:

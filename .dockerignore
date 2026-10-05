@@ -18,3 +18,9 @@ logs
 /back/logs/
 /back/streams/
 /back/settings.json
+
+# Viewer sign-in secrets. .gitignore keeps these out of git, but `COPY . .` reads
+# the build context directly and ignores git - so without this line the client
+# secret lands in an image layer. It is injected at run time instead.
+/back/viewer_auth.env
+/back/accounts/

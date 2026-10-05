@@ -3,6 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
 const cors = require('cors');
 const compression = require('compression');
 const QRCode = require('qrcode');
@@ -35,7 +36,9 @@ const oauthRouter = require('./oauth_api_v3_api.js');
 
 const watchPageInteractions = require('./watch_page_interactions_apis');
 const historyStore = require('./history_store');
+const subscriptionsFeed = require('./subscriptions_feed');
 const tokenStore = require('./token_store');
+const viewerAccounts = require('./viewer_accounts');
 const { registerMsxRoutes, isMsxPath } = require('./msx');
 
 
@@ -743,7 +746,35 @@ app.all('/api/lounge/bc/bind', async (req, res) => {
 // The 2016 client sends its OAuth bearer when the user paired an account. If it
 // did not, fall back to the newest saved token, refreshing it when it is close to
 // expiry - see back/token_store.js. Token values are never logged.
+/*
+ * The bearer to send upstream, in priority order:
+ *
+ *   1. the viewer's own token, from the session cookie - the account that signed
+ *      in here is the account the TV should browse and play as, and this is the
+ *      token with the scopes history and subscriptions are read under;
+ *   2. whatever the 2016 bundle sends in Authorization - kept so a client holding
+ *      its own token keeps working, and so playback survives a viewer who is
+ *      signed out but still mid-session on a set that issued one;
+ *   3. the current account's token from token_store.
+ *
+ * The session is checked first, and on purpose: with the custom sign-in the
+ * bundle no longer acquires a token of its own, so step 2 only ever fires for a
+ * client that still holds a legacy one.
+ *
+ * cachedAccessTokenFor is a memory read and cannot await. When it comes up empty -
+ * first request after sign-in, or a token near expiry - the refresh is started in
+ * the background and the request goes out anonymously. That is not a regression
+ * from how the rest of this file already behaves (it never blocked on a refresh),
+ * but it does mean the very first browse after a cold sign-in can be anonymous.
+ */
 function bearerOf(req) {
+    const sub = currentSub(req);
+    if (sub) {
+        const own = viewerAccounts.cachedAccessTokenFor(sub);
+        if (own) return own;
+        void viewerAccounts.accessTokenFor(sub);
+    }
+
     const h = req.headers.authorization || req.headers.Authorization;
     if (h && typeof h === 'string') {
         const v = h.trim();
@@ -752,14 +783,10 @@ function bearerOf(req) {
     return tokenStore.getAccessToken();
 }
 
-// Local watch journal. The backend is shared by several viewers, so every request
-// has to say who it is: the profile id picks the file under back/history/, and an
-// absent or malformed one falls back to the shared "default" profile.
-//
-// The client mirrors the id into a cookie (see histProfileId in
-// assets/custom-player.js) because the 2016 app builds its own /api/browse URLs
-// and cannot be given a header - without the cookie only the journal requests,
-// which do send the header, would be per-viewer.
+/* Legacy fallback key. Signed-out callers keep the pre-journal behaviour of a
+ * single shared "default" profile, so the anonymous home feed is unchanged.
+ * It is never reachable while a session exists, and no journal row is written
+ * under it: historyAccount() refuses without a sub. */
 const DEFAULT_PROFILE_ID = 'default';
 
 function cookieValue(req, name) {
@@ -799,7 +826,7 @@ app.post('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), resolveProfileId(req));
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), historyAccount(req) || DEFAULT_PROFILE_ID);
 
         res.json(browseData);
     } catch (error) {
@@ -954,30 +981,152 @@ app.get('/api/video-meta/:videoId', async (req, res) => {
 
 
 /*
+ * Who is signed in, and getting rid of it.
+ *
+ * There is no /api/auth/login here any more. Sign-in is the app's own "Sign in to
+ * this TV" dialog in the right-hand panel, and it works because the two routes it
+ * already used - /o/oauth2/device/code and /o/oauth2/token, both relative, so
+ * both aimed at this server - now issue and exchange a code for this project's
+ * OAuth client instead of the one baked into the bundle. The dialog is the app's;
+ * the grant behind it is ours; the browser ends up with the same signed HttpOnly
+ * session cookie carrying the account id and no token in localStorage.
+ *
+ * The endpoints below only read that cookie and revoke it. Which is why they are
+ * all that is left: a sign-in that needs a second front door to start is a sign-in
+ * that will eventually be run twice, under two accounts, on one set.
+ */
+
+/*
+ * Never let these answers be cached, not by the browser and not by ETag.
+ *
+ * Express generates an ETag from the response body, and the body here is often
+ * byte-identical across two different viewers - every signed-out visitor gets
+ * {"signed_in":false} - so the browser sends If-None-Match and gets a bare 304
+ * with no body at all. The client then sees an empty responseText, fails to
+ * parse it, and concludes it is signed out even when the cookie is valid. That
+ * is a signed-in viewer being logged out by a cache header.
+ *
+ * It is worse than cosmetic for signout_local: after signing out, the body
+ * legitimately stays the same {"signed_in":false}, so a cached 304 confirms a
+ * state that has since changed.
+ */
+function noStore(req, res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    // The headers above are not enough on their own. Express computes req.fresh
+    // from If-None-Match against the ETag it is about to generate, and when they
+    // match it replaces the whole body with a bodiless 304 - ignoring no-store
+    // entirely, since the freshness check happens before the cache headers are
+    // consulted. Dropping the request's validator header is what actually stops
+    // it; the ETag on the response stays, which is harmless with no-store.
+    if (req && req.headers) delete req.headers['if-none-match'];
+}
+
+// The signed-in account for this request, or null. Cookie is HttpOnly so this is
+// the only way a viewer can be identified.
+function currentSub(req) {
+    return viewerAccounts.verifySession(cookieValue(req, viewerAccounts.SESSION_COOKIE));
+}
+
+app.get('/api/auth/whoami', async (req, res) => {
+    noStore(req, res);
+    const sub = currentSub(req);
+    if (!sub) return res.json({ signed_in: false });
+    try {
+        // A live token is proof the stored refresh token still works, so an
+        // account that lost its grant shows as signed out instead of silently
+        // returning empty history.
+        const token = await viewerAccounts.accessTokenFor(sub);
+        if (!token) {
+            return res.json({ signed_in: false, reason: 'no_usable_token' });
+        }
+        res.json(viewerAccounts.publicProfile(sub));
+    } catch (error) {
+        logger.warn('auth', 'whoami failed', {
+            reason: logger.truncateStderr(String(error.message || error)),
+        });
+        res.json({ signed_in: false, reason: 'lookup_failed' });
+    }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+    noStore(req, res);
+    const sub = currentSub(req);
+    res.setHeader('Set-Cookie', viewerAccounts.clearedSessionCookie());
+    if (!sub) return res.json({ ok: true });
+    try {
+        await viewerAccounts.signOut(sub);
+    } catch (error) {
+        logger.warn('auth', 'logout failed', {
+            reason: logger.truncateStderr(String(error.message || error)),
+        });
+    }
+    res.json({ ok: true });
+});
+
+app.post('/api/auth/signout_local', (req, res) => {
+    noStore(req, res);
+    const sub = currentSub(req);
+    if (sub) viewerAccounts.signOutLocalOnly(sub);
+    res.setHeader('Set-Cookie', viewerAccounts.clearedSessionCookie());
+    res.json({ ok: true });
+});
+
+
+/*
  * Local watch journal, per profile. The player reports a session when playback
  * really happened (not on a prefetch), and the journal feeds the History tab and
  * the home feed re-ranking. The client groups the list into Today / Yesterday /
  * Earlier itself, so the answer is a flat newest-first array.
  */
-/* The journal is off until it is keyed on the viewer's own Google account
-   instead of a caller-supplied profile id - see back/history_store.js for the
-   reasoning. These routes answer "nothing stored" rather than 404 so the
-   client journal keeps working once the store is switched back on. */
+/* The journal is keyed on the viewer's own Google account rather than on an id
+   the caller supplies. Nothing in the request picks the file any more: the
+   session cookie is HMAC-signed with a per-install secret, `sub` is read back out
+   of that cookie, and the row is written under back/history/<sub>.json. The
+   client's profile_id is still accepted for logging, but it has no say in what
+   gets read. */
+function sanitizeSub(value) {
+    const raw = String(value == null ? '' : value).trim();
+    return /^[A-Za-z0-9._-]{1,128}$/.test(raw) ? raw : '';
+}
+
+/*
+ * The account the journal belongs to, or '' when nobody is signed in. The journal
+ * is never keyed on anything the caller can choose.
+ */
+function historyAccount(req) {
+    return sanitizeSub(currentSub(req));
+}
+
+/*
+ * No session means no journal - not an error and not a shared bucket. The
+ * client's own heartbeat must not start failing because a device is signed out,
+ * so the write answers normally and simply records nothing. Reads answer an empty
+ * list, which is what the History tab already renders for a fresh profile.
+ */
+function historyUnsigned(res) {
+    res.json({ ok: true, signed_in: false, recorded: false, items: [], channels: [], videos: [] });
+    return true;
+}
+
 function historyDisabled(res) {
     res.json({ ok: true, disabled: true, recorded: false, items: [], channels: [], videos: [] });
     return true;
 }
 
 app.post('/api/history/play', async (req, res) => {
-    if (!historyStore.enabled) return historyDisabled(res);
-    const profileId = resolveProfileId(req);
+    noStore(req, res);
+    if (!historyStore.ENABLED) return historyDisabled(res);
+    const sub = historyAccount(req);
+    if (!sub) return historyUnsigned(res);
     const body = req.body || {};
     const videoId = String(body.video_id || '').trim();
     if (!/^[\w-]{6,20}$/.test(videoId)) {
         return res.status(400).json({ error: 'A valid video_id is required.' });
     }
     try {
-        const record = await historyStore.recordPlay(profileId, {
+        const record = await historyStore.recordPlay(sub, {
             video_id: videoId,
             title: body.title,
             channel_id: body.channel_id,
@@ -989,14 +1138,13 @@ app.post('/api/history/play', async (req, res) => {
         });
         res.json({
             ok: true,
-            profile_id: profileId,
             recorded: !!record,
             counted: !!record && record.watch_seconds >= historyStore.MIN_WATCH_SECONDS,
             watch_seconds: record ? record.watch_seconds : 0,
         });
     } catch (error) {
         logger.error('history', 'play record failed', {
-            profile_id: profileId,
+            sub,
             video_id: videoId,
             message: logger.truncateStderr(String(error.message || error)),
         });
@@ -1005,14 +1153,16 @@ app.post('/api/history/play', async (req, res) => {
 });
 
 app.get('/api/history', async (req, res) => {
-    if (!historyStore.enabled) return historyDisabled(res);
-    const profileId = resolveProfileId(req);
+    noStore(req, res);
+    if (!historyStore.ENABLED) return historyDisabled(res);
+    const sub = historyAccount(req);
+    if (!sub) return historyUnsigned(res);
     try {
-        const items = await historyStore.listHistory(profileId, req.query.limit);
-        res.json({ profile_id: profileId, min_watch_seconds: historyStore.MIN_WATCH_SECONDS, items });
+        const items = await historyStore.listHistory(sub, req.query.limit);
+        res.json({ signed_in: true, min_watch_seconds: historyStore.MIN_WATCH_SECONDS, items });
     } catch (error) {
         logger.error('history', 'list failed', {
-            profile_id: profileId,
+            sub,
             message: logger.truncateStderr(String(error.message || error)),
         });
         res.status(500).json({ error: 'Failed to load history.' });
@@ -1021,24 +1171,74 @@ app.get('/api/history', async (req, res) => {
 
 // Channel affinity derived from the journal: what the home feed should lean on.
 app.get('/api/history/affinity', async (req, res) => {
-    if (!historyStore.enabled) return historyDisabled(res);
-    const profileId = resolveProfileId(req);
+    noStore(req, res);
+    if (!historyStore.ENABLED) return historyDisabled(res);
+    const sub = historyAccount(req);
+    if (!sub) return historyUnsigned(res);
     try {
-        const channels = await historyStore.affinity(profileId, req.query);
-        const videos = await historyStore.topVideos(profileId, req.query);
-        res.json({ profile_id: profileId, channels, videos });
+        const channels = await historyStore.affinity(sub, req.query);
+        const videos = await historyStore.topVideos(sub, req.query);
+        res.json({ signed_in: true, channels, videos });
     } catch (error) {
         logger.error('history', 'affinity failed', {
-            profile_id: profileId,
+            sub,
             message: logger.truncateStderr(String(error.message || error)),
         });
         res.status(500).json({ error: 'Failed to compute affinity.' });
     }
 });
 
+/* Home page from the viewer's own subscriptions.
+ *
+ * Only reachable with a session: the channel list is private to the account, and
+ * serving it anonymously would mean serving somebody else's. The token comes from
+ * the account module, never from the request, so a client cannot point this at a
+ * different account's subscriptions. */
+const SUBSCRIPTIONS_BROWSE_ID = 'FEsubscriptions_home';
+
+function subscribeEnvelope(shelves) {
+    return {
+        contents: {
+            tvBrowseRenderer: {
+                content: {
+                    tvSurfaceContentRenderer: {
+                        content: { sectionListRenderer: { contents: shelves } }
+                    }
+                }
+            }
+        }
+    };
+}
+
+app.get('/api/auth/subscriptions', async (req, res) => {
+    noStore(req, res);
+    const sub = historyAccount(req);
+    if (!sub) {
+        return res.status(401).json({ error: 'Sign in to see your subscriptions.', signed_in: false });
+    }
+    try {
+        const token = await viewerAccounts.accessTokenFor(sub);
+        if (!token) {
+            return res.status(401).json({ error: 'Session has no usable token. Sign in again.', signed_in: false });
+        }
+        const feed = await subscriptionsFeed.subscriptionsHome(token, {
+            maxChannels: req.query.channels,
+        });
+        res.json(subscribeEnvelope(feed.envelopes));
+    } catch (error) {
+        logger.error('subscriptions', 'home feed failed', {
+            message: logger.truncateStderr(String(error.message || error)),
+        });
+        res.status(500).json({ error: 'Failed to build the subscriptions feed.' });
+    }
+});
+
 app.get('/api/history/stats', (req, res) => {
-    if (!historyStore.enabled) return historyDisabled(res);
-    res.json({ profile_id: resolveProfileId(req), ...historyStore.stats(resolveProfileId(req)) });
+    noStore(req, res);
+    if (!historyStore.ENABLED) return historyDisabled(res);
+    const sub = historyAccount(req);
+    if (!sub) return historyUnsigned(res);
+    res.json({ signed_in: true, ...historyStore.stats(sub) });
 });
 
 // Pending debounced writes must not be lost when the server goes down.

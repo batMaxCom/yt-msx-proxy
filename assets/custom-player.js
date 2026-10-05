@@ -11,7 +11,7 @@
 (function (global) {
     'use strict';
     if (global.YTCustomPlayer) return;
-    global.__CUSTOM_PLAYER_VERSION = '20261002j';
+    global.__CUSTOM_PLAYER_VERSION = '20261005g';
 
     var appSettings = { hideOnScreenNav: false, showToggleVideoInfo: true };
     try {
@@ -39,6 +39,63 @@
         x.open('GET', url, true);
         x.onreadystatechange = function () { if (x.readyState === 4) cb(x.status >= 200 && x.status < 400 ? (x.responseText || '') : null); };
         x.send(null);
+    }
+
+    /* ---- who is signed in ----
+       The journal and the subscription home feed belong to a Google account, so
+       the client needs to know whether there is one. Nothing here starts a sign-in:
+       the app's own Sign in tile in the right-hand panel does that, and the server
+       issues the device code for it.
+
+       This costs one request per page load and gates nothing - a signed-out device
+       keeps watching exactly as before, the server simply does not store it. */
+
+    var authState = { checked: false, signed_in: false, profile: null };
+
+    function authRequest(method, path, body, cb) {
+        try {
+            var x = new XMLHttpRequest();
+            x.open(method, base + path, true);
+            x.withCredentials = true;
+            if (body) x.setRequestHeader('Content-Type', 'application/json');
+            x.onreadystatechange = function () {
+                if (x.readyState !== 4) return;
+                var data = null;
+                try { data = JSON.parse(x.responseText || 'null'); } catch (e) { }
+                cb(x.status >= 200 && x.status < 400 ? data : (data || { error: 'request_failed', status: x.status }));
+            };
+            x.send(body ? JSON.stringify(body) : null);
+        } catch (e) {
+            cb({ error: 'network' });
+        }
+    }
+
+    /*
+     * Who is signed in - and that is all this file asks.
+     *
+     * Sign-in itself belongs to the app's own "Sign in to this TV" dialog in the
+     * right-hand panel, and nothing here competes with it. There used to be a
+     * floating panel of our own with a button in it, plus a hook on the bundle's
+     * device-code request and a click trap on its Sign in tile; all three existed to
+     * put a second sign-in in front of the first. The server now issues the device
+     * code for its own client from /o/oauth2/device/code, so the native dialog
+     * signs the viewer in as a person on its own and there is nothing left for our
+     * panel to do.
+     *
+     * What remains is the question the journal needs answered - is there an account,
+     * and is its token still good - so that history is stored against a real sub
+     * and stops being stored at all when nobody is signed in.
+     */
+    function authProbe() {
+        if (authState.checked) return authState;
+        authState.checked = true;
+        authRequest('GET', '/api/auth/whoami', null, function (r) {
+            if (r && r.signed_in) {
+                authState.signed_in = true;
+                authState.profile = r;
+            }
+        });
+        return authState;
     }
 
     /* ---- local watch journal ----
@@ -4394,7 +4451,27 @@
         },
         /* Which profile this browser is writing under, so it can be told apart
            from the others sharing the backend. */
+        /* Kept for diagnostics: the client profile id is now only a label, the
+           server keys the journal on the signed-in account. */
         getProfile: function () { return histProfileId(); },
+        getAuth: function () { return authProbe(); },
+        /*
+         * Sign-in is deliberately absent. YTCustomPlayer.signIn() used to be the
+         * way to get a token without touching the app's own dialog, and with it
+         * gone there is exactly one way in: the Sign in tile in the right-hand
+         * panel. Leaving an opener behind would only invite it back as a second
+         * front door, which is what this whole change exists to remove.
+         */
+        signOut: function () {
+            authRequest('POST', '/api/auth/logout', null, function () {
+                authState = { checked: true, signed_in: false, profile: null };
+                beacon('CP_AUTH_LOGOUT', {});
+            });
+        },
+        refreshAuth: function () {
+            authState = { checked: false, signed_in: false, profile: null };
+            return authProbe();
+        },
         stop: stopActive,
         _remount: remount,
         _engineEl: function () { return active ? active.engEl : null; }
@@ -4407,6 +4484,14 @@
     histProfileId();
 
     if (global.document) {
+        // Learn the session, without opening anything. The app's own sign-in is
+        // left entirely alone: no hook on its device-code request, no click trap
+        // on its tile, no panel over the video.
+        if (global.document.readyState === 'complete' || global.document.readyState === 'interactive') {
+            authProbe();
+        } else {
+            global.document.addEventListener('DOMContentLoaded', authProbe);
+        }
         if (global.document.readyState === 'complete' || global.document.readyState === 'interactive') {
             poll();
         } else {

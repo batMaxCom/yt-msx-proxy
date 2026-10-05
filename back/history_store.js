@@ -166,10 +166,14 @@ function writeToDisk(profileId, entry, now) {
     const file = profilePath(profileId);
     const tmp = `${file}.${process.pid}.tmp`;
     try {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
         // rename(2) is atomic within a filesystem, so a reader never sees a
         // half-written file even if the box loses power mid-write.
-        fs.writeFileSync(tmp, payload, 'utf8');
+        fs.writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
+        // rename keeps the source file's mode, so the mode has to be set on the
+        // temporary file above - setting it after the rename would leave a window
+        // where the journal was world-readable. This is what someone watched, and
+        // it is keyed by account, so it gets the same 600 as back/accounts/.
         fs.renameSync(tmp, file);
     } catch (err) {
         logger.error('history', 'profile write failed', {
@@ -357,24 +361,15 @@ function stats(profileId) {
     return { records: entry.records.size, counted, watch_seconds: seconds, min_watch_seconds: MIN_WATCH_SECONDS };
 }
 
-/* Local watch journal - OFF.
+/* Local watch journal.
  *
- * The journal is keyed by a profile id that the caller supplies, and nothing
- * proves the caller owns it. On a public host that means whoever names an id
- * reads that profile's rows, and `default` - the historical fallback - is a
- * well-known id anyone can type. Storage location does not help: the id travels
- * in the request, and cookie or localStorage is not proof of anything to the
- * server. Rows already on disk stay where they are, for the migration.
- *
- * The replacement keys the journal on the viewer's own Google account: the
- * client proves who it is with an OAuth token, the server resolves the identity
- * through the official API, and only then is a file read or written.
- *
- * One switch for the whole feature, because the Home feed and the History tab
- * read this store directly and would otherwise keep serving rows after the API
- * routes were closed. Every caller must consult historyStore.enabled.
+ * Keyed on the viewer's Google `sub` and reachable only through a server-verified
+ * session - see historyAccount in server.js. Nothing the caller sends names the
+ * file any more, so there is no id to guess and no "default" bucket to read.
+ * Rows written under the old caller-supplied profile ids stay on disk, untouched,
+ * and are no longer served by anything.
  */
-const ENABLED = false;
+const ENABLED = true;
 
 module.exports = {
     ENABLED,

@@ -2,15 +2,14 @@ const axios = require('axios');
 const qs = require('qs');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const bodyParser = require('body-parser');
+const logger = require('./logger');
+const viewerAccounts = require('./viewer_accounts');
 
 const LOG_FILE = path.join(__dirname, 'logs', 'error.log');
-const TOKEN_FOLDER = path.join(__dirname, 'token');
-const TOKEN_FILE = path.join(TOKEN_FOLDER, 'oauth_token.json');
-
-if (!fs.existsSync(TOKEN_FOLDER)) {
-    fs.mkdirSync(TOKEN_FOLDER);
-}
+// back/token/ is no longer written to: tokens belong to the viewer account that
+// /o/oauth2/token now adopts, and they live in back/accounts/<sub>.json.
 
 const logErrorToFile = (errorMessage) => {
     const timestamp = new Date().toISOString();
@@ -39,6 +38,14 @@ async function requestDeviceCode(client_id, scope) {
     }
 }
 
+/* A device code is a credential, not an identifier: anyone holding it can trade
+   it for tokens. Logs need to tie a polling sequence together, so they get a
+   stable short fingerprint instead of the value. */
+function secretFingerprint(value) {
+    if (!value) return null;
+    return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 8);
+}
+
 async function requestToken(client_id, device_code, client_secret, grant_type, refresh_token = null) {
     const tokenUrl = 'https://oauth2.googleapis.com/token';
     let params;
@@ -62,10 +69,13 @@ async function requestToken(client_id, device_code, client_secret, grant_type, r
     }
 
     try {
-        console.log('Requesting token with the following params:');
-        console.log(`client_id: ${client_id}`);
-        console.log(`device_code: ${device_code || 'N/A'}`);
-        console.log(`client_secret: ${client_secret}`);
+        // Never log the client secret or a device code: both are credentials, and
+        // the token response carries the access and refresh tokens verbatim.
+        logger.info('oauth', 'TOKEN_REQUEST', {
+            client_id,
+            grant_type,
+            device_code_fp: secretFingerprint(device_code),
+        });
 
         const response = await axios.post(tokenUrl, params, {
             headers: {
@@ -74,12 +84,21 @@ async function requestToken(client_id, device_code, client_secret, grant_type, r
         });
 
         if (response.data.access_token) {
-            console.log('Authorization successful, server response:', response.data);
+            logger.info('oauth', 'TOKEN_ISSUED', {
+                client_id,
+                grant_type,
+                device_code_fp: secretFingerprint(device_code),
+                token_type: response.data.token_type || null,
+                expires_in: Number(response.data.expires_in) || 0,
+                has_refresh_token: !!response.data.refresh_token,
+            });
             return response.data;
         }
 
         if (response.data.error === 'authorization_pending') {
-            console.log('Authorization pending. Please complete authorization on another device.');
+            logger.info('oauth', 'TOKEN_PENDING', {
+                device_code_fp: secretFingerprint(device_code),
+            });
         } else {
             throw new Error('Unexpected error during token request: ' + response.data.error_description);
         }
@@ -209,9 +228,54 @@ async function getYouTubeChannelData(accessToken) {
 
 const oauthRouter = (app) => {
 
+    /*
+     * The 2016 bundle asks for its device code here, from the client id and scope
+     * hardcoded in its own minified source, and then shows the code in the native
+     * "Sign in to this TV" dialog. Both requests the bundle makes are relative, so
+     * they land on this server and nowhere else - which means the dialog can be
+     * kept as the only sign-in UI while the grant behind it becomes ours.
+     *
+     * That is what the next block does: the code is requested for our client, not
+     * the bundle's. The dialog is unchanged - the same text box, the same code
+     * length, the same verification_url contract - but approving it signs the
+     * viewer in as a person, which is what /o/oauth2/token then needs to store.
+     *
+     * The bundle's own client_id and scope are ignored, deliberately. Honouring them
+     * would mean a second grant again: playback as one identity, the journal as
+     * another, on one set. If our client is not configured the request falls
+     * through to the legacy pair so a TV with no viewer OAuth still plays rather
+     * than presenting a sign-in that cannot succeed.
+     */
     app.post('/o/oauth2/device/code', async (req, res) => {
-        const { client_id, scope } = req.body;
+        const cfg = viewerAccounts.loadConfig();
 
+        if (cfg.ready) {
+            try {
+                const pending = await viewerAccounts.startSignIn();
+                logger.info('oauth', 'DEVICE_CODE_ISSUED', {
+                    client_id: cfg.clientId,
+                    scope: cfg.scope,
+                    expires_in: Math.round((pending.expiresAt - Date.now()) / 1000),
+                });
+                res.json({
+                    device_code: pending.deviceCode,
+                    user_code: pending.userCode,
+                    verification_url: pending.verificationUrl,
+                    expires_in: Math.max(0, Math.round((pending.expiresAt - Date.now()) / 1000)),
+                    interval: pending.interval,
+                });
+            } catch (error) {
+                const message = `Error during device code request: ${error.message}`;
+                logger.warn('oauth', 'device code request failed', {
+                    reason: logger.truncateStderr(String(error.message || error)),
+                });
+                res.status(500).send('Error during device code request.');
+                logErrorToFile(message);
+            }
+            return;
+        }
+
+        const { client_id, scope } = req.body;
         if (!client_id || !scope) {
             const errorMessage = 'Client ID and scope are required.';
             res.status(400).send(errorMessage);
@@ -236,43 +300,71 @@ const oauthRouter = (app) => {
         }
     });
 
+    /*
+     * Step 2 of the native sign-in, and the point where the account becomes real.
+     *
+     * The device_code in here belongs to whichever client /o/oauth2/device/code
+     * asked for it - our client, because that route now prefers it - so the
+     * exchange below uses our credentials and the bundle's client_secret in the
+     * body is discarded. Google rejects a device_code presented with the wrong
+     * client_id, so mixing the two would fail on the first poll.
+     *
+     * On success the token is adopted: identified against userinfo, cached, and its
+     * refresh token stored in back/accounts/<sub>.json. The session cookie is set
+     * here, on this response, so the very next request from the same browser is
+     * already signed in - the bundle does nothing to help with that, it only keeps
+     * the bearer in its own localStorage.
+     *
+     * Writing back/token/ is gone. That file existed for the old arrangement, where
+     * token_store.js hunted for it; token_store.js now reads the account this route
+     * creates, so a second copy of the same token on disk would only be a second
+     * thing to expire unnoticed.
+     *
+     * The 428/slow_down grammar below is untouched, and it is the only reason this
+     * route can be the poll loop: the bundle polls here itself, on a timer, until
+     * Google stops saying authorization_pending.
+     */
     app.post('/o/oauth2/token', async (req, res) => {
-        const { client_id, device_code, client_secret, grant_type, refresh_token } = req.body;
-    
-        if (!client_id || !client_secret || (!device_code && grant_type !== 'refresh_token')) {
+        const { device_code, grant_type, refresh_token } = req.body;
+        const isRefresh = grant_type === 'refresh_token';
+        const cfg = viewerAccounts.loadConfig();
+
+        if (!device_code && !isRefresh) {
             const errorMessage = 'Client ID, client secret, device_code (for device flow), and refresh_token (for refresh flow) are required.';
             res.status(400).send(errorMessage);
             logErrorToFile(errorMessage);
             return;
         }
-    
+
         try {
-            const tokenData = await requestToken(client_id, device_code, client_secret, grant_type, refresh_token);
-    
+            const tokenData = cfg.ready
+                ? await requestToken(cfg.clientId, device_code, cfg.clientSecret, grant_type, refresh_token)
+                : await requestToken(req.body.client_id, device_code, req.body.client_secret, grant_type, refresh_token);
+
             if (tokenData.access_token) {
-                const savedData = {
-                    access_token: tokenData.access_token,
-                    expires_in: tokenData.expires_in,
-                    token_type: tokenData.token_type,
-                };
-    
-                if (tokenData.refresh_token) {
-                    savedData.refresh_token = tokenData.refresh_token;
-                } else if (grant_type === 'refresh_token') {
-                    savedData.refresh_token = refresh_token;
+                if (!isRefresh && device_code && device_code !== 'undefined') {
+                    let identity = null;
+                    try {
+                        identity = await viewerAccounts.adoptExchangedToken(tokenData);
+                    } catch (error) {
+                        // Playback does not depend on knowing who this is: the
+                        // bundle walks away with a usable bearer either way, and
+                        // whoami will report the account as signed out rather than
+                        // reporting a broken sign-in.
+                        logger.warn('oauth', 'token issued, account not adopted', {
+                            device_code_fp: secretFingerprint(device_code),
+                            reason: logger.truncateStderr(String(error.message || error)),
+                        });
+                    }
+                    if (identity) {
+                        res.setHeader('Set-Cookie', viewerAccounts.sessionCookie(
+                            viewerAccounts.signSession(identity.sub, Date.now())));
+                        logger.info('oauth', 'viewer session issued', { sub: identity.sub });
+                    }
                 }
 
-                if (!device_code || device_code === 'undefined') {
-                    console.warn('Invalid or undefined device code, this dont matter much, since it aint used! It saves because I am lazy to find another way lol.');
-                    res.json(tokenData);
-                    return;
-                }
-    
-                const deviceTokenFile = path.join(TOKEN_FOLDER, `device_${device_code}_oauth_token.json`);
-                fs.writeFileSync(deviceTokenFile, JSON.stringify(savedData, null, 2), 'utf8');
-    
                 res.json(tokenData);
-                
+
             } else {
                 const errorMessage = 'Invalid token response: ' + JSON.stringify(tokenData);
                 res.status(400).send(errorMessage);
@@ -300,19 +392,20 @@ const oauthRouter = (app) => {
                     res.status(428).send(errorMessage);
                     logErrorToFile(`Authorization pending. Waiting for user authorization.`);
                 } else if (errorType === 'slow_down') {
-                    console.log('Received slow_down error, retrying...');
-                    const retryDelay = 2000; // Retry after 2 seconds
-                    setTimeout(async () => {
-                        try {
-                            const retryTokenData = await requestToken(client_id, device_code, client_secret, grant_type, refresh_token);
-                            res.json(retryTokenData);
-                            fs.writeFileSync(deviceTokenFile, JSON.stringify(retryTokenData, null, 2), 'utf8');
-                        } catch (retryError) {
-                            const retryErrorMessage = `Retry failed: ${retryError.message}`;
-                            res.status(418).send(retryErrorMessage);
-                            logErrorToFile(retryErrorMessage);
-                        }
-                    }, retryDelay);
+                    // Google is asking for a longer gap between polls, and this
+                    // branch used to answer by trying once more on a fixed two
+                    // second timer - which is slower than what it just asked for,
+                    // so it drew slow_down again and answered with 418. The bundle
+                    // is already pacing itself; the honest thing is to say so and
+                    // let it poll again, rather than guess a delay here and hold
+                    // the response open while guessing.
+                    logger.info('oauth', 'slow_down', {
+                        device_code_fp: secretFingerprint(device_code),
+                    });
+                    res.status(429).json({
+                        error: 'slow_down',
+                        interval: Number(errorDetails.interval) || 10,
+                    });
                 } else if (error.response.status === 400) {
                     const errorMessage = `Bad request: ${errorDescription}`;
                     res.status(400).send(errorMessage);

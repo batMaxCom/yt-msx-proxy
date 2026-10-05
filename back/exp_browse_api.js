@@ -187,19 +187,25 @@ async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, pr
         // Home only: a topic row must keep its own curation.
         if (isHomeId) updatedData = await personalizeHome(updatedData, profileId);
 
-        const logsDir = path.join(__dirname, 'logs');
-        if (!fs.existsSync(logsDir)) {
-            fs.mkdirSync(logsDir); 
+        // Full response dumps are debugging scaffolding. Unconditional they write
+        // two copies of every browse payload per request, which on a public host
+        // fills the disk within days. Off by default; the env var turns them back
+        // on for a debugging session.
+        if (process.env.YT_DUMP_BROWSE === '1') {
+            const logsDir = path.join(__dirname, 'logs');
+            if (!fs.existsSync(logsDir)) {
+                fs.mkdirSync(logsDir);
+            }
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const logFilePath = path.join(logsDir, `modded-browse-response-${timestamp}.json`);
+            const logFilePath2 = path.join(logsDir, `raw-browse-response-${timestamp}.json`);
+
+            fs.writeFileSync(logFilePath, JSON.stringify(updatedData, null, 2));
+            fs.writeFileSync(logFilePath2, JSON.stringify(response.data, null, 2));
+
+            console.log('Updated response saved to log file:', logFilePath);
         }
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const logFilePath = path.join(logsDir, `modded-browse-response-${timestamp}.json`);
-        const logFilePath2 = path.join(logsDir, `raw-browse-response-${timestamp}.json`);
-
-        fs.writeFileSync(logFilePath, JSON.stringify(updatedData, null, 2)); 
-        fs.writeFileSync(logFilePath2, JSON.stringify(response.data, null, 2)); 
-
-        console.log('Updated response saved to log file:', logFilePath);
 
         return updatedData;
     } catch (error) {
@@ -594,7 +600,7 @@ function browseEnvelope(shelves) {
 }
 
 async function localHistoryBrowse(profileId) {
-    if (!historyStore.enabled) return [];
+    if (!historyStore.ENABLED) return [];
     const items = await historyStore.listHistory(profileId, 300);
     const buckets = new Map();
     for (const rec of items) {
@@ -734,7 +740,7 @@ function personalizeHomeShelves(data, affinityChannels, watched) {
 /* Applies the journal to a home feed. Without a profile - or with an empty
    journal - the feed is returned exactly as it came in. */
 async function personalizeHome(data, profileId) {
-    if (!historyStore.enabled) return data;
+    if (!historyStore.ENABLED) return data;
     if (!profileId) return data;
     try {
         const [channels, watched] = await Promise.all([
@@ -1343,4 +1349,4 @@ async function convertSubscriptionsToV5(data, authHeader) {
 }
 
 
-module.exports = { fetchBrowseData };
+module.exports = { fetchBrowseData, browseEnvelope };

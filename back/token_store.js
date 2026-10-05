@@ -1,32 +1,45 @@
 /*
- * Stored account token.
+ * The bearer the TV plays as.
  *
- * The device flow in back/oauth_api_v3_api.js drops a
- * back/token/device_<code>_oauth_token.json for every account that paired. The TV
- * client sends its bearer on /api/guide and /api/browse, but plenty of clients
- * never send one at all, and those rows quietly fall back to the anonymous guide
- * with no Library, no uploads and no subscriptions. Rather than depend on the
- * client remembering, the newest saved token is picked up here.
+ * One sign-in, one token. The viewer authorises once through
+ * back/viewer_accounts.js; the refresh token lives in back/accounts/<sub>.json and
+ * the access token handed to InnerTube on every browse/guide/next comes from here,
+ * with the same scopes and the same refresh as the account itself. server.js calls
+ * getAccessToken() synchronously from the request path, so the old shape is kept
+ * even though the source of the token is now ours rather than the 2016 bundle's.
  *
- * Those tokens live ~16 hours, so reading the file is not enough: an expired one
- * gets refreshed with the same client id/secret the 2016 client itself ships
- * (assets/app-prod.js, d.Wn/d.Zj), the response is written back over the same
- * file, and the next request sees a live token. Nothing here ever logs a token
- * value - only which file was used and when it runs out.
+ * Nothing here logs a token value - only which account was used and when its
+ * token runs out.
  */
 
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const logger = require('./logger');
+const viewerAccounts = require('./viewer_accounts');
 
-const TOKEN_DIR = path.join(__dirname, 'token');
-const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const ACCOUNT_DIR = path.join(__dirname, 'accounts');
 
-// The 2016 TV app's own OAuth client. Its secret is not a secret: it ships in the
-// client bundle, and a refresh needs the same pair the token was issued to.
-const CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
-const CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT';
+/*
+ * One token store for the whole TV, fed by one sign-in.
+ *
+ * This used to read whatever the 2016 bundle's own OAuth client had left in
+ * back/token/, which meant the app had two identities: one for playing (the
+ * bundle's) and one for the journal (ours). Every video request rode on a token
+ * that had nothing to do with the signed-in viewer, and a viewer could be
+ * recognised while the TV played as somebody else's idea of what to show.
+ *
+ * Now there is one grant. The viewer signs in once, the refresh token lives in
+ * back/accounts/<sub>.json, and the bearer handed to InnerTube comes from here -
+ * the same account, the same scopes, the same refresh. token_store keeps its old
+ * name and synchronous getAccessToken() shape because server.js calls it from the
+ * request path, but what it hands out comes from viewer_accounts.
+ *
+ * Which account? A TV is shared by whoever is watching it, so there is one
+ * "current" account rather than one per request. It is the most recently signed
+ * in or most recently refreshed, which is what a person stepping up to the set
+ * expects. Per-request identity still comes from the session cookie elsewhere;
+ * this is only the bearer.
+ */
 
 // Refresh a little before the real expiry, so a request landing on the boundary
 // does not go out with a token that dies in flight.
@@ -34,60 +47,43 @@ const REFRESH_MARGIN_MS = 10 * 60 * 1000;
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const REFRESH_MIN_GAP_MS = 60 * 1000;
 
-let cached = null;            // { file, accessToken, expiresAt }
+let cached = null;            // { sub, accessToken, expiresAt }
 let lastAttemptAt = 0;
 let refreshing = null;        // in-flight refresh, shared by concurrent callers
 
-function tokenFiles() {
+/*
+ * Which stored account is the TV playing as.
+ *
+ * Newest mtime wins. signSession and refreshAccount both touch the file, so mtime
+ * means "most recently the active account" rather than merely "created first" -
+ * stepping up to a set after a different viewer used it picks the right bearer.
+ * There is deliberately no "first" account pinned at import: a shared TV should
+ * follow whoever used it last, and the journal below keeps per-sub rows regardless.
+ */
+function currentAccountFile() {
+    let names = [];
     try {
-        return fs.readdirSync(TOKEN_DIR).filter(name => name.endsWith('_oauth_token.json'));
+        names = fs.readdirSync(ACCOUNT_DIR).filter(name => /^[0-9]{6,32}\.json$/.test(name));
     } catch (err) {
         if (!err || err.code !== 'ENOENT') {
-            logger.warn('token', 'token dir unreadable', { message: logger.truncateStderr(String(err.message || err)) });
+            logger.warn('token', 'account dir unreadable', { message: logger.truncateStderr(String(err.message || err)) });
         }
-        return [];
+        return null;
     }
-}
-
-/* Newest file wins: a device code can be paired more than once and the later file
-   is the one that was refreshed last. */
-function newestTokenFile() {
     let best = null;
     let bestAt = -1;
-    for (const name of tokenFiles()) {
-        const full = path.join(TOKEN_DIR, name);
+    for (const name of names) {
+        const full = path.join(ACCOUNT_DIR, name);
         try {
             const mtime = fs.statSync(full).mtimeMs || 0;
-            if (mtime > bestAt) {
-                bestAt = mtime;
-                best = full;
-            }
+            if (mtime > bestAt) { bestAt = mtime; best = full; }
         } catch (err) { /* file vanished mid-scan */ }
     }
     return best;
 }
 
-function readTokenFile(file) {
-    try {
-        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (!parsed || typeof parsed.access_token !== 'string' || !parsed.access_token) return null;
-        const lifetime = Number(parsed.expires_in) || 0;
-        let issuedAt = 0;
-        try {
-            // expires_in is relative to issue time; the file mtime is the closest
-            // stand-in we have, since the device flow does not stamp one.
-            issuedAt = fs.statSync(file).mtimeMs || Date.now();
-        } catch (err) { issuedAt = Date.now(); }
-        return {
-            file,
-            accessToken: parsed.access_token,
-            refreshToken: typeof parsed.refresh_token === 'string' ? parsed.refresh_token : '',
-            expiresAt: lifetime > 0 ? issuedAt + lifetime * 1000 : 0,
-        };
-    } catch (err) {
-        logger.warn('token', 'token file unreadable', { message: logger.truncateStderr(String(err.message || err)) });
-        return null;
-    }
+function subOfFile(file) {
+    return file ? path.basename(file, '.json') : '';
 }
 
 function logState(level, message, file, token, extra) {
@@ -99,82 +95,59 @@ function logState(level, message, file, token, extra) {
     });
 }
 
-async function refreshToken(token) {
-    if (!token || !token.refreshToken) return null;
-    const response = await axios.post(OAUTH_TOKEN_URL, null, {
-        params: {
-            client_id: CLIENT_ID,
-            client_secret: CLIENT_SECRET,
-            refresh_token: token.refreshToken,
-            grant_type: 'refresh_token',
-        },
-        timeout: 20000,
-    });
-    const data = response.data || {};
-    if (!data.access_token) throw new Error('refresh response had no access_token');
-
-    const lifetime = Number(data.expires_in) || 0;
-    const now = Date.now();
-    const saved = {
-        access_token: data.access_token,
-        expires_in: lifetime,
-        token_type: data.token_type || 'Bearer',
-        refresh_token: data.refresh_token || token.refreshToken,
-    };
-    // Same path, so the next start finds the fresh one first.
-    fs.writeFileSync(token.file, JSON.stringify(saved, null, 2), 'utf8');
-
-    return {
-        file: token.file,
-        accessToken: data.access_token,
-        refreshToken: saved.refresh_token,
-        expiresAt: lifetime > 0 ? now + lifetime * 1000 : 0,
-    };
+/*
+ * Mint an access token for an account.
+ *
+ * viewer_accounts owns the credentials and already does this: it holds the
+ * refresh token per sub, collapses concurrent refreshes into one, writes the
+ * account file back, and logs without ever printing a token. Doing it again here
+ * would mean a second copy of the refresh logic and a second place for it to be
+ * wrong, so this only asks.
+ */
+async function refreshToken(sub) {
+    const accessToken = await viewerAccounts.accessTokenFor(sub);
+    return accessToken ? { sub, accessToken, expiresAt: 0 } : null;
 }
 
 /*
- * Load the newest saved token, refreshing it when it is inside the expiry margin.
- * Concurrent callers share one refresh instead of racing to write the same file.
+ * Resolve the current account's bearer, refreshing if the cached one is inside
+ * the expiry margin. Concurrent callers share one refresh rather than each
+ * firing their own.
  */
 async function load({ force = false } = {}) {
-    const file = newestTokenFile();
+    const file = currentAccountFile();
     if (!file) {
         cached = null;
         return null;
     }
-    if (cached && cached.file === file && !force) {
+    const sub = subOfFile(file);
+    if (cached && cached.sub === sub && !force) {
+        // expiresAt 0 means "no local expiry known"; viewer_accounts tracks the
+        // real one in memory, so a cached token is trusted until it asks for it.
         const stillFresh = cached.expiresAt === 0 || cached.expiresAt - REFRESH_MARGIN_MS > Date.now();
         if (stillFresh) return cached;
-    }
-
-    const token = readTokenFile(file);
-    if (!token) return null;
-
-    const expired = token.expiresAt > 0 && token.expiresAt - REFRESH_MARGIN_MS <= Date.now();
-    if (!expired) {
-        cached = token;
-        logState('info', 'using stored token', file, token);
-        return cached;
     }
 
     if (refreshing) return refreshing;
 
     refreshing = (async () => {
         try {
-            const fresh = await refreshToken(token);
-            cached = fresh;
-            logState('info', 'stored token refreshed', fresh.file, fresh);
-            return fresh;
+            const fresh = await refreshToken(sub);
+            if (fresh) {
+                cached = fresh;
+                logState('info', 'using viewer account token', file, fresh);
+                return cached;
+            }
+            cached = null;
+            return null;
         } catch (err) {
-            logger.warn('token', 'stored token refresh failed', {
-                file: path.basename(token.file),
+            logger.warn('token', 'viewer account token unavailable', {
+                sub,
                 status: err.response ? err.response.status : undefined,
                 message: logger.truncateStderr(String(err.message || err)),
             });
-            // An expired token is still better than none for endpoints that only
-            // use it as a hint, but it must not be cached as a live one.
-            cached = token;
-            return token;
+            cached = null;
+            return null;
         } finally {
             refreshing = null;
             lastAttemptAt = Date.now();
@@ -190,23 +163,15 @@ async function load({ force = false } = {}) {
  * started in the background and picked up by the next request.
  */
 function getAccessToken() {
-    if (cached && (cached.expiresAt === 0 || cached.expiresAt - REFRESH_MARGIN_MS > Date.now())) {
-        return cached.accessToken;
-    }
+    if (cached) return cached.accessToken;
     const now = Date.now();
+    // Kick off the first load, then throttle so a signed-out TV - one with no
+    // account file at all - does not retry on every single request.
     if (!refreshing && now - lastAttemptAt > REFRESH_MIN_GAP_MS) {
         lastAttemptAt = now;
         void load();
     }
-    if (cached) return cached.accessToken;
-    const file = newestTokenFile();
-    const token = file ? readTokenFile(file) : null;
-    if (token) cached = token;
-    return token ? token.accessToken : null;
-}
-
-function isStale() {
-    return !!(cached && cached.expiresAt > 0 && cached.expiresAt - REFRESH_MARGIN_MS <= Date.now());
+    return cached ? cached.accessToken : null;
 }
 
 /*
@@ -220,7 +185,7 @@ function isStale() {
  * keeping the event loop alive (the listener has not been created yet).
  */
 async function prepare({ timeoutMs = 15000 } = {}) {
-    if (!newestTokenFile()) return null;
+    if (!currentAccountFile()) return null;
     let timer = null;
     try {
         return await Promise.race([
@@ -236,7 +201,13 @@ function startBackgroundRefresh() {
     // Idempotent: prepare() normally already loaded, so this is a cache hit.
     void load();
     const timer = setInterval(() => {
-        if (isStale()) void load();
+        // Unconditional rather than isStale(): viewer_accounts tracks the real
+        // expiry in memory and this module deliberately does not duplicate that
+        // bookkeeping, so "is it stale" is not answerable from here. load() is a
+        // no-op when the token is still good - accessTokenFor returns the cached
+        // access token without a request - and it also picks up a different
+        // account after someone else signs in.
+        void load();
     }, REFRESH_INTERVAL_MS);
     if (timer.unref) timer.unref();
     return timer;

@@ -12,3 +12,6 @@ node_modules/
 /back/streams/
 # OAuth client of our own GCP project for viewer sign-in. Secrets, never commit.
 /back/viewer_auth.env
+
+# Per-account OAuth refresh tokens and the session signing key.
+/back/accounts/
