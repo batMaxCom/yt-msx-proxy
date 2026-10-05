@@ -367,6 +367,31 @@ async function startSignIn() {
  * identify is deliberately not fatal: the bundle needs a bearer to keep playing,
  * and a TV that plays without a name beats a sign-in dialog that errors out.
  */
+/*
+ * Scope lists are only ever widened, never narrowed.
+ *
+ * Google's device flow does not report the granted scopes consistently: the
+ * same consent screen asking for "openid youtube" came back as both, then as
+ * openid alone, on consecutive sign-ins. Replacing what is stored with whatever
+ * one response happened to say turns a working account into one that can only
+ * read openid, and the damage is permanent because the narrower refresh token
+ * replaces the wider one. Merging keeps the widest grant this account has ever
+ * shown, and a genuine downgrade gets logged instead of passing unnoticed.
+ */
+function mergeScopes(...lists) {
+    const out = [];
+    const seen = new Set();
+    for (const list of lists) {
+        for (const raw of list || []) {
+            const scope = String(raw || '').trim();
+            if (!scope || seen.has(scope)) continue;
+            seen.add(scope);
+            out.push(scope);
+        }
+    }
+    return out;
+}
+
 async function adoptExchangedToken(data) {
     if (!data || !data.access_token) {
         const e = new Error('token response had no access_token');
@@ -400,13 +425,28 @@ async function adoptExchangedToken(data) {
 
     if (identity && refreshToken) {
         const existing = loadAccount(identity.sub) || {};
+        const cfg = loadConfig();
+        const requested = String(cfg.scope || '').split(/\s+/).filter(Boolean);
+        const granted = identity.scopes || [];
+        const scopes = mergeScopes(existing.scopes, granted, requested);
+        const missing = requested.filter((scope) => !granted.includes(scope));
+        if (missing.length) {
+            // Loud on purpose: a grant that came back short is the difference
+            // between a working TV and one that cannot reach the Data API.
+            logger.warn('accounts', 'exchange granted fewer scopes than requested', {
+                sub: identity.sub,
+                requested,
+                granted,
+                missing,
+            });
+        }
         saveAccount(identity.sub, {
             sub: identity.sub,
             refresh_token: refreshToken,
             channel_id: identity.channelId || existing.channel_id || '',
             name: identity.name || existing.name || '',
             avatar: identity.avatar || existing.avatar || '',
-            scopes: identity.scopes,
+            scopes,
             created_at: existing.created_at || new Date(now).toISOString(),
             last_seen_at: new Date(now).toISOString(),
         });
@@ -414,7 +454,7 @@ async function adoptExchangedToken(data) {
 
     logger.info('accounts', 'adopted exchanged token', {
         sub: identity ? identity.sub : null,
-        scopes: identity ? identity.scopes : null,
+        scopes: identity ? mergeScopes(identity.scopes) : null,
         expires_in: lifetime,
         stored_refresh_token: !!(identity && refreshToken),
     });
@@ -533,18 +573,19 @@ async function refreshAccount(sub) {
     tokenCache.set(sub, entry);
 
     stored.last_seen_at = new Date().toISOString();
-    if (entry.refreshToken !== stored.refresh_token) stored.refresh_token = entry.refreshToken;
-    // Refresh responses carry the granted scopes too, which is how an account
-    // that was stored before scopes came from the right source gets corrected
-    // without asking the viewer to sign in again.
+    if (entry.refreshToken !== stored.refresh_token) stored.refresh_token = entry.refresh_token;
+    // A refresh response may omit scopes or report them short, so it widens the
+    // stored list and never trims it - see mergeScopes. An account stored before
+    // scopes were read from the right source still gets corrected here.
     const granted = typeof data.scope === 'string' ? data.scope.split(/\s+/).filter(Boolean) : [];
-    if (granted.length && JSON.stringify(granted) !== JSON.stringify(stored.scopes || [])) {
-        logger.info('accounts', 'granted scopes corrected on refresh', {
+    const merged = mergeScopes(stored.scopes, granted);
+    if (granted.length && JSON.stringify(merged) !== JSON.stringify(stored.scopes || [])) {
+        logger.info('accounts', 'granted scopes widened on refresh', {
             sub,
-            scopes: granted,
+            scopes: merged,
             previous: stored.scopes || [],
         });
-        stored.scopes = granted;
+        stored.scopes = merged;
     }
     saveAccount(sub, stored);
 
