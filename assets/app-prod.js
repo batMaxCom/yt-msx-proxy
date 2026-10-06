@@ -9908,6 +9908,12 @@
         };
         d.lB = function () {
             var a = this.P.ic();
+            if (!a) try {
+                a = !(!window.YTCustomPlayer || !YTCustomPlayer.isSignedIn || !YTCustomPlayer.isSignedIn())
+            } catch (b) {
+                a = !1
+            }
+            window.YTCustomPlayer && YTCustomPlayer.registerGuideView && YTCustomPlayer.registerGuideView(this);
             a ? this.za("logged-in") : this.Ha("logged-in");
             this.xW(a);
             this.render()
@@ -9975,35 +9981,28 @@
         };
 
         d.gN = function (a) {
-
-            console.log("d.gN a guide:", a);
-
-            if (a.accountListHeader && a.accountListHeader.activeAccountHeaderRenderer) {
-
-                console.log("d.gN a guide:", a);
-
-                a = a.accountListHeader.activeAccountHeaderRenderer;
-
-                console.log("d.gN a guide:", a);
-
-                // Set userName and dr
-                this.userName = L(a.accountName);
-                this.dr = this.$a.g(a.accountPhoto);
-        
-                // Log values for better clarity
-                console.log("userName guide:", this.userName);
-                console.log("dr guide:", this.dr);
-        
-                // Set unlimitedStatus if available
-                if (a.unlimitedStatus) {
-                    this.unlimitedStatus = L(a.unlimitedStatus[0]);
-                    console.log("unlimitedStatus guide:", this.unlimitedStatus);
+            var b = "",
+                c = "";
+            if (a && a.accountListHeader && a.accountListHeader.activeAccountHeaderRenderer) {
+                var e = a.accountListHeader.activeAccountHeaderRenderer;
+                b = L(e.accountName);
+                c = this.$a.g(e.accountPhoto);
+                e.unlimitedStatus && (this.unlimitedStatus = L(e.unlimitedStatus[0]))
+            } else if (a && a.topbar && a.topbar.guideSectionRenderer && a.topbar.guideSectionRenderer.items) {
+                // This is the shape the 2016 guide call actually returns: the
+                // signed-in account sits in the topbar rather than in an
+                // accountListHeader, and its title is a plain string.
+                for (var f = a.topbar.guideSectionRenderer.items, g = 0; g < f.length; g++) {
+                    var k = f[g] && f[g].guideAccountEntryRenderer;
+                    if (k) {
+                        b = k.title && k.title.simpleText ? k.title.simpleText : L(k.title);
+                        k.thumbnail && k.thumbnail.thumbnails && k.thumbnail.thumbnails.length && (c = k.thumbnail.thumbnails[k.thumbnail.thumbnails.length - 1].url || "");
+                        break
+                    }
                 }
-            }
-        
-            // Log event update
-            this.S.J("unlimited-status-update", !!this.unlimitedStatus);
-            console.log("unlimited-status-update event triggered:", !!this.unlimitedStatus);
+            }(b || c) && (this.userName = b, this.dr = c);
+            window.YTCustomPlayer && YTCustomPlayer.noteGuideAccount && YTCustomPlayer.noteGuideAccount(b, c);
+            this.S.J("unlimited-status-update", !!this.unlimitedStatus)
         };
         
         d.tO = function (a) {
@@ -33172,7 +33171,44 @@
             this.h.Ix && (a = this.f.action().$b(this.D).Rb("[[CREDITS|Button that shows credit information, giving credit to all open-source software used in building this product.]]").Jb(),
                 this.g.push(a));
             a = this.f.action().ep("request-tos-dialog").Rb("[[Privacy & Terms|Title of menu item which shows links to terms of service and privacy documents on youtube.com.]]").Ud("icon-settings-term").wl("terms-tile").Jb();
-            this.g.push(a)
+            this.g.push(a);
+            // Which of the two account pictures the guide sidebar shows. Built as
+            // a toggle tile so it carries its own state, with the label replaced
+            // by the source that is currently on rather than Enabled/Disabled.
+            // The tile component listens on its flag for value:changed, so the
+            // flag is a real emitter rather than a bare get/set pair.
+            var listeners = [];
+            a = this.f.ej({
+                get: function () {
+                    return !window.YTCustomPlayer || !YTCustomPlayer.avatarSource || "channel" === YTCustomPlayer.avatarSource()
+                },
+                set: function (b) {
+                    window.YTCustomPlayer && YTCustomPlayer.setAvatarSource && YTCustomPlayer.setAvatarSource(b ? "channel" : "google");
+                    for (var c = listeners.slice(), d = 0; d < c.length; d++) try {
+                        c[d]()
+                    } catch (g) { }
+                },
+                C: function (b, c) {
+                    if ("value:changed" !== b) return q;
+                    listeners.push(c);
+                    return function () {
+                        for (var b = 0; b < listeners.length; b++) if (listeners[b] === c) {
+                            listeners.splice(b, 1);
+                            break
+                        }
+                    }
+                }
+            }).Rb("[[Avatar source|Title for the tile that picks which profile picture the guide shows.]]").Og("[[Choose whether the guide shows your Google account picture or your YouTube channel picture.|Description for the tile that picks which profile picture the guide shows.]]").wl("avatar-source-tile").Jb();
+            var e = this.f.h.ia("[[Google account|Label that names the Google account picture as the one the guide shows.]]"),
+                f = this.f.h.ia("[[YouTube channel|Label that names the YouTube channel picture as the one the guide shows.]]");
+            a.qL = function () {
+                var b = "channel";
+                try {
+                    window.YTCustomPlayer && YTCustomPlayer.avatarSource && (b = YTCustomPlayer.avatarSource())
+                } catch (c) { }
+                return "google" === b ? e : f
+            };
+            this.g.unshift(a)
         };
         d.dT = function () {
             this.ha.get(q, q)
@@ -36602,9 +36638,7 @@
                     return a.model.ag
                 },
                 unlimitedStatus: function (a) {
-                   console.log("unlimitedStatus: ", a.model.stuff[0].items[0].guideAccountEntryRenderer.title.accessibility.accessibilityData.label); // Fallback logging
-
-                    return "" // We don't want this to be used!
+                    return (a && a.unlimitedStatus) || ""
                 },                
                 catchRowMouseMove: function (a) {
                     return a.ut
@@ -36652,15 +36686,13 @@
                     return a.model.oL()
                 },
                 userAvatar: function (a) {
-
-                    console.log("userAvatar: ", a.model.stuff[0].items[0].guideAccountEntryRenderer.thumbnail.thumbnails[0].url); // Fallback logging
-
-                    var avatar = a.model.stuff[0].items[0].guideAccountEntryRenderer.thumbnail.thumbnails[0].url ? a.model.stuff[0].items[0].guideAccountEntryRenderer.thumbnail.thumbnails[0].url : APP_URL + "/assets/default_pfp.png"; 
-                
-                    console.log("moron", a); 
-
-                    return avatar;
-                },               
+                    var avatar = "";
+                    try {
+                        window.YTCustomPlayer && YTCustomPlayer.sidebarAvatar && (avatar = YTCustomPlayer.sidebarAvatar())
+                    } catch (b) { }
+                    avatar || (avatar = a && a.dr || "");
+                    return avatar
+                },
                 "model.durationMinutes": function (a) {
                     return a.model.Oj
                 },
@@ -36758,7 +36790,12 @@
                     return a.model.qL()
                 },
                 userName: function (a) {
-                    return  a.model.stuff[0].items[0].guideAccountEntryRenderer.title.runs[0].text
+                    var name = "";
+                    try {
+                        window.YTCustomPlayer && YTCustomPlayer.sidebarName && (name = YTCustomPlayer.sidebarName())
+                    } catch (b) { }
+                    name || (name = a && a.userName || "");
+                    return name
                 },
                 platformUserIcon: function (a) {
                     return a.wi

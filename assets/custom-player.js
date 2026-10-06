@@ -93,9 +93,101 @@
             if (r && r.signed_in) {
                 authState.signed_in = true;
                 authState.profile = r;
+                /* The guide may already be up with no picture on it, so give it
+                   the account picture as soon as we learn who this is. */
+                refreshSidebar();
             }
         });
         return authState;
+    }
+
+    /* ---- guide sidebar identity ----
+       The guide template has always carried a profile block - an avatar and the
+       account name inside #user-info-background - but the bindings that feed it
+       were written against a response shape the YouTube TV /guide call never had,
+       so it stayed empty. The real account entry lives under
+       topbar.guideSectionRenderer.items[].guideAccountEntryRenderer and is handed
+       over by the patched Ui.gN; the Google account picture comes from
+       /api/auth/whoami.
+
+       Which of the two pictures the sidebar shows is the viewer's own choice, and
+       it lives in localStorage next to the other local settings. "channel" is the
+       YouTube channel avatar the guide itself carries, "google" is the picture on
+       the Google account. The channel picture wins when the preferred source has
+       nothing to show, so the sidebar is never blank while signed in. */
+
+    var AVATAR_SOURCE_KEY = 'yt_avatar_source';
+    var guideAccount = { name: '', avatar: '' };
+    var guideView = null;
+
+    function avatarSource() {
+        try {
+            return global.localStorage.getItem(AVATAR_SOURCE_KEY) === 'google' ? 'google' : 'channel';
+        } catch (e) { return 'channel'; }
+    }
+
+    function setAvatarSource(v) {
+        try {
+            global.localStorage.setItem(AVATAR_SOURCE_KEY, v === 'google' ? 'google' : 'channel');
+        } catch (e) { }
+    }
+
+    function googleAvatar() {
+        return (authState.profile && authState.profile.avatar) || '';
+    }
+
+    function sidebarAvatar() {
+        var source = avatarSource();
+        var avatar = source === 'google'
+            ? (googleAvatar() || guideAccount.avatar)
+            : (guideAccount.avatar || googleAvatar());
+        if (avatar) return avatar;
+        return '/assets/default_pfp.png';
+    }
+
+    function sidebarName() {
+        if (guideAccount.name) return guideAccount.name;
+        var p = authState.profile;
+        return (p && p.name) || '';
+    }
+
+    /* The app's own authService only knows about the token it stores itself, so
+       it stays signed out here even when the server has a session. Treat either
+       as signed in: the guide block should follow whoever the server can see. */
+    function isSignedIn() {
+        if (authState.signed_in) return true;
+        try { return !!global.localStorage.getItem('tv-refresh-token'); } catch (e) { return false; }
+    }
+
+    /* Called by the patched Ui.gN with what the guide response actually carries. */
+    function noteGuideAccount(name, avatar) {
+        if (typeof name === 'string') guideAccount.name = name;
+        if (typeof avatar === 'string') guideAccount.avatar = avatar;
+        return guideAccount;
+    }
+
+    /* Re-render the sidebar. The guide component keeps its own copy of the name
+       and avatar and toggles the .logged-in class that unhides the block, so it
+       is asked to run again rather than poking its markup behind its back; the
+       direct write is only the fallback for the moment before it exists. */
+    function refreshSidebar() {
+        try {
+            if (guideView && typeof guideView.lB === 'function') {
+                guideView.lB();
+                return;
+            }
+        } catch (e) { }
+        try {
+            var doc = global.document;
+            var pic = doc && doc.getElementById('guide-user-avatar');
+            if (pic) pic.style.backgroundImage = 'url(' + sidebarAvatar() + ')';
+            var text = doc && doc.querySelector('.guide-user-name');
+            if (text) text.textContent = sidebarName();
+        } catch (e) { }
+    }
+
+    function registerGuideView(view) {
+        guideView = view || null;
     }
 
     /* ---- local watch journal ----
@@ -4455,6 +4547,16 @@
            server keys the journal on the signed-in account. */
         getProfile: function () { return histProfileId(); },
         getAuth: function () { return authProbe(); },
+        /* The guide sidebar's own picture and name, plus the switch that picks
+           which account picture the sidebar shows. */
+        isSignedIn: isSignedIn,
+        sidebarAvatar: sidebarAvatar,
+        sidebarName: sidebarName,
+        avatarSource: avatarSource,
+        setAvatarSource: function (v) { setAvatarSource(v); refreshSidebar(); },
+        noteGuideAccount: noteGuideAccount,
+        registerGuideView: registerGuideView,
+        refreshSidebar: refreshSidebar,
         /*
          * Sign-in is deliberately absent. YTCustomPlayer.signIn() used to be the
          * way to get a token without touching the app's own dialog, and with it
@@ -4463,9 +4565,17 @@
          * front door, which is what this whole change exists to remove.
          */
         signOut: function () {
+            /*
+             * Stop the video first, and not as a detail: histEnd() flushes the
+             * time actually played, and leaving the player running after a
+             * sign-out keeps the heartbeat timer alive against an account that
+             * has just left the set.
+             */
+            try { stopActive(); } catch (e) { }
             authRequest('POST', '/api/auth/logout', null, function () {
                 authState = { checked: true, signed_in: false, profile: null };
                 beacon('CP_AUTH_LOGOUT', {});
+                refreshSidebar();
             });
         },
         refreshAuth: function () {

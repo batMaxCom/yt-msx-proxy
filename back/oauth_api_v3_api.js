@@ -438,14 +438,50 @@ const oauthRouter = (app) => {
             return;
         }
 
+        /*
+         * This is the bundle's sign-out, and it is the only sign-out that is not
+         * ours. Its Settings menu clears the bearer it kept in memory and the
+         * tv-refresh-token it stored, then posts the token here - it never calls
+         * /api/*, and yt_sess is HttpOnly, so from its point of view the viewer
+         * session does not exist. Left alone that means signing out on the set
+         * ends the client but not the account: history keeps recording under the
+         * sub in the cookie, and the History tab keeps showing it, because from
+         * the server's side nobody ever left.
+         *
+         * So end that session here, before the token is handed back to Google.
+         * Local-only: the grant survives a client-side sign-out, so signing back in
+         * does not need a fresh device flow. Revoking the grant stays behind
+         * /api/auth/logout.
+         */
+        try {
+            const sub = viewerAccounts.endSessionFromCookieHeader(
+                req.headers && req.headers.cookie);
+            if (sub) {
+                res.setHeader('Set-Cookie', viewerAccounts.clearedSessionCookie());
+                logger.info('auth', 'viewer session ended by bundle sign out', { sub });
+            }
+        } catch (error) {
+            logger.warn('auth', 'bundle sign out could not end viewer session', {
+                reason: logger.truncateStderr(String(error.message || error)),
+            });
+        }
+
         try {
     
-            const result = await revokeToken(token);``
+            const result = await revokeToken(token);
             res.json(result);
         } catch (error) {
-            const errorMessage = `Error during token revocation: ${error.message}`;
-            res.status(500).send(errorMessage);
-            logErrorToFile(errorMessage);
+            /*
+             * Google refusing the token is not a failed sign-out. The viewer
+             * session is already ended above and the bundle drops its copy of the
+             * token whatever the answer says, so a 500 here only makes the client
+             * treat a completed sign-out as a broken one. Report it and answer
+             * normally - the sign-out is the outcome, not Google's opinion of it.
+             */
+            logger.warn('auth', 'google revoke failed, sign out still completed', {
+                reason: logger.truncateStderr(String(error.message || error)),
+            });
+            res.json({ message: 'Token revocation reported an error; local sign out completed.' });
         }
     });
     

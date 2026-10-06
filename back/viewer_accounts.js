@@ -314,6 +314,41 @@ function clearedSessionCookie() {
     return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
 }
 
+/*
+ * End whatever viewer session a Cookie header carries, and report which account it
+ * belonged to ('' if there was none, or if it did not verify).
+ *
+ * There are two sign-outs in this app and only one of them is ours. /api/auth/logout
+ * is a viewer route and can call anything it likes; the bundle's own Settings
+ * sign-out speaks OAuth and never touches /api/*, so the only place it can reach us
+ * is the revoke endpoint. Without this, a sign-out from the native menu drops the
+ * bearer the bundle was holding and leaves yt_sess standing - the set looks signed
+ * out while the server keeps filing watch time under an account that has left.
+ *
+ * signOutLocalOnly rather than signOut: a client signing itself out should not
+ * destroy the grant it is holding, or the next sign-in needs a whole new device
+ * flow. Revoking the grant stays an explicit choice behind /api/auth/logout.
+ */
+function endSessionFromCookieHeader(cookieHeader) {
+    if (!cookieHeader || typeof cookieHeader !== 'string') return '';
+    const needle = `${SESSION_COOKIE}=`;
+    for (const part of cookieHeader.split(';')) {
+        const trimmed = part.trim();
+        if (trimmed.indexOf(needle) !== 0) continue;
+        let raw = '';
+        try {
+            raw = decodeURIComponent(trimmed.slice(needle.length));
+        } catch (e) {
+            raw = trimmed.slice(needle.length);
+        }
+        const sub = verifySession(raw);
+        if (!sub) return '';
+        signOutLocalOnly(sub);
+        return sub;
+    }
+    return '';
+}
+
 /* ---- device flow -------------------------------------------------------- */
 
 /*
@@ -368,15 +403,22 @@ async function startSignIn() {
  * and a TV that plays without a name beats a sign-in dialog that errors out.
  */
 /*
- * Scope lists are only ever widened, never narrowed.
+ * Two scope lists, and the difference between them is the whole point.
  *
- * Google's device flow does not report the granted scopes consistently: the
- * same consent screen asking for "openid youtube" came back as both, then as
- * openid alone, on consecutive sign-ins. Replacing what is stored with whatever
- * one response happened to say turns a working account into one that can only
- * read openid, and the damage is permanent because the narrower refresh token
- * replaces the wider one. Merging keeps the widest grant this account has ever
- * shown, and a genuine downgrade gets logged instead of passing unnoticed.
+ * `scopes` is the widest grant this account has ever been issued - merged, never
+ * narrowed, because Google's device flow does not report granted scopes
+ * consistently: the same consent screen asking for "openid youtube" came back as
+ * both, then as openid alone, on consecutive sign-ins. Narrowing the stored list on
+ * one short answer would be permanent, since the narrower refresh token replaces
+ * the wider one.
+ *
+ * `granted_scopes` is what the token in hand can actually do right now, and it is
+ * the only one of the two that may be replaced. It is read from Google's own
+ * response, never inferred from what was requested. This is what `has_youtube`
+ * reports: YouTube answers a request made with an openid-only bearer with
+ * "403 insufficient authentication scopes", so a stored-but-ungranted youtube
+ * scope is not a near miss, it is the exact reason the app's tabs stay anonymous
+ * while Settings insists the viewer is signed in.
  */
 function mergeScopes(...lists) {
     const out = [];
@@ -447,6 +489,9 @@ async function adoptExchangedToken(data) {
             name: identity.name || existing.name || '',
             avatar: identity.avatar || existing.avatar || '',
             scopes,
+            // What this token can do now. Google answered, so this is a fact and
+            // not a guess - and it is allowed to shrink when the grant shrinks.
+            granted_scopes: mergeScopes(granted),
             created_at: existing.created_at || new Date(now).toISOString(),
             last_seen_at: new Date(now).toISOString(),
         });
@@ -587,6 +632,18 @@ async function refreshAccount(sub) {
         });
         stored.scopes = merged;
     }
+    // A refresh is the cheapest place there is to learn what the live token can
+    // actually do, because Google puts the answer in every response. Keep it, so
+    // has_youtube stops reporting a scope the account requested once and may
+    // never have been granted.
+    if (granted.length && JSON.stringify(granted) !== JSON.stringify(stored.granted_scopes || null)) {
+        logger.info('accounts', 'live token scopes recorded', {
+            sub,
+            granted,
+            previous: stored.granted_scopes || null,
+        });
+        stored.granted_scopes = granted;
+    }
     saveAccount(sub, stored);
 
     logger.info('accounts', 'access token refreshed', {
@@ -659,6 +716,16 @@ function cachedAccessTokenFor(sub) {
 function publicProfile(sub, meta) {
     if (!sub) return { signed_in: false };
     const stored = loadAccount(sub) || {};
+
+    // What the account asked for, and what the token in hand can actually do.
+    const requested = (meta && meta.scopes) || stored.scopes || [];
+    // An account written before granted_scopes existed has no reading yet, so fall
+    // back to the requested list rather than accusing a healthy grant of being
+    // broken. The next refresh - which whoami already awaits - fills it in.
+    const granted = (meta && meta.grantedScopes) || stored.granted_scopes || requested;
+    const hasYoutube = [granted].some((l) => l.some((s) => /youtube/.test(s)));
+    const wantsYoutube = [requested].some((l) => l.some((s) => /youtube/.test(s)));
+
     return {
         signed_in: true,
         sub,
@@ -666,10 +733,16 @@ function publicProfile(sub, meta) {
         avatar: (meta && meta.avatar) || stored.avatar || '',
         channel_id: (meta && meta.channelId) || stored.channel_id || '',
         has_channel: !!((meta && meta.channelId) || stored.channel_id),
-        // Falls back to the stored scopes, because whoami calls this without meta.
-        // Reading meta only meant has_youtube was false for every signed-in viewer
-        // checking their own session, however complete the grant actually was.
-        has_youtube: [((meta && meta.scopes) || stored.scopes || [])].some(l => l.some(s => /youtube/.test(s))),
+        has_youtube: hasYoutube,
+        /*
+         * Signed in, but Google never handed over the YouTube scope. Worth saying
+         * out loud, because the symptom otherwise reads as an app bug: the viewer
+         * is signed in, Settings says so, and yet YouTube answers every data call
+         * with "403 insufficient authentication scopes" and the app's own tabs stay
+         * anonymous. Only another consent screen can fix that, so say that instead
+         * of leaving the person to guess.
+         */
+        needs_youtube_consent: !hasYoutube && wantsYoutube,
         last_seen_at: stored.last_seen_at || null,
     };
 }
@@ -740,6 +813,7 @@ module.exports = {
     verifySession,
     signSession,
     revokeSessionsFor,
+    endSessionFromCookieHeader,
     sessionsRevokedAfter,
     sessionCookie,
     clearedSessionCookie,

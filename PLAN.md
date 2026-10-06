@@ -97,6 +97,22 @@ Watch Later). Поэтому личность и список подписок �
 - [x] Ничего не блокирует: без входа ТВ работает как раньше
 - [x] Версия плеера `20261002j` → `20261002k`, cache-bust в `index.html`
 
+### Профиль в гайде
+
+- [x] `#user-info-background` в левой панели: аватар и имя аккаунта под ним
+- [x] `Ui.gN` читает `topbar.guideSectionRenderer.items[].guideAccountEntryRenderer` —
+      в ответе 2016 года нет `accountListHeader`, заголовок там `simpleText`,
+      а не `runs`; старые `console.log` перед `if` роняли весь рендер
+- [x] Биндинги `userAvatar` / `userName` / `unlimitedStatus` больше не читают
+      несуществующее `model.stuff`: раньше панель оставалась пустой
+- [x] `.logged-in` ставится, если `authService.ic()` **или** `whoami` видит
+      сессию; без него `#user-info-background` остаётся `display:none`
+- [x] Тайл **Avatar source** в настройках: `channel` — аватар YouTube-канала из
+      гайда, `google` — картинка аккаунта Google; выбор в `yt_avatar_source`
+- [x] `YTCustomPlayer`: `isSignedIn` / `sidebarAvatar` / `sidebarName` /
+      `avatarSource` / `setAvatarSource` / `noteGuideAccount` / `refreshSidebar`
+- [x] Кэш-баст `index.html`: плеер `20261006b`, бандл `20261006d`
+
 ### Деплой
 
 - [x] `deploy.sh`: том `accounts`, миграция состояния, `--env-file` с `chmod 600`
