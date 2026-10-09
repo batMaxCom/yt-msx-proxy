@@ -3,6 +3,7 @@ const path = require('path');
 const axios = require('axios');
 const logger = require('./logger');
 const historyStore = require('./history_store');
+const subscriptionsFeed = require('./subscriptions_feed');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 
@@ -77,7 +78,7 @@ const HOME_BROWSE_ID = 'FEwhat_to_watch';
    so this id is answered locally instead of going upstream. */
 const LOCAL_HISTORY_BROWSE_ID = 'FEhistory';
 
-async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, profileId = null) { 
+async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, profileId = null, continuation = null) {
     const apiKey = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
     const apiUrl = `https://www.googleapis.com/youtubei/v1/browse?key=${apiKey}`;
 
@@ -98,8 +99,16 @@ async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, pr
                 gl: 'US',
             }
         },
-        browseId: browseId
     };
+
+    // InnerTube continuation calls carry only {context, continuation} - no
+    // browseId. The 2016 client sends exactly that when the user scrolls a
+    // browse page to the end; rejecting it broke infinite scroll with a 400.
+    if (continuation) {
+        postData.continuation = continuation;
+    } else {
+        postData.browseId = browseId;
+    }
 
     const headers = {
         'Content-Type': 'application/json'
@@ -1101,7 +1110,57 @@ const metadata = videoItem.tileRenderer.metadata?.tileMetadataRenderer || {};
 }
 
 async function convertSubscriptionsToV5(data, authHeader) {
-    console.log('Received Subscription Data:', data, authHeader);
+    // Client contract (assets/app-prod.js): d.Ia feeds the browse response to
+    // findSectionListRenderer, which returns the FIRST sectionListRenderer in
+    // the tree — the one inside the selected tab, not a sibling. So the rebuilt
+    // channel shelf must be PREPENDED to that tab's section list: d.VI then sees
+    // items[0].gridChannelRenderer and swaps horizontalListRenderer for
+    // fakeSubsListRenderer ("subs-horizontal-list", round avatars).
+    // listSubscriptions returns { channels, pages } — a bare Array.isArray()
+    // check on it is always false (regression that silently disabled this rail).
+    if (authHeader) {
+        try {
+            const listed = await subscriptionsFeed.listSubscriptions(authHeader, 40);
+            const subscribed = listed && Array.isArray(listed.channels) ? listed.channels : [];
+            if (subscribed.length > 0) {
+                const subsShelf = {
+                    shelfRenderer: {
+                        title: { runs: [{ text: "Subscriptions" }] },
+                        content: {
+                            horizontalListRenderer: {
+                                items: subscribed.map(function (ch) {
+                                    return {
+                                        gridChannelRenderer: {
+                                            channelId: ch.channel_id,
+                                            title: { runs: [{ text: ch.title || "Unknown Channel" }] },
+                                            thumbnail: { thumbnails: [{ url: ch.avatar || "", width: 88, height: 88 }] },
+                                            navigationEndpoint: {
+                                                clickTrackingParams: "",
+                                                browseEndpoint: { browseId: ch.channel_id, params: "" }
+                                            }
+                                        }
+                                    };
+                                })
+                            }
+                        }
+                    }
+                };
+
+                const tabs = data?.contents?.tvBrowseRenderer?.content?.tvSecondaryNavRenderer?.sections?.[0]?.tvSecondaryNavSectionRenderer?.tabs;
+                const tab = Array.isArray(tabs) && (tabs.find(t => t?.tabRenderer?.selected) || tabs[0]);
+                const sectionList = tab?.tabRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer;
+                if (sectionList) {
+                    sectionList.contents = [subsShelf].concat(Array.isArray(sectionList.contents) ? sectionList.contents : []);
+                    return data;
+                }
+                logger.warn('browse', 'SUBS_SHELF_NO_TAB', { note: 'sectionListRenderer not found, legacy conversion kept' });
+            }
+        } catch (err) {
+            logger.error('browse', 'SUBS_SHELF_REBUILD_FAILED', {
+                message: logger.truncateStderr(String((err && err.message) || err)),
+            });
+        }
+    }
 
     const tabs = data?.contents?.tvBrowseRenderer?.content?.tvSecondaryNavRenderer?.sections?.[0]?.tvSecondaryNavSectionRenderer?.tabs;
 

@@ -817,16 +817,16 @@ function ytCookieOf(req) {
 }
 
 app.post('/api/browse', async (req, res) => {
-    const { browseId } = req.body;
+    const { browseId, continuation } = req.body;
 
-    if (!browseId) {
+    if (!browseId && !continuation) {
         return res.status(400).json({
-            error: 'Missing browseId parameter in the request body.'
+            error: 'Missing browseId or continuation parameter in the request body.'
         });
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), historyAccount(req) || DEFAULT_PROFILE_ID);
+        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), historyAccount(req) || DEFAULT_PROFILE_ID, continuation);
 
         res.json(browseData);
     } catch (error) {
