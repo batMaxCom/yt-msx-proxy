@@ -48,8 +48,7 @@ set -euo pipefail
 # аргументом, не правя файл:  PUBLISH_8070=yes ./deploy.sh
 
 SERVER_USER="${SERVER_USER:-root}"
-#SERVER_IP="${SERVER_IP:-194.41.113.178}"
-SERVER_IP="${SERVER_IP:-82.23.162.149}"
+SERVER_IP="${SERVER_IP:-104.143.218.171}"
 REMOTE_DIR="${REMOTE_DIR:-projects/yt-msx-proxy}"
 
 CONTAINER="${CONTAINER:-yt2016}"

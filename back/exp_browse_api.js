@@ -158,10 +158,15 @@ async function fetchBrowseData(browseId, authHeader = null, reqCookie = null, pr
         let updatedData;
 
         if (browseId == "FEsubscriptions") {
-            updatedData = convertSubscriptionsToV5(response.data, authHeader);
+            updatedData = await convertSubscriptionsToV5(response.data, authHeader);
         } else {
             updatedData = convertToV5(response.data, browseId);
         }
+
+        /* Last pass: the 2016 client cannot inflate tileRenderer, and a single
+           one aborts the whole page. Rewrite/drop them everywhere (all tabs,
+           continuations). */
+        convertTileRenderers(updatedData);
 
         const summary = sectionSummaries(updatedData);
         logger.info('browse', 'BROWSE_ADAPTED', {
@@ -430,6 +435,141 @@ function searchItemToGridVideoRenderer(item) {
     if (item.lockupViewModel) return lockupToGridVideoRenderer(item.lockupViewModel);
     if (item.videoRenderer) return videoRendererToGridVideoRenderer(item.videoRenderer);
     return null;
+}
+
+/* Modern InnerTube shelves (subscriptions, home) describe a video as a
+   tileRenderer. The 2016 client only knows the legacy gridVideoRenderer shape
+   (it has zero references to tileRenderer), so every such item inflates into a
+   "no-model" placeholder and the row reads "No videos are available".
+   Rewrite the tile into a gridVideoRenderer, or return null for tiles that are
+   not videos (albums/playlists carry no watchEndpoint). */
+function tileRendererToGridVideoRenderer(tile) {
+    if (!tile || typeof tile !== 'object') return null;
+
+    const videoId = tile.onSelectCommand?.watchEndpoint?.videoId
+        || (/^[A-Za-z0-9_-]{11}$/.test(tile.contentId || '') ? tile.contentId : '');
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return null;
+
+    const runsText = t => t?.simpleText || (Array.isArray(t?.runs) ? t.runs.map(r => r.text || '').join('') : '');
+
+    const meta = tile.metadata?.tileMetadataRenderer || {};
+    const spotlight = tile.onFocusCommand?.commandExecutorCommand?.commands
+        ?.map(c => c.updateCarouselHeaderCommand?.spotlight?.entityMetadataRenderer)
+        ?.find(Boolean) || {};
+
+    const lineTexts = [];
+    for (const line of (meta.lines || [])) {
+        for (const entry of (line?.lineRenderer?.items || [])) {
+            const text = entry?.lineItemRenderer?.text;
+            const value = runsText(text) || text?.accessibility?.accessibilityData?.label;
+            if (value) lineTexts.push(value);
+        }
+    }
+    const spotlightTexts = (spotlight.bylines || [])
+        .flatMap(b => (b.lineRenderer?.items || []).map(i => runsText(i.lineItemRenderer?.text)))
+        .filter(Boolean);
+
+    const titleText = runsText(meta.title) || runsText(spotlight.title) || videoId;
+    const viewCountText = lineTexts.find(s => /views|просмотр/i.test(s))
+        || spotlightTexts.find(s => /views|просмотр/i.test(s)) || '0 views';
+    const publishedTimeText = lineTexts.find(s => /ago|назад/i.test(s)) || 'Unknown';
+    const lengthText = tile.header?.tileHeaderRenderer?.thumbnailOverlays?.[0]
+        ?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText || '0:00';
+    const channelName = lineTexts.find(s => !/views|ago|просмотр|назад|^•$/i.test(s))
+        || spotlightTexts[0] || 'Unknown Channel';
+
+    const thumbnails = tile.header?.tileHeaderRenderer?.thumbnail?.thumbnails;
+
+    return {
+        videoId,
+        thumbnail: { thumbnails: (Array.isArray(thumbnails) && thumbnails.length) ? thumbnails : thumbnailsFor(videoId) },
+        title: { runs: [{ text: titleText }] },
+        publishedTimeText: { runs: [{ text: publishedTimeText }] },
+        viewCountText: { runs: [{ text: viewCountText }] },
+        lengthText: { runs: [{ text: lengthText }], accessibility: { accessibilityData: { label: lengthText } } },
+        navigationEndpoint: { watchEndpoint: { videoId } },
+        shortBylineText: { runs: [{ text: channelName }] }
+    };
+}
+
+/* tileRenderer can appear anywhere InnerTube nests a shelf: inside the
+   selected tab, inside inactive tabs (they are shipped pre-rendered), and in
+   continuation responses. A single unrecognized tileRenderer throws and aborts
+   the whole page render, so sweep the entire response tree and rewrite every
+   one of them. Non-video tiles (albums/playlists) are dropped. */
+const AD_RENDERER_KEYS = [
+    'adSlotRenderer',
+    'inFeedAdLayoutRenderer',
+    'pageTopAdLayoutRenderer',
+    'overlaySectionRenderer',
+    'qrCodeRenderer',
+    'adHoverTextButtonRenderer',
+];
+
+/* The 2016 client has no ad renderers at all (grep app-prod.js for adSlot ->
+   zero hits). YouTube TV HTML5 now ships them inline: the home "Recommended"
+   shelf routinely starts with adSlotRenderer among the videos. An unknown
+   renderer inside a shelf makes the client collapse the tile window of that
+   shelf, and the surrounding video tiles end up painted over each other. */
+function convertTileRenderers(node) {
+    if (!node || typeof node !== 'object') return;
+
+    if (Array.isArray(node)) {
+        for (let i = node.length - 1; i >= 0; i -= 1) {
+            const item = node[i];
+            if (!item || typeof item !== 'object') continue;
+
+            let dropped = false;
+            for (const key of Object.keys(item)) {
+                if (AD_RENDERER_KEYS.indexOf(key) !== -1) {
+                    delete item[key];
+                    dropped = true;
+                }
+            }
+
+            if (item.tileRenderer) {
+                const grid = tileRendererToGridVideoRenderer(item.tileRenderer);
+                if (grid) {
+                    node[i] = { gridVideoRenderer: grid };
+                } else {
+                    node.splice(i, 1);
+                }
+                continue;
+            }
+
+            convertTileRenderers(item);
+
+            if (dropped && Object.keys(item).length === 0) {
+                node.splice(i, 1);
+                continue;
+            }
+
+            // A shelf whose every card was an ad must not stay as an empty row.
+            if (item.shelfRenderer) {
+                const hlr = item.shelfRenderer.content && item.shelfRenderer.content.horizontalListRenderer;
+                if (hlr && Array.isArray(hlr.items) && hlr.items.length === 0) {
+                    node.splice(i, 1);
+                }
+            }
+        }
+        return;
+    }
+
+    for (const key of Object.keys(node)) {
+        if (AD_RENDERER_KEYS.indexOf(key) !== -1) {
+            delete node[key];
+            continue;
+        }
+        const value = node[key];
+        if (!value || typeof value !== 'object') continue;
+        if (!Array.isArray(value) && value.tileRenderer) {
+            const grid = tileRendererToGridVideoRenderer(value.tileRenderer);
+            if (grid) node[key] = { gridVideoRenderer: grid };
+            else delete node[key];
+        } else {
+            convertTileRenderers(value);
+        }
+    }
 }
 
 function sectionSummaries(data) {

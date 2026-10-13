@@ -19,6 +19,7 @@
 const axios = require('axios');
 const logger = require('./logger');
 const { getVideoInfoCached } = require('./get_video_info');
+const { isMixId, resolveMix } = require('./mix_resolver');
 
 // Same TVHTML5 key/client the rest of the project already talks to.
 const API_KEY = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
@@ -39,9 +40,18 @@ const cache = new Map();      // videoId -> { items, ts, source }
 const inflight = new Map();   // videoId -> Promise
 
 const VIDEO_ID_RE = /^[\w-]{11}$/;
+// Mix/radio tiles (RD…/UL… playlist ids, 13-26 chars) are walkable too: the
+// client opens them like videos and the backend plays the radio head, so a
+// mix in the up-next row must not be hidden.
+const MIX_ID_RE = /^(RD|UL)[\w-]+$/;
 
 function isVideoId(v) {
     return typeof v === 'string' && VIDEO_ID_RE.test(v);
+}
+
+function isPlayableId(v) {
+    return typeof v === 'string'
+        && (VIDEO_ID_RE.test(v) || (v.length > 11 && MIX_ID_RE.test(v)));
 }
 
 function textOf(node) {
@@ -202,8 +212,8 @@ function looksLikeShort(node) {
    model's onTap innertube command. */
 function idOf(node) {
     if (!node || typeof node !== 'object') return null;
-    if (isVideoId(node.videoId)) return node.videoId;
-    if (isVideoId(node.contentId)) return node.contentId;
+    if (isPlayableId(node.videoId)) return node.videoId;
+    if (isPlayableId(node.contentId)) return node.contentId;
     const holders = [
         node.onSelectCommand, node.navigationEndpoint, node.onTap, node.endpoint,
         node.autonavEndpointRenderer, node.onFocusCommand,
@@ -212,9 +222,9 @@ function idOf(node) {
     ];
     for (const h of holders) {
         if (!h || typeof h !== 'object') continue;
-        if (isVideoId(h.videoId)) return h.videoId;
-        if (h.watchEndpoint && isVideoId(h.watchEndpoint.videoId)) return h.watchEndpoint.videoId;
-        if (h.innertubeCommand && h.innertubeCommand.watchEndpoint && isVideoId(h.innertubeCommand.watchEndpoint.videoId)) {
+        if (isPlayableId(h.videoId)) return h.videoId;
+        if (h.watchEndpoint && isPlayableId(h.watchEndpoint.videoId)) return h.watchEndpoint.videoId;
+        if (h.innertubeCommand && h.innertubeCommand.watchEndpoint && isPlayableId(h.innertubeCommand.watchEndpoint.videoId)) {
             return h.innertubeCommand.watchEndpoint.videoId;
         }
     }
@@ -383,6 +393,62 @@ async function enrichBareTitles(items) {
     return items;
 }
 
+/* A mix id (RD…/UL…) asked for as "related" means the radio chain: the client
+   started the head track from /get_video_info and now needs the rest of the
+   queue as its up-next list, so playback keeps rolling through the radio.
+   The whole queue is returned, head included - the chain skips the track
+   that is already playing on its own.
+
+   The /next payload only labels the head track, so the first rows get their
+   titles from the yt-dlp metadata cache under a tight budget: a pool of 4,
+   a shared deadline, and whatever is missing stays blank - those rows are
+   still playable, and the cache keeps filling for later answers. */
+async function fromMix(mixId) {
+    const { queue, identity, head } = await resolveMix(mixId);
+    // The head track is what is already playing (the watch flow started it);
+    // the chain must begin with the row after it or it would replay the head.
+    const items = queue
+        .filter(row => !head || row.id !== head.id)
+        .map(row => ({
+        id: row.id,
+        title: row.title,
+        author: row.author,
+        authorId: row.authorId || '',
+        duration: row.duration || '',
+        thumb: row.thumb || '',
+        live: false,
+        short: false,
+        autoplay: false,
+    }));
+
+    const POOL = 4, LABEL_TARGET = 12, BUDGET_MS = 6000;
+    const bare = items.filter(it => !it.title).slice(0, LABEL_TARGET);
+    if (bare.length) {
+        let cursor = 0;
+        const worker = async () => {
+            while (cursor < bare.length) {
+                const it = bare[cursor++];
+                try {
+                    const meta = await getVideoInfoCached(it.id);
+                    if (meta && meta.title) {
+                        it.title = String(meta.title);
+                        if (meta.uploader) it.author = String(meta.uploader);
+                    }
+                } catch (err) { /* a row without a label is still a row */ }
+            }
+        };
+        await Promise.race([
+            Promise.all(Array.from({ length: Math.min(POOL, bare.length) }, worker)),
+            new Promise(resolve => setTimeout(resolve, BUDGET_MS)),
+        ]);
+    }
+
+    // Row 0 speaks for the whole radio ("Mix – Hypa Hypa", "Artist radio")
+    if (identity && identity.kind && items[0] && !items[0].author) items[0].author = identity.kind;
+    return items;
+}
+
+
 async function fetchRelated(videoId, limit) {
     const max = Math.max(1, Math.min(30, Number(limit) || 12));
     const hit = cache.get(videoId);
@@ -390,6 +456,23 @@ async function fetchRelated(videoId, limit) {
     if (inflight.has(videoId)) return inflight.get(videoId);
 
     const building = (async () => {
+        if (isMixId(videoId)) {
+            // Not cached here: the mix cache in mix_resolver already covers the
+            // InnerTube call, and a fresh pass labels more rows from the
+            // yt-dlp cache each time a client re-asks during the session.
+            try {
+                const items = await fromMix(videoId);
+                const result = { videoId, source: 'mix', items: items.slice(0, Math.max(max, items.length)) };
+                logger.info('related', 'related list built', { video_id: videoId, source: 'mix', count: result.items.length });
+                return result;
+            } catch (err) {
+                logger.warn('related', 'mix queue failed, falling back to next', {
+                    video_id: videoId,
+                    message: logger.truncateStderr(String(err.message || err)),
+                });
+            }
+        }
+
         let items = [];
         let source = 'next';
         try {

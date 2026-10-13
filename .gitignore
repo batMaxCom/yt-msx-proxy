@@ -10,6 +10,17 @@ node_modules/
 /screenshots/
 .ai/
 /back/streams/
+
+# Agent tooling: memory files and runtime state of AI assistants.
+# Project docs live in README.md/PLAN.md; AGENTS.md is the agent's own memory.
+AGENTS.md
+.agents/
+.headroom/
+.headroom.pid
+.proxy.pid
+cache_salt
+state/
+
 # OAuth client of our own GCP project for viewer sign-in. Secrets, never commit.
 /back/viewer_auth.env
 

@@ -81,8 +81,10 @@ function clampPlays(value) {
 
 function sanitizeRecord(raw) {
     if (!raw || typeof raw !== 'object') return null;
-    const videoId = clampString(raw.video_id, 24);
-    if (!/^[\w-]{6,24}$/.test(videoId)) return null;
+    // Mix/radio ids (RD…/UL…, up to 26 chars) are recorded alongside real
+    // 11-char video ids, so the bound must fit both.
+    const videoId = clampString(raw.video_id, 40);
+    if (!/^[\w-]{6,40}$/.test(videoId)) return null;
     const watchedAt = Number(raw.watched_at);
     return {
         video_id: videoId,

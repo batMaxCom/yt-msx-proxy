@@ -6,6 +6,7 @@ const youtubeDl = require('youtube-dl-exec');
 const logger = require('./logger');
 const { rewriteString } = require('./image_proxy');
 const { resolve: resolvePublicOrigin, createRewriteContext, encodeOrigin } = require('./public_origin');
+const mixResolver = require('./mix_resolver');
 
 const settingsPath = path.join(__dirname, 'settings.json');
 const bundledYtDlpPath = path.join(
@@ -673,15 +674,43 @@ function handleStreamRequest(req, res) {
 
 
 function handleGetVideoInfo(req, res) {
-    const videoId = req.query.video_id;
+    const rawId = req.query.video_id;
     const prettyPrint = req.query.prettyprint === 'true';
     const unurlencode = req.query.unurlencode === 'true';
 
     // Disable WebM progressive workaround (unused; kept for parity with old rows).
     const disableWebM = false;
-    if (!videoId) {
+    if (!rawId) {
         return res.status(400).send('Video ID is required');
     }
+
+    // Mix/Radio ids (RD…/UL…) are playlists, yt-dlp refuses them outright.
+    // The watch flow just needs something playable: resolve the radio queue
+    // and hand back the head track. The chain keeps rolling through the rest
+    // of the queue via /api/related, which answers from the same cache.
+    if (mixResolver.isMixId(rawId)) {
+        console.log('[MIX] resolving', rawId);
+        mixResolver.resolveMix(rawId)
+            .then(({ head }) => {
+                console.log('[MIX]', rawId, '-> head track', head.id);
+                req.query.video_id = head.id;
+                handleGetVideoInfo(req, res);
+            })
+            .catch(err => {
+                console.error('[MIX] resolve failed:', err.message);
+                logger.error('video-info', 'mix resolve failed', {
+                    mix_id: rawId,
+                    message: logger.truncateStderr(String(err.message || err)),
+                });
+                const errObj = { error: 'Failed to resolve mix playlist.', details: err.message };
+                if (prettyPrint) return res.status(502).send(JSON.stringify(errObj, null, 2));
+                if (unurlencode) return res.status(502).send(encodeURIComponent(JSON.stringify(errObj)));
+                res.status(502).send(JSON.stringify(errObj));
+            });
+        return;
+    }
+
+    const videoId = rawId;
 
     console.log('[REQUEST] GET /get_video_info');
     console.log('[REQUEST] video_id:', videoId);

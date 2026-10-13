@@ -29674,7 +29674,8 @@
         };
 
         function Xt(a) {
-            return [-11, 0, 100 + a, 2 * (100 + a)]
+            for (var b = [-11, 0], c = 1; 16 > c; ++c) b.push(c * (100 + a));
+            return b
         }
         d.aL = function () {
             return this.h.Rg ? Dr : up

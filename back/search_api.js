@@ -1,6 +1,7 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const mixResolver = require('./mix_resolver');
 
 const logsDir = path.join(__dirname, 'logs');
 if (!fs.existsSync(logsDir)) {
@@ -112,10 +113,61 @@ function isChannelId(id) {
     return typeof id === 'string' && /^UC[\w-]{22}$/.test(id);
 }
 
+/* A real videoId is exactly 11 chars. The modern search endpoint also returns
+   auto-generated mixes as videoRenderer with playlist-shaped ids ("RDEM…",
+   26 chars). Those are kept: mix_resolver resolves them to a playable radio
+   queue, and the tiles below are decorated with the head track's thumbnail
+   and a "Mix – …" title so the row looks the way search always looked.
+   Anything else that is neither a video id nor a mix is dropped. */
+function isVideoId(id) {
+    return typeof id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(id);
+}
+
+/* Mix tiles pass through as-is (the client opens them like videos and the
+   backend plays the radio head); ids that are neither videos nor mixes are
+   junk and get dropped. */
+function keepVideoRenderer(videoRenderer) {
+    if (!videoRenderer) return false;
+    const id = videoRenderer.videoId;
+    return isVideoId(id) || mixResolver.isMixId(id);
+}
+
+/* Mix tiles come back from the modern endpoint without a thumbnail (i.ytimg
+   has nothing for an RD id) and without a title. YouTube search always showed
+   the radio as "Mix – <seed track>" with the seed's artwork, so decorate the
+   tile that way: resolve the queue once (shared cache with the watch flow)
+   under a short budget - a mix without decoration is still clickable, it
+   just looks bare until the cache warms. */
+async function decorateMixTiles(items) {
+    const mixes = [];
+    for (const item of items) {
+        const r = item && item.videoRenderer;
+        if (r && mixResolver.isMixId(r.videoId) && (!r.title || !r.thumbnail)) {
+            mixes.push(r);
+        }
+    }
+    if (!mixes.length) return;
+
+    await Promise.all(mixes.map(async r => {
+        try {
+            const { head } = await Promise.race([
+                mixResolver.resolveMix(r.videoId),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('mix decorate timed out')), 2500)),
+            ]);
+            if (!r.title || !r.title.runs || !r.title.runs.length) {
+                r.title = { runs: [{ text: head.title ? `Mix – ${head.title}` : 'Mix' }] };
+            }
+            if (head.thumb) {
+                r.thumbnail = { thumbnails: [{ url: absoluteThumbUrl(head.thumb), width: 480, height: 360 }] };
+            }
+        } catch (err) { /* the row stays undecorated but playable */ }
+    }));
+}
+
 function absoluteThumbUrl(url) {
     if (typeof url !== 'string') return '';
     // search sometimes hands back protocol-relative "//yt3.ggpht.com/..." URLs, which
-    // resolve against our own origin and never reach the image proxy
+    // resolve against our own origin and never reach image proxy
     return url.startsWith('//') ? `https:${url}` : url;
 }
 
@@ -188,7 +240,7 @@ function lockupToChannelRenderer(lockup) {
 }
 
 function lockupToVideoRenderer(lockup) {
-    if (!lockup || lockup.contentType && lockup.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO') {
+    if (!lockup || (lockup.contentType && lockup.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO' && lockup.contentType !== 'LOCKUP_CONTENT_TYPE_PLAYLIST')) {
         // Still allow if contentId looks like a video id
         if (!lockup?.contentId) return null;
     }
@@ -311,17 +363,21 @@ function convertSearchItem(item) {
         if (lockup.contentType === 'LOCKUP_CONTENT_TYPE_CHANNEL' || isChannelId(lockup.contentId)) {
             return lockupToChannelRenderer(lockup);
         }
+        // Accept playlists/mixes (LOCKUP_CONTENT_TYPE_PLAYLIST) so they can become videoRenderer
+        // entries that the client recognises and the backend can resolve.
         const videoRenderer = lockupToVideoRenderer(lockup);
-        return videoRenderer ? { videoRenderer } : null;
+        if (!videoRenderer) return null;
+        return keepVideoRenderer(videoRenderer) ? { videoRenderer } : null;
     }
 
     if (item.tileRenderer) {
         const videoRenderer = tileToVideoRenderer(item.tileRenderer);
-        return videoRenderer ? { videoRenderer } : null;
+        if (!videoRenderer) return null;
+        return keepVideoRenderer(videoRenderer) ? { videoRenderer } : null;
     }
 
     // Already legacy-compatible
-    if (item.videoRenderer) return item;
+    if (item.videoRenderer) return keepVideoRenderer(item.videoRenderer) ? item : null;
     if (item.compactChannelRenderer) return item;
 
     return null;
@@ -329,7 +385,7 @@ function convertSearchItem(item) {
 
 function adaptSearchResponse(data) {
     if (!data || !data.contents || !data.contents.sectionListRenderer) {
-        return data;
+        return Promise.resolve(data);
     }
 
     const sections = data.contents.sectionListRenderer.contents || [];
@@ -338,32 +394,46 @@ function adaptSearchResponse(data) {
 
     sections.forEach(section => {
         const items = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
-        if (!Array.isArray(items)) return;
-
-        // Filter ads and convert modern renderers
-        const nextItems = [];
-        for (const item of items) {
-            if (item && item.adSlotRenderer) {
-                skippedCount += 1;
-                continue;
+        if (Array.isArray(items)) {
+            const nextItems = [];
+            for (const item of items) {
+                if (item && item.adSlotRenderer) {
+                    skippedCount += 1;
+                    continue;
+                }
+                const converted = convertSearchItem(item);
+                if (converted) {
+                    nextItems.push(converted);
+                    convertedCount += 1;
+                } else {
+                    skippedCount += 1;
+                }
             }
-            const converted = convertSearchItem(item);
-            if (converted) {
-                nextItems.push(converted);
-                convertedCount += 1;
-            } else {
-                skippedCount += 1;
+            section.shelfRenderer.content.horizontalListRenderer.items = nextItems;
+            if (!section.shelfRenderer.title) {
+                const headerText =
+                    section.shelfRenderer.headerRenderer?.shelfHeaderRenderer?.avatarLockup
+                        ?.avatarLockupRenderer?.title?.runs?.[0]?.text || 'Search results';
+                section.shelfRenderer.title = { runs: [{ text: headerText }] };
             }
         }
-
-        section.shelfRenderer.content.horizontalListRenderer.items = nextItems;
-
-        // Ensure shelf title exists (old UI may expect it)
-        if (!section.shelfRenderer.title) {
-            const headerText =
-                section.shelfRenderer.headerRenderer?.shelfHeaderRenderer?.avatarLockup
-                    ?.avatarLockupRenderer?.title?.runs?.[0]?.text || 'Search results';
-            section.shelfRenderer.title = { runs: [{ text: headerText }] };
+        const clusters = section?.clusterShelfRenderer?.clusters;
+        if (Array.isArray(clusters)) {
+            for (const cl of clusters) {
+                const citems = cl?.clusterRenderer?.items;
+                if (Array.isArray(citems)) {
+                    for (let i = 0; i < citems.length; i++) {
+                        const item = citems[i];
+                        const converted = convertSearchItem(item);
+                        if (converted) {
+                            citems[i] = converted;
+                            convertedCount += 1;
+                        } else {
+                            skippedCount += 1;
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -371,7 +441,22 @@ function adaptSearchResponse(data) {
         `[SEARCH ADAPTER] converted=${convertedCount} skipped=${skippedCount} estimatedResults=${data.estimatedResults}`
     );
 
-    return data;
+    // Mix tiles (kept above) need head-track artwork and a "Mix – …" title;
+    // bounded so a cold mix cache cannot stretch the search answer.
+    const decorated = [];
+    for (const section of sections) {
+        const items = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
+        if (Array.isArray(items)) decorated.push(...items);
+        // Also check cluster shelves (common for "Mix" results in modern responses)
+        const clusters = section?.clusterShelfRenderer?.clusters;
+        if (Array.isArray(clusters)) {
+            for (const cl of clusters) {
+                const citems = cl?.clusterRenderer?.items;
+                if (Array.isArray(citems)) decorated.push(...citems);
+            }
+        }
+    }
+    return decorateMixTiles(decorated).then(() => data).catch(() => data);
 }
 
 // Keep using the same Innertube key already present in the project (TVHTML5 client).
@@ -543,6 +628,9 @@ async function handleSearchContinuationRequest(req, res, client, authToken) {
         items.push(converted);
     }
 
+    // mix rows can arrive on page 2+ as well: give them head artwork too
+    await decorateMixTiles(items).catch(() => {});
+
     const nextData = nextContinuationDataOf(raw);
     const payload = {
         continuationContents: {
@@ -635,7 +723,7 @@ async function handleSearchRequest(req, res) {
             deep.rawJson
         );
 
-        const processedResponse = adaptSearchResponse(data);
+        const processedResponse = await adaptSearchResponse(data);
 
         // the row can only walk further if the answer hands it a token, and the
         // first page's token is the one that leads to page two
@@ -937,4 +1025,4 @@ async function handleSearchPageRequest(req, res) {
     }
 }
 
-module.exports = { handleSearchRequest, handleSearchPageRequest, adaptSearchResponse };
+module.exports = { handleSearchRequest, handleSearchPageRequest, adaptSearchResponse, convertSearchItem };

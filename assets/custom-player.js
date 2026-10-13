@@ -30,7 +30,7 @@
     }
 
     function getVideoId() {
-        var m = (global.location.hash || '').match(/(?:[?&#]|^)v=([\w-]{6,16})/);
+        var m = (global.location.hash || '').match(/(?:[?&#]|^)v=([\w-]{6,40})/);
         return m ? m[1] : null;
     }
 
@@ -2164,6 +2164,20 @@
     var chainPath = [];        // [{id,title}] in visit order
     var chainPathPos = -1;     // index of the video currently playing
 
+    /* Sticky radio queue. A mix (RD…/UL…) started from search plays its head
+       track, then the chain walks the queue; without this, the ranking request
+       that start() fires for every new track would replace the radio with that
+       track's own related list after one hop. While the queue lasts, every
+       track that belongs to it is served from it instead. */
+    var radioQueue = [];      // remaining rows [{id,title,...}]
+    var radioSeed = '';       // the RD… id the queue came from
+
+    function radioOwns(id) {
+        if (!radioQueue.length) return false;
+        for (var i = 0; i < radioQueue.length; i++) if (radioQueue[i] && radioQueue[i].id === id) return true;
+        return false;
+    }
+
     function readStoredQuality() {
         storedHeight = 0;
         try {
@@ -2797,12 +2811,28 @@
 
     function loadChain(id, cb) {
         if (!id) return;
+        // Sticky radio: a track that belongs to the current mix is served from
+        // the queue instead of pulling that track's own related ranking, so
+        // the radio keeps rolling through the whole session.
+        if (radioQueue.length && radioOwns(id)) {
+            if (chainFor !== id) {
+                chainFor = id;
+                chainEmptyFor = '';
+                chainItems = radioQueue;
+            }
+            if (cb) cb(chainItems);
+            relPanelRefresh();
+            return;
+        }
         if (chainFor === id) {
             // a request is already on its way: hold the caller until it lands,
             // firing back with [] right now would make it re-enter chainNext()
             if (chainLoadingFor === id) { if (cb) chainWaiters.push(cb); return; }
             if (chainItems.length) { if (cb) cb(chainItems); return; }
         }
+        // A video outside the radio queue means the viewer left the radio.
+        radioQueue = [];
+        radioSeed = '';
         chainWaiters = [];
         chainFor = id;
         chainEmptyFor = '';
@@ -2823,6 +2853,12 @@
                 return;
             }
             chainItems = data.items;
+            // The answer for a mix id IS the radio: remember it, so every next
+            // track of this session keeps walking the same queue.
+            if (data.source === 'mix') {
+                radioSeed = id;
+                radioQueue = chainItems;
+            }
             beacon('CP_CHAIN_LIST', { id: id, n: chainItems.length, src: data.source });
             // resolve the up-next target right now, while the current video plays
             var first = pickChainItem(id);

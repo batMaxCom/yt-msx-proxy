@@ -17,6 +17,7 @@ const { fetchGuideData } = require('./guide_api');
 const { handleSearchRequest, handleSearchPageRequest } = require('./search_api');
 const { fetchNextData } = require('./next_api');
 const { fetchRelated } = require('./related_api');
+const mixResolver = require('./mix_resolver');
 const { handleChannelRequest } = require('./channel_api');
 const { handleGetVideoInfo, handleStreamRequest, handleHlsRequest, getVideoInfoCached } = require('./get_video_info');
 
@@ -901,7 +902,8 @@ app.post('/api/search/page', handleSearchPageRequest);
 // starts and walks the list when the video ends.
 async function handleRelatedRequest(req, res) {
     const videoId = (req.query.videoId || req.query.id || req.params.videoId || '').toString().trim();
-    if (!/^[\w-]{6,20}$/.test(videoId)) {
+    // 11-char video ids and longer mix/radio playlist ids (RD…/UL…) both land here.
+    if (!/^[\w-]{6,40}$/.test(videoId)) {
         return res.status(400).json({ error: 'A valid videoId is required.' });
     }
     try {
@@ -953,11 +955,18 @@ function pickThumb(output, videoId) {
 }
 
 app.get('/api/video-meta/:videoId', async (req, res) => {
-    const videoId = String(req.params.videoId || '').trim();
-    if (!/^[\w-]{6,20}$/.test(videoId)) {
+    let videoId = String(req.params.videoId || '').trim();
+    // 11-char video ids and longer mix/radio playlist ids (RD…/UL…) both land here.
+    if (!/^[\w-]{6,40}$/.test(videoId)) {
         return res.status(400).json({ error: 'A valid videoId is required.' });
     }
     try {
+        // A mix describes itself through its head track: that is what is
+        // actually playing, so the watch screen shows its title and thumb.
+        if (mixResolver.isMixId(videoId)) {
+            const { head } = await mixResolver.resolveMix(videoId);
+            videoId = head.id;
+        }
         const output = await getVideoInfoCached(videoId);
         // res.json() is wrapped by the image proxy, so the thumbnail comes back
         // already rewritten to /img/... and the TV never talks to ytimg directly
@@ -1122,7 +1131,8 @@ app.post('/api/history/play', async (req, res) => {
     if (!sub) return historyUnsigned(res);
     const body = req.body || {};
     const videoId = String(body.video_id || '').trim();
-    if (!/^[\w-]{6,20}$/.test(videoId)) {
+    // 11-char video ids and longer mix/radio playlist ids (RD…/UL…) both land here.
+    if (!/^[\w-]{6,40}$/.test(videoId)) {
         return res.status(400).json({ error: 'A valid video_id is required.' });
     }
     try {
