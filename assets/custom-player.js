@@ -1678,6 +1678,10 @@
                 if (want && !playlistHeadFor) {
                     playlistHeadFor = want;
                     playlistHeadAt = Date.now();
+                    // A fresh playlist entry is a fresh walk: forget what an
+                    // earlier session marked as played, or a re-opened playlist
+                    // would be considered exhausted from the first press.
+                    chainPlayed = [];
                     beacon('CP_PLAYLIST_HEAD', { list: want });
                     whenMeta(want, function (meta) {
                         if (!meta || !meta.id) { if (playlistHeadFor === want) playlistHeadFor = null; return; }
@@ -2357,6 +2361,19 @@
        the related UI flips its "Похожие" label to "Плейлист" on. */
     function radioActive() {
         return !!(radioSeed && radioQueue.length);
+    }
+
+    /* The row right after `cur` in the queue, in play order, or null when `cur`
+       is not in the snapshot (drifted) or is the last row (end of playlist). */
+    function radioNextRow(cur) {
+        if (!radioActive()) return null;
+        for (var i = 0; i < radioQueue.length; i++) {
+            if (radioQueue[i] && radioQueue[i].id === cur) {
+                var nx = radioQueue[i + 1];
+                return (nx && nx.id) ? nx : null;
+            }
+        }
+        return null;
     }
 
     function readStoredQuality() {
@@ -3348,6 +3365,9 @@
         if (!manual && !chainEnabled()) return false;
         var cur = currentId || (active ? active.id : getVideoId());
         if (!cur) return false;
+        // The track on air has been played: remember it, or pickChainItem() will
+        // happily walk back onto it once we step off the head of the queue.
+        if (chainPlayed.indexOf(cur) < 0) chainPlayed.push(cur);
         if (!chainItems.length) {
             if (chainEmptyFor === cur) {
                 if (!manual) return false;         // nothing to roll over to
@@ -3357,32 +3377,53 @@
             loadChain(cur);
             return false;
         }
-        var next = pickChainItem(cur);
+        // In a playlist/radio session "next" is literally the row below the one
+        // on air - deterministic play order. The generic ranking cursor skips
+        // the current track and everything already walked, which on a moving
+        // snapshot can jump backward, so a queue that owns playback wins.
+        var next = radioNextRow(cur);
+        if (!next && radioActive()) {
+            // current track is not in the queue snapshot: exhausted or drifted
+            if (chainFor !== cur) { loadChain(cur, manual ? function () { chainNext(cur, true); } : null); return manual === true; }
+            beacon('CP_CHAIN_DONE', { id: cur });
+            return false;
+        }
+        if (!next) next = pickChainItem(cur);
         if (!next) {
             // ranking exhausted: look for a fresh list before giving up
             if (chainFor !== cur) { loadChain(cur, manual ? function () { chainNext(cur, true); } : null); return manual === true; }
             beacon('CP_CHAIN_DONE', { id: cur });
             return false;
         }
-        chainItems.shift();
+        // chainItems aliases radioQueue when a playlist drives playback, so it
+        // must not be mutated here: pickChainItem already skips the track on air
+        // and everything we have walked (chainPlayed), which is the effective
+        // cursor. Shifting the shared array used to drain the playlist.
         if (chainPlayed.indexOf(next.id) < 0) chainPlayed.push(next.id);
         return chainGo({ id: next.id, title: next.title }, 1, manual);
     }
 
     /* Transport "skip forward" / "skip backward". Forward walks back through
        visited videos first, then continues down the up-next ranking; backward
-       walks the session history. Both work even with endless playback off. */
+       walks the session history. Both work even with endless playback off, and
+       against a video the app is playing on its own: the idle takeover only
+       fires on a dead element, so when the bundle started playback itself
+       `active` is still null and the transport must fall back to the URL. */
     function chainSkipNext() {
-        if (!active || chainBusy) return false;
+        if (chainBusy) return false;
+        var cur = active ? active.id : getVideoId();
+        if (!cur) return false;
         var hist = chainNextItem();
         if (hist) return chainGo(hist, 1, true);
-        return chainNext(active.id, true);
+        return chainNext(cur, true);
     }
 
     function chainSkipPrev() {
-        if (!active || chainBusy) return false;
+        if (chainBusy) return false;
+        var cur = active ? active.id : getVideoId();
+        if (!cur) return false;
         var hist = chainPrevItem();
-        if (!hist) { beacon('CP_CHAIN_PREV_NONE', { id: active.id }); return false; }
+        if (!hist) { beacon('CP_CHAIN_PREV_NONE', { id: cur }); return false; }
         return chainGo(hist, -1, true);
     }
 
@@ -3440,8 +3481,8 @@
         // itself: the whole thing, in play order, the currently playing track
         // included (unlike the related feed, which drops the video you watch).
         if (radioActive()) {
-            for (i = 0; i < chainItems.length; i++) {
-                it = chainItems[i];
+            for (i = 0; i < radioQueue.length; i++) {
+                it = radioQueue[i];
                 if (!it || !it.id || seen[it.id]) continue;
                 seen[it.id] = true;
                 out.push(it);
