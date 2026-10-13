@@ -152,6 +152,48 @@ async function isSubscribed(accessToken, channelId) {
 }
 
 /*
+ * Subscribe / unsubscribe through the Data API, not InnerTube.
+ *
+ * The InnerTube subscription/subscribe endpoint answers 200 for the old
+ * TVHTML5 client the 2016 app uses, but does nothing: the response carries only
+ * a responseContext and no actions, and the subscription never appears. The
+ * Data API subscriptions.insert/delete uses the same OAuth token, is idempotent
+ * in our favour (insert on an existing sub is a 409) and is what actually
+ * changes the account.
+ */
+async function subscribe(accessToken, channelId) {
+    if (!accessToken || !CHANNEL_RE.test(String(channelId || ''))) {
+        throw new Error('A valid accessToken and channelId are required.');
+    }
+    const response = await axios.post(`${SUBSCRIPTIONS_URL}?part=snippet`, {
+        snippet: { resourceId: { kind: 'youtube#channel', channelId } },
+    }, {
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        timeout: 20000,
+    });
+    return response.data;
+}
+
+async function unsubscribe(accessToken, channelId) {
+    if (!accessToken || !CHANNEL_RE.test(String(channelId || ''))) {
+        throw new Error('A valid accessToken and channelId are required.');
+    }
+    const list = await axios.get(SUBSCRIPTIONS_URL, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { part: 'id', mine: true, forChannelId: channelId, maxResults: 1 },
+        timeout: 20000,
+    });
+    const id = list.data && list.data.items && list.data.items[0] && list.data.items[0].id;
+    if (!id) return { deleted: false };               // already not subscribed
+    await axios.delete(SUBSCRIPTIONS_URL, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { id },
+        timeout: 20000,
+    });
+    return { deleted: true };
+}
+
+/*
  * YouTube has moved channel uploads off gridVideoRenderer and onto
  * tileRenderer, which is a different animal: the id is `contentId`, every
  * string lives under `metadata.tileMetadataRenderer`, and the duration is an
@@ -418,6 +460,8 @@ module.exports = {
     subscriptionsHome,
     listSubscriptions,
     isSubscribed,
+    subscribe,
+    unsubscribe,
     fetchChannelVideos,
     // exported for tests
     collectVideoRenderers,

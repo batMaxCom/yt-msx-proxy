@@ -53,7 +53,7 @@ async function resolveAccessToken(req) {
 
 async function handleLikeAction(req, res) {
     const { action } = req.params;
-    const { videoId } = req.body.target;
+    const { videoId } = (req.body && req.body.target) || {};
 
     if (!videoId || typeof videoId !== 'string' || !videoId.trim()) {
         return res.status(400).json({
@@ -67,64 +67,37 @@ async function handleLikeAction(req, res) {
         });
     }
 
+    /*
+     * Data API, not InnerTube. The InnerTube like/like endpoint answers 200 for
+     * the TVHTML5 client but does not change the rating (verified: getRating
+     * stays "none"), the same silent no-op as subscription/subscribe.
+     * videos.rate uses the same OAuth token and actually rates the video.
+     */
+    const rating = action === 'removelike' ? 'none' : action;
     try {
         const accessToken = await resolveAccessToken(req);
         if (!accessToken) {
             return res.status(401).json({ error: 'Sign in to rate videos.', signed_in: false });
         }
 
-        let apiUrl = '';
-        switch (action) {
-            case 'like':
-                apiUrl = 'https://www.youtube.com/youtubei/v1/like/like';
-                break;
-            case 'removelike':
-                apiUrl = 'https://www.youtube.com/youtubei/v1/like/removelike';
-                break;
-            case 'dislike':
-                apiUrl = 'https://www.youtube.com/youtubei/v1/like/dislike';
-                break;
-        }
-
-        const requestBody = {
-            context: {
-                client: {
-                    clientName: "TVHTML5",
-                    clientVersion: "5.20150715",
-                    screenWidthPoints: 1632,
-                    screenHeightPoints: 904,
-                    screenPixelDensity: 1,
-                    theme: "CLASSIC",
-                    webpSupport: false,
-                    acceptRegion: "US",
-                    acceptLanguage: "en-US"
-                },
-                user: {
-                    enableSafetyMode: false
-                }
-            },
-            target: {
-                videoId
-            }
-        };
-
-        const response = await axios.post(apiUrl, requestBody, {
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            }
+        await axios.post('https://www.googleapis.com/youtube/v3/videos/rate', null, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            params: { id: videoId, rating },
+            timeout: 20000,
         });
 
         res.status(200).json({
             message: `Successfully ${action}d the video.`,
-            data: response.data
+            rating,
         });
     } catch (error) {
-        console.error('Error performing like action:', error.message);
-        res.status(500).json({
-            error: 'Failed to perform the like action.',
-            details: error.message || 'No additional details available.'
+        logger.warn('interactions', 'like action failed', {
+            action,
+            video_id: videoId,
+            status: (error.response && error.response.status) || 0,
+            message: logger.truncateStderr(String(error.message || error)),
         });
+        res.status(500).json({ error: 'Failed to perform the like action.' });
     }
 }
 
@@ -144,61 +117,44 @@ async function handleSubscriptionAction(req, res) {
         });
     }
 
+    /*
+     * Data API, not InnerTube. The InnerTube subscription/subscribe endpoint
+     * answers 200 for the TVHTML5 client this app carries but silently does
+     * nothing (no actions in the response, no subscription on the account) -
+     * the button showed its optimistic tick and stayed wrong. subscriptions
+     * .insert/delete uses the same OAuth token and really changes the account.
+     */
+    const channelId = String(channelIds[0]);
     try {
         const accessToken = await resolveAccessToken(req);
         if (!accessToken) {
             return res.status(401).json({ error: 'Sign in to subscribe.', signed_in: false });
         }
 
-        let apiUrl = '';
-        switch (action) {
-            case 'subscribe':
-                apiUrl = 'https://www.youtube.com/youtubei/v1/subscription/subscribe';
-                break;
-            case 'unsubscribe':
-                apiUrl = 'https://www.youtube.com/youtubei/v1/subscription/unsubscribe';
-                break;
+        if (action === 'subscribe') {
+            await subscriptionsFeed.subscribe(accessToken, channelId);
+            return res.status(200).json({ message: 'Successfully subscribed the channel.', subscribed: true });
         }
 
-        const requestBody = {
-            context: {
-                client: {
-                    clientName: "TVHTML5",
-                    clientVersion: "5.20150715",
-                    screenWidthPoints: 1632,
-                    screenHeightPoints: 904,
-                    screenPixelDensity: 1,
-                    theme: "CLASSIC",
-                    webpSupport: false,
-                    acceptRegion: "US",
-                    acceptLanguage: "en-US"
-                },
-                user: {
-                    enableSafetyMode: false
-                }
-            },
-            target: {
-                channelIds
-            }
-        };
-
-        const response = await axios.post(apiUrl, requestBody, {
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        res.status(200).json({
-            message: `Successfully ${action}d the channel.`,
-            data: response.data
+        const result = await subscriptionsFeed.unsubscribe(accessToken, channelId);
+        return res.status(200).json({
+            message: 'Successfully unsubscribed the channel.',
+            subscribed: false,
+            deleted: !!result.deleted,
         });
     } catch (error) {
-        console.error('Error performing subscription action:', error.message);
-        res.status(500).json({
-            error: 'Failed to perform the subscription action.',
-            details: error.message || 'No additional details available.'
+        const status = (error.response && error.response.status) || 0;
+        // 409 means the subscription already exists - not a failure to the user.
+        if (action === 'subscribe' && status === 409) {
+            return res.status(200).json({ message: 'Already subscribed.', subscribed: true });
+        }
+        logger.warn('interactions', 'subscription action failed', {
+            action,
+            channel_id: channelId,
+            status,
+            message: logger.truncateStderr(String(error.message || error)),
         });
+        res.status(500).json({ error: 'Failed to perform the subscription action.' });
     }
 }
 
