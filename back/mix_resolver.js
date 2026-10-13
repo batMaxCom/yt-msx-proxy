@@ -43,10 +43,16 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_CACHE = 64;
 const MAX_QUEUE = 50;
 
-// A real videoId is exactly 11 chars; mix ids are longer and start with the
-// RD (radio) or UL (My Mix) playlist prefixes.
+// A real videoId is exactly 11 chars; playlist ids are longer and start with a
+// type prefix. The module originally resolved only radio feeds (RD…/UL…), but
+// the same /next call answers for any playlist (PL…=user/YouTube, VL…=user
+// uploads, OL…=official artist, FL…=favorites, LL…=listen later, UU…=likes),
+// so the resolver now treats every such id uniformly - a user playlist in our
+// search adapter was a dead end before: the tile navigated to a watch without
+// v= and nothing ever played.
 const VIDEO_ID_RE = /^[\w-]{11}$/;
 const MIX_ID_RE = /^(RD|UL)[\w-]+$/;
+const PLAYLIST_ID_RE = /^(PL|RD|UL|VL|UU|FL|OL|LL|RDAM|OLAK5uy)[\w-]+$/;
 
 function isVideoId(id) {
     return typeof id === 'string' && VIDEO_ID_RE.test(id);
@@ -54,6 +60,10 @@ function isVideoId(id) {
 
 function isMixId(id) {
     return typeof id === 'string' && id.length > 11 && MIX_ID_RE.test(id);
+}
+
+function isPlaylistId(id) {
+    return typeof id === 'string' && id.length > 11 && PLAYLIST_ID_RE.test(id);
 }
 
 function textOf(node) {
@@ -296,33 +306,36 @@ const inflight = new Map();  // mixId -> Promise
 /* Head of the mix plus the full queue. Resolved once per TTL and shared by
    every consumer, so the search decoration, the watch screen and the chain
    all hit the same InnerTube call. */
-async function resolveMix(mixId) {
-    if (!isMixId(mixId)) throw new Error('not a mix id: ' + mixId);
+async function resolvePlaylist(playlistId) {
+    if (!isPlaylistId(playlistId)) throw new Error('not a playlist id: ' + playlistId);
 
-    const hit = cache.get(mixId);
+    const hit = cache.get(playlistId);
     if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit;
 
-    const pending = inflight.get(mixId);
+    const pending = inflight.get(playlistId);
     if (pending) return pending;
 
-    const job = fetchMixQueue(mixId)
+    const job = fetchMixQueue(playlistId)
         .then(({ queue, identity }) => {
-            const result = { mixId, queue, identity, head: queue[0], ts: Date.now() };
+            const result = { playlistId, queue, identity, head: queue[0], ts: Date.now() };
             if (cache.size > MAX_CACHE) cache.clear();
-            cache.set(mixId, result);
-            inflight.delete(mixId);
+            cache.set(playlistId, result);
+            inflight.delete(playlistId);
             return result;
         })
         .catch(err => {
-            inflight.delete(mixId);
+            inflight.delete(playlistId);
             logger.warn('mix', 'resolve failed', {
-                mix_id: mixId,
+                mix_id: playlistId,
                 message: logger.truncateStderr(String(err.message || err)),
             });
             throw err;
         });
-    inflight.set(mixId, job);
+    inflight.set(playlistId, job);
     return job;
 }
 
-module.exports = { isMixId, isVideoId, resolveMix };
+/* Backwards-compat alias: radio ids (RD…/UL…) are playlists too. */
+const resolveMix = resolvePlaylist;
+
+module.exports = { isMixId, isPlaylistId, isVideoId, resolveMix, resolvePlaylist };

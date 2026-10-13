@@ -684,13 +684,14 @@ function handleGetVideoInfo(req, res) {
         return res.status(400).send('Video ID is required');
     }
 
-    // Mix/Radio ids (RD…/UL…) are playlists, yt-dlp refuses them outright.
-    // The watch flow just needs something playable: resolve the radio queue
-    // and hand back the head track. The chain keeps rolling through the rest
-    // of the queue via /api/related, which answers from the same cache.
-    if (mixResolver.isMixId(rawId)) {
+    // Playlist ids (RD…/UL… mixes, PL…/VL…/OL… user playlists) are playlists,
+    // yt-dlp refuses them outright. The watch flow just needs something
+    // playable: resolve the playlist queue and hand back the head track. The
+    // chain keeps rolling through the rest of the queue via /api/related,
+    // which answers from the same cache.
+    if (mixResolver.isPlaylistId(rawId)) {
         console.log('[MIX] resolving', rawId);
-        mixResolver.resolveMix(rawId)
+        mixResolver.resolvePlaylist(rawId)
             .then(({ head }) => {
                 console.log('[MIX]', rawId, '-> head track', head.id);
                 req.query.video_id = head.id;

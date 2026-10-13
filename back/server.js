@@ -878,9 +878,30 @@ app.get('/api/guide', handleGuideRequest);
 app.post('/api/guide', handleGuideRequest);
 
 app.post('/api/next', async (req, res) => {
-    const { videoId } = req.body;
+    const body = req.body || {};
+    const { videoId } = body;
 
-    if (typeof videoId !== 'string' || !videoId.trim()) {
+    // A playlist tile opens the watch screen without a video id: the client
+    // navigates to #/watch?list=PL… (no v=) and asks /next for the head. The
+    // stock validation below rejects such a body, the watch flow dies and
+    // nothing plays. Resolve the playlist queue and continue with its head the
+    // way a real video watch would.
+    let vid = videoId;
+    if ((typeof vid !== 'string' || !vid.trim()) && typeof body.playlistId === 'string' && body.playlistId.trim()) {
+        try {
+            const mixResolver = require('./mix_resolver');
+            const { head } = await mixResolver.resolvePlaylist(body.playlistId.trim());
+            vid = head && head.id;
+        } catch (err) {
+            console.error('Error resolving playlist for /next:', err.message);
+            return res.status(422).json({
+                error: 'Failed to resolve playlist to a playable video.',
+                details: String(err.message || err),
+            });
+        }
+    }
+
+    if (typeof vid !== 'string' || !vid.trim()) {
         return res.status(400).json({
             error: '"videoId" is required and must be a non-empty string.'
         });
@@ -890,7 +911,7 @@ app.post('/api/next', async (req, res) => {
     const accessToken = authorizationHeader && authorizationHeader.startsWith('Bearer ') ? authorizationHeader.split(' ')[1] : null;
 
     try {
-        const nextData = await fetchNextData(videoId, accessToken);
+        const nextData = await fetchNextData(vid, accessToken);
 
         res.json(nextData);
     } catch (error) {
@@ -977,10 +998,10 @@ app.get('/api/video-meta/:videoId', async (req, res) => {
         return res.status(400).json({ error: 'A valid videoId is required.' });
     }
     try {
-        // A mix describes itself through its head track: that is what is
-        // actually playing, so the watch screen shows its title and thumb.
-        if (mixResolver.isMixId(videoId)) {
-            const { head } = await mixResolver.resolveMix(videoId);
+        // A mix or playlist describes itself through its head track: that is
+        // what is actually playing, so the watch screen shows its title/thumb.
+        if (mixResolver.isPlaylistId(videoId)) {
+            const { head } = await mixResolver.resolvePlaylist(videoId);
             videoId = head.id;
         }
         const output = await getVideoInfoCached(videoId);

@@ -1623,6 +1623,17 @@
     var quitUntil = 0;
     var lastHash = null;
 
+    /* Playlist deep links (#/watch?list=PL…, no v=) never reach the takeover:
+       getVideoId() looks for v= only, so poll() bails. The bundle renders the
+       watch metadata (its /api/next answered the head track) but never mounts
+       a player node, so even a would-be start() would have no element. We
+       resolve the playlist's head here too and rewrite the hash with v= ; the
+       router then binds a full watch with a playable id and this file takes
+       that player over. playlistHeadAt is a cooldown: a failed resolve must
+       not fire a /api/video-meta request on every 1s tick. */
+    var playlistHeadFor = null;
+    var playlistHeadAt = 0;
+
     /* A user-initiated quit (Esc) must not be immediately undone by the takeover:
        after we stop playback the hash can still hold the same v=... and the app may
        only append &resume, so re-takeover would silently restart the same video.
@@ -1659,8 +1670,69 @@
             stopIfLeftWatch('poll');
             var id = getVideoId();
             var el = global.document && global.document.querySelector('.html5-main-video');
-            if (!id || !el) { lastCandidate = 0; poll(); return; }
             var hashNow = (global.location && global.location.hash) || '';
+            if (!id && onWatchRoute()) {
+                var ml = hashNow.match(/(?:[?&#]|^)list=([\w-]{6,80})/);
+                var want = ml ? ml[1] : null;
+                if (want && want === playlistHeadFor && Date.now() - playlistHeadAt > 8000) playlistHeadFor = null;
+                if (want && !playlistHeadFor) {
+                    playlistHeadFor = want;
+                    playlistHeadAt = Date.now();
+                    beacon('CP_PLAYLIST_HEAD', { list: want });
+                    whenMeta(want, function (meta) {
+                        if (!meta || !meta.id) { if (playlistHeadFor === want) playlistHeadFor = null; return; }
+                        // the app already moved to a real video, or left watch
+                        if (getVideoId() || ((global.location || {}).hash || '').indexOf('/watch') < 0) {
+                            if (playlistHeadFor === want) playlistHeadFor = null;
+                            return;
+                        }
+                        // Prime the endless chain with the playlist's own queue
+                        // BEFORE the watch screen mounts: start() calls
+                        // loadChain(head) in the same turn it begins playback,
+                        // so the queue must already be there - otherwise that
+                        // call would fall back to the head's own related ranking
+                        // and the playlist would never walk its real order.
+                        // loadChain() answers the queue because the backend
+                        // treats every playlist id (PL…, RD…, OL…) as a mix.
+                        var h2 = (global.location && global.location.hash) || '';
+                        loadChain(want, function (items) {
+                            // Two resolves feed this: /api/video-meta picks the
+                            // head, /api/related picks the queue - and a moving
+                            // playlist can answer each with a different snapshot
+                            // (its head here, a shifted first row there). The
+                            // queue is only recognized as radio while it actually
+                            // contains the track being played, so pin the head
+                            // in front when the queue has drifted.
+                            if (items && Array.isArray(items)) {
+                                var have = false;
+                                for (var j = 0; j < items.length; j++) {
+                                    if (items[j] && items[j].id === meta.id) { have = true; break; }
+                                }
+                                if (!have) items.unshift({ id: meta.id, title: meta.title || '' });
+                            }
+                            var h3 = (global.location && global.location.hash) || '';
+                            if (getVideoId() || h3.indexOf('/watch') < 0) { if (playlistHeadFor === want) playlistHeadFor = null; return; }
+                            var base = h3.split('?')[0];
+                            var qs = h3.indexOf('?') >= 0 ? h3.slice(h3.indexOf('?') + 1) : '';
+                            // list= is deliberately dropped: the bundle re-binds a
+                            // playlist watch into a list-only route for a beat,
+                            // which re-enters this resolver and re-primes (read:
+                            // clears) the queue we just warmed. With a plain v=
+                            // the bundle has nothing playlist-shaped to rewrite.
+                            var next = base + '?v=' + encodeURIComponent(meta.id) +
+                                (/\bresume\b/.test(qs) ? '&resume' : '');
+                            beacon('CP_PLAYLIST_HEAD_NAV', { to: next, queue: (radioQueue && radioQueue.length) || 0 });
+                            if ((global.location && global.location.hash) === h3) global.location.hash = next;
+                            // latch: swallow any transient list-only hash the
+                            // bundle writes while binding; the stable v= settles
+                            // on its own. If the bundle truly reverted, the latch
+                            // releases and the resolver runs again.
+                            global.setTimeout(function () { if (playlistHeadFor === want) playlistHeadFor = null; }, 1500);
+                        }, 30);
+                    });
+                }
+            }
+            if (!id || !el) { lastCandidate = 0; poll(); return; }
             if (hashNow !== lastHash) {
                 lastHash = hashNow;
                 if (id !== quitId) { quitId = null; quitUntil = 0; }
@@ -2912,12 +2984,13 @@
         return pre.text;
     }
 
-    function loadChain(id, cb) {
+    function loadChain(id, cb, limit) {
         if (!id) return;
         // Sticky radio: a track that belongs to the current mix is served from
         // the queue instead of pulling that track's own related ranking, so
         // the radio keeps rolling through the whole session.
         if (radioQueue.length && radioOwns(id)) {
+            beacon('CP_RADIO_HIT', { id: id, q: radioQueue.length, seed: radioSeed });
             if (chainFor !== id) {
                 chainFor = id;
                 chainEmptyFor = '';
@@ -2927,6 +3000,7 @@
             relPanelRefresh();
             return;
         }
+        if (radioQueue.length) beacon('CP_RADIO_MISS', { id: id, q: radioQueue.length, seed: radioSeed });
         if (chainFor === id) {
             // a request is already on its way: hold the caller until it lands,
             // firing back with [] right now would make it re-enter chainNext()
@@ -2942,8 +3016,11 @@
         chainItems = [];
         chainLoadingFor = id;
         var req = ++chainRequest;
+        // the default 20 rows is plenty for a video's up-next; a playlist or
+        // radio queue is walked in its own order, so prime those longer.
+        var want = (limit > 0) ? Math.min(Math.floor(limit), 30) : 20;
         if (relOpenNow()) renderRelPanel();
-        xhrText(base + '/api/related?videoId=' + encodeURIComponent(id) + '&limit=20', function (res) {
+        xhrText(base + '/api/related?videoId=' + encodeURIComponent(id) + '&limit=' + want, function (res) {
             if (req !== chainRequest) return;
             chainLoadingFor = '';
             var data = null;

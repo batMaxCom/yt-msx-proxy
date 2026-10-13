@@ -19,7 +19,7 @@
 const axios = require('axios');
 const logger = require('./logger');
 const { getVideoInfoCached } = require('./get_video_info');
-const { isMixId, resolveMix } = require('./mix_resolver');
+const { isPlaylistId, resolvePlaylist } = require('./mix_resolver');
 
 // Same TVHTML5 key/client the rest of the project already talks to.
 const API_KEY = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
@@ -404,7 +404,7 @@ async function enrichBareTitles(items) {
    a shared deadline, and whatever is missing stays blank - those rows are
    still playable, and the cache keeps filling for later answers. */
 async function fromMix(mixId) {
-    const { queue, identity, head } = await resolveMix(mixId);
+    const { queue, identity, head } = await resolvePlaylist(mixId);
     // The head track is what is already playing (the watch flow started it);
     // the chain must begin with the row after it or it would replay the head.
     const items = queue
@@ -456,7 +456,7 @@ async function fetchRelated(videoId, limit) {
     if (inflight.has(videoId)) return inflight.get(videoId);
 
     const building = (async () => {
-        if (isMixId(videoId)) {
+        if (isPlaylistId(videoId)) {
             // Not cached here: the mix cache in mix_resolver already covers the
             // InnerTube call, and a fresh pass labels more rows from the
             // yt-dlp cache each time a client re-asks during the session.
