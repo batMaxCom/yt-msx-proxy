@@ -11444,6 +11444,7 @@
             this.C("button-enter", x(this.YY, this));
             this.w.hb && this.C("keySelectionChanged", x(this.g.Q_, this.g));
             this.j = this.va("search-input");
+            this.shelvesList = this.va("search-shelves");
             this.w.kh || (this.i = this.va("search-keyboard"), this.Mu(this.i));
             this.A = this.va("search-suggestions");
             this.ka ? this.Mu(this.A) : (this.removeChild(this.A), this.A = null);
@@ -11738,17 +11739,13 @@
                 var trackingParams = n("contents.sectionListRenderer.trackingParams", a);
                 this.M.lb(trackingParams);
 
-                var contentNode = this.Na.f(this.Aa, b, this.h);
+                var sectionList = n("contents.sectionListRenderer", a) || {};
+                var contentNode = this.shelvesList;
+                var queryText = this.g && this.g.Xd ? this.g.Xd() : "";
+                contentNode.Ia(sectionList, this.Aa, queryText);
+                contentNode.H.id = "search-results";
 
                 if (contentNode !== this.h) {
-                    var placeholder = this.h ? this.h.H : this.H.querySelector("#results-placeholder");
-                    this.H.replaceChild(contentNode.H, placeholder);
-
-                    if (this.h) {
-                        this.removeChild(this.h);
-                    }
-
-                    contentNode.H.id = "search-results";
                     this.sb(contentNode);
                     this.h = contentNode;
                     this.kB();
@@ -36251,7 +36248,7 @@
             a.register("progress_bar.html", '<div>  <div class="progress-bar-line">    <div class="progress-bar-background"></div>    <div class="progress-bar-loaded" rebound-style="width:{{percentageLoaded}}"></div>    <div class="progress-bar-played" rebound-style="width:{{percentagePlayed}}"></div>  </div>  <div class="progress-bar-playhead">    <div class="$cue-range-markers"></div>    <div class="progress-bar-disc" rebound-style="left:{{percentagePlayed}}"></div>  </div></div>');
             a.register("quality_status.html",
                 '<div>  <div class="watch-hd-badge $badge"></div></div>');
-            a.register("search.html", '<div>  <div class="youtube-logo-top">    <div class="youtube-logo icon-youtube-logo"></div>    <div class="youtube-unlimited-logo icon-youtube-unlimited-logo"></div>  </div>  <div class="controls">    <div id="text-box-background">      <div id="search-input" class="$textInput" data-title="search" data-placeholder="[[Search...|Placeholder indicating that a user can start searching within a text box]]"></div>    </div>    <div id="search-text-entry">      <div class="suggestions-container">        <div id="keyboard-icon" class="icon-search-keyboard"></div>        <div id="search-suggestions" class="$suggestions"></div>      </div>      <div id="search-keyboard" class="$keyboard"></div>      <div class="search-hint">        [[Voice search is not supported.|Message that tells Xbox One users that voice doesn\'t work for search.|1391152342]]      </div>      <div id="search-action" class="$subtitled-button search-action-button"></div>    </div>  </div>  <div class="search-pairing">    <div class="search-img"></div>    <div class="search-message">      <div class="title">[[Search Faster|Search pairing hint title]]</div>      <div id="pairing" class="$pairingDialog" data-context="search"></div>    </div>  </div>  <div id="results-placeholder"></div></div>');
+            a.register("search.html", '<div>  <div class="youtube-logo-top">    <div class="youtube-logo icon-youtube-logo"></div>    <div class="youtube-unlimited-logo icon-youtube-unlimited-logo"></div>  </div>  <div class="controls">    <div id="text-box-background">      <div id="search-input" class="$textInput" data-title="search" data-placeholder="[[Search...|Placeholder indicating that a user can start searching within a text box]]"></div>    </div>    <div id="search-text-entry">      <div class="suggestions-container">        <div id="keyboard-icon" class="icon-search-keyboard"></div>        <div id="search-suggestions" class="$suggestions"></div>      </div>      <div id="search-keyboard" class="$keyboard"></div>      <div class="search-hint">        [[Voice search is not supported.|Message that tells Xbox One users that voice doesn\'t work for search.|1391152342]]      </div>      <div id="search-action" class="$subtitled-button search-action-button"></div>    </div>  </div>  <div class="search-pairing">    <div class="search-img"></div>    <div class="search-message">      <div class="title">[[Search Faster|Search pairing hint title]]</div>      <div id="pairing" class="$pairingDialog" data-context="search"></div>    </div>  </div>  <div id="results-placeholder"></div><div id="search-shelves" class="$shelves"></div></div>');
             a.register("search_suggestion.html", '<div data-can-be-focus-leaf="true">{{model.label}}</div>');
             a.register("search_two_rows.html", '<div>  <div class="youtube-logo-top">    <div class="youtube-logo icon-youtube-logo"></div>    <div class="youtube-unlimited-logo icon-youtube-unlimited-logo"></div>  </div>  <div class="controls">    <div id="text-box-background">      <div id="search-input" class="$textInput" data-title="search" data-placeholder="[[Search...|Placeholder indicating that a user can start searching within a text box]]"></div>    </div>    <div id="search-text-entry">      <div class="suggestions-container">        <div id="keyboard-icon" class="icon-search-keyboard"></div>        <div id="search-suggestions" class="$suggestions"></div>      </div>      <div id="search-keyboard" class="$keyboard"></div>      <div class="search-hint">        [[Voice search is not supported.|Message that tells Xbox One users that voice doesn\'t work for search.|1391152342]]      </div>      <div id="search-action" class="$subtitled-button search-action-button"></div>    </div>  </div>  <div class="search-pairing">    <div class="search-img"></div>    <div class="search-message">      <div class="title">[[Search Faster|Search pairing hint title]]</div>      <div id="pairing" class="$pairingDialog" data-context="search"></div>    </div>  </div>  <div id="search-shelves" class="$searchShelfList"></div></div>');
             a.register("settings.html", '<div>  <div class="settings-shelf">    <div class="settings-title">{{title}}</div>    <div id="settings-items" class="$settingsHorizontalList"></div>  </div></div>');

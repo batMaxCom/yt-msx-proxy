@@ -293,6 +293,74 @@ function lockupToVideoRenderer(lockup) {
     };
 }
 
+/* Modern search returns playlists as lockups instead of the legacy
+   compactPlaylistRenderer the 2016 client knows; rebuild that renderer so the
+   third ("Плейлисты") shelf paints a real playlist tile instead of dropping the
+   hit. innerTubePlaylistParser reads playlistId, title, shortBylineText,
+   thumbnailRenderer.playlistVideoThumbnailRenderer and videoCount, and can fall
+   back to a generated thumbnail/navigation from playlistId alone. */
+function lockupToPlaylistRenderer(lockup) {
+    if (!lockup) return null;
+
+    const onTap = lockup?.rendererContext?.commandContext?.onTap?.innertubeCommand;
+    const playlistId =
+        lockup.contentId ||
+        onTap?.watchEndpoint?.playlistId ||
+        onTap?.watchPlaylistEndpoint?.playlistId ||
+        '';
+    if (typeof playlistId !== 'string' || playlistId.length <= 11) return null;
+
+    const title = textRuns(lockup?.metadata?.lockupMetadataViewModel?.title) || 'Playlist';
+    const { channel } = extractMetadataParts(lockup);
+    const channelId = extractBrowseIdFromMenu(lockup) || '';
+
+    const thumbnails = thumbSourcesFromLockup(lockup).map(s => ({
+        url: absoluteThumbUrl(s.url),
+        width: s.width || 0,
+        height: s.height || 0,
+    }));
+
+    const rows =
+        lockup?.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel
+            ?.metadataRows || [];
+    const parts = rows
+        .flatMap(row => (row?.metadataParts || []).map(p => textRuns(p.text)))
+        .filter(Boolean);
+    const videoCount = parts.find(t => /video|видео/i.test(t)) || '';
+
+    const renderer = {
+        playlistId,
+        title: { runs: [{ text: title }] },
+        shortBylineText: {
+            runs: [
+                {
+                    text: channel || '',
+                    navigationEndpoint: channelId
+                        ? { browseEndpoint: { browseId: channelId } }
+                        : undefined,
+                },
+            ],
+        },
+        navigationEndpoint: {
+            clickTrackingParams: onTap?.clickTrackingParams || '',
+            watchPlaylistEndpoint: { playlistId },
+        },
+    };
+    if (thumbnails.length) {
+        renderer.thumbnailRenderer = {
+            playlistVideoThumbnailRenderer: { thumbnail: { thumbnails } },
+        };
+    }
+    if (videoCount) {
+        renderer.videoCountShortText = { simpleText: videoCount };
+        renderer.thumbnailOverlays = [
+            { thumbnailOverlayBottomPanelRenderer: { text: { simpleText: videoCount } } },
+        ];
+    }
+
+    return { compactPlaylistRenderer: renderer };
+}
+
 function tileToVideoRenderer(tileRenderer) {
     if (!tileRenderer) return null;
 
@@ -363,8 +431,12 @@ function convertSearchItem(item) {
         if (lockup.contentType === 'LOCKUP_CONTENT_TYPE_CHANNEL' || isChannelId(lockup.contentId)) {
             return lockupToChannelRenderer(lockup);
         }
-        // Accept playlists/mixes (LOCKUP_CONTENT_TYPE_PLAYLIST) so they can become videoRenderer
-        // entries that the client recognises and the backend can resolve.
+        if (lockup.contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST') {
+            return lockupToPlaylistRenderer(lockup);
+        }
+        // everything else (videos, music, shorts) flattens to a videoRenderer the
+        // client recognises; mixes keep their RD… id so the backend can resolve
+        // them to a playable radio queue
         const videoRenderer = lockupToVideoRenderer(lockup);
         if (!videoRenderer) return null;
         return keepVideoRenderer(videoRenderer) ? { videoRenderer } : null;
@@ -383,6 +455,20 @@ function convertSearchItem(item) {
     return null;
 }
 
+function searchShelf(title, items) {
+    return {
+        shelfRenderer: {
+            title: { runs: [{ text: title }] },
+            content: { horizontalListRenderer: { items } },
+        },
+    };
+}
+
+/* TVHTML5 answers a search with ONE flat horizontal list that mixes videos,
+   channels, playlists and ads side by side, and the 2016 client paints exactly
+   the section it is handed. Regroup every hit into the three shelves the
+   patched search view stacks (see the search view patch in app-prod.js):
+   videos first, channels next, playlists last. Ads and junk are dropped. */
 function adaptSearchResponse(data) {
     if (!data || !data.contents || !data.contents.sectionListRenderer) {
         return Promise.resolve(data);
@@ -392,70 +478,59 @@ function adaptSearchResponse(data) {
     let convertedCount = 0;
     let skippedCount = 0;
 
-    sections.forEach(section => {
-        const items = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
-        if (Array.isArray(items)) {
-            const nextItems = [];
-            for (const item of items) {
-                if (item && item.adSlotRenderer) {
-                    skippedCount += 1;
-                    continue;
-                }
-                const converted = convertSearchItem(item);
-                if (converted) {
-                    nextItems.push(converted);
-                    convertedCount += 1;
-                } else {
-                    skippedCount += 1;
-                }
-            }
-            section.shelfRenderer.content.horizontalListRenderer.items = nextItems;
-            if (!section.shelfRenderer.title) {
-                const headerText =
-                    section.shelfRenderer.headerRenderer?.shelfHeaderRenderer?.avatarLockup
-                        ?.avatarLockupRenderer?.title?.runs?.[0]?.text || 'Search results';
-                section.shelfRenderer.title = { runs: [{ text: headerText }] };
-            }
+    const videos = [];
+    const channels = [];
+    const others = [];
+    const decorated = [];
+    const seen = new Set();
+
+    const consider = item => {
+        if (!item || typeof item !== 'object') return;
+        if (item.adSlotRenderer) {
+            skippedCount += 1;
+            return;
         }
+        const converted = convertSearchItem(item);
+        if (!converted) {
+            skippedCount += 1;
+            return;
+        }
+        const key = itemKey(converted);
+        if (key) {
+            if (seen.has(key)) return;
+            seen.add(key);
+        }
+        convertedCount += 1;
+        if (converted.compactChannelRenderer) channels.push(converted);
+        else if (converted.compactPlaylistRenderer) others.push(converted);
+        else videos.push(converted);
+        decorated.push(converted);
+    };
+
+    for (const section of sections) {
+        const items = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
+        if (Array.isArray(items)) items.forEach(consider);
         const clusters = section?.clusterShelfRenderer?.clusters;
         if (Array.isArray(clusters)) {
-            for (const cl of clusters) {
-                const citems = cl?.clusterRenderer?.items;
-                if (Array.isArray(citems)) {
-                    for (let i = 0; i < citems.length; i++) {
-                        const item = citems[i];
-                        const converted = convertSearchItem(item);
-                        if (converted) {
-                            citems[i] = converted;
-                            convertedCount += 1;
-                        } else {
-                            skippedCount += 1;
-                        }
-                    }
-                }
+            for (const cluster of clusters) {
+                const citems = cluster?.clusterRenderer?.items;
+                if (Array.isArray(citems)) citems.forEach(consider);
             }
         }
-    });
+    }
+
+    const rebuilt = [];
+    if (videos.length) rebuilt.push(searchShelf('Видео', videos));
+    if (channels.length) rebuilt.push(searchShelf('Каналы', channels));
+    if (others.length) rebuilt.push(searchShelf('Плейлисты', others));
+    if (rebuilt.length) data.contents.sectionListRenderer.contents = rebuilt;
 
     console.log(
-        `[SEARCH ADAPTER] converted=${convertedCount} skipped=${skippedCount} estimatedResults=${data.estimatedResults}`
+        `[SEARCH ADAPTER] converted=${convertedCount} skipped=${skippedCount} videos=${videos.length} channels=${channels.length} others=${others.length} estimatedResults=${data.estimatedResults}`
     );
 
     // Mix tiles (kept above) need head-track artwork and a "Mix – …" title;
     // bounded so a cold mix cache cannot stretch the search answer.
-    const decorated = [];
-    for (const section of sections) {
-        const items = section?.shelfRenderer?.content?.horizontalListRenderer?.items;
-        if (Array.isArray(items)) decorated.push(...items);
-        // Also check cluster shelves (common for "Mix" results in modern responses)
-        const clusters = section?.clusterShelfRenderer?.clusters;
-        if (Array.isArray(clusters)) {
-            for (const cl of clusters) {
-                const citems = cl?.clusterRenderer?.items;
-                if (Array.isArray(citems)) decorated.push(...citems);
-            }
-        }
-    }
     return decorateMixTiles(decorated).then(() => data).catch(() => data);
 }
 
@@ -518,11 +593,13 @@ function itemKey(item) {
     if (!item || typeof item !== 'object') return '';
     if (item.videoRenderer) return 'v:' + item.videoRenderer.videoId;
     if (item.compactChannelRenderer) return 'c:' + item.compactChannelRenderer.channelId;
+    if (item.compactPlaylistRenderer) return 'p:' + item.compactPlaylistRenderer.playlistId;
     // the first page is still raw here, and its lockups have to hash to the same
     // key the converted ones do or the dedupe below sees an empty set
     if (item.lockupViewModel) {
         const lockup = item.lockupViewModel;
         if (isChannelId(lockup.contentId)) return 'c:' + lockup.contentId;
+        if (lockup.contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST') return 'p:' + lockup.contentId;
         if (lockup.contentId) return 'v:' + lockup.contentId;
     }
     return '';
@@ -620,6 +697,9 @@ async function handleSearchContinuationRequest(req, res, client, authToken) {
         if (!node || typeof node !== 'object' || node.adSlotRenderer) continue;
         const converted = convertSearchItem(node);
         if (!converted) continue;
+        // the continuation feeds the video row only; channels live in their own
+        // shelf and would pollute the row if appended here
+        if (converted.compactChannelRenderer) continue;
         const key = itemKey(converted);
         if (key) {
             if (seen.has(key)) continue;
@@ -832,7 +912,15 @@ function findContinuation(raw) {
    only then sets up its collection continuer, so an answer without it can never
    grow no matter how many pages upstream is willing to hand out. */
 function attachSearchContinuation(data, nextData) {
-    const list = searchListOf(data);
+    // after the regroup the video row sits first, but fall back to the first
+    // non-empty list so the token is never dropped
+    const sections = data?.contents?.sectionListRenderer?.contents || [];
+    const videoSection = sections.find(
+        s =>
+            Array.isArray(s?.shelfRenderer?.content?.horizontalListRenderer?.items) &&
+            s.shelfRenderer.content.horizontalListRenderer.items.length
+    );
+    const list = videoSection?.shelfRenderer?.content?.horizontalListRenderer || searchListOf(data);
     if (!list || !Array.isArray(list.items) || !list.items.length || !nextData) return false;
     list.continuations = [{ nextContinuationData: nextData }];
     return true;
