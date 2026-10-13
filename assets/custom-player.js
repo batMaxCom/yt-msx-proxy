@@ -1671,6 +1671,12 @@
             var id = getVideoId();
             var el = global.document && global.document.querySelector('.html5-main-video');
             var hashNow = (global.location && global.location.hash) || '';
+            // Remember whatever actually plays, even when the app started it on
+            // its own: our idle takeover only fires on a dead element, so the
+            // very first playlist track (and any app-driven hop) never reaches
+            // start(). Without this it never enters the history, and "Previous"
+            // from the second track has nowhere to go (chainPathPos === 0).
+            if (!active && id && id !== quitId) chainAdvanceTo({ id: id });
             if (!id && onWatchRoute()) {
                 var ml = hashNow.match(/(?:[?&#]|^)list=([\w-]{6,80})/);
                 var want = ml ? ml[1] : null;
