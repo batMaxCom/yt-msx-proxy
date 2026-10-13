@@ -558,7 +558,7 @@ app.get('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), resolveProfileId(req));
+        const browseData = await fetchBrowseData(browseId, await bearerOf(req), ytCookieOf(req), resolveProfileId(req));
         res.json(browseData);
     } catch (error) {
         console.error('Error:', error.message);
@@ -756,24 +756,40 @@ app.all('/api/lounge/bc/bind', async (req, res) => {
  *   2. whatever the 2016 bundle sends in Authorization - kept so a client holding
  *      its own token keeps working, and so playback survives a viewer who is
  *      signed out but still mid-session on a set that issued one;
- *   3. the current account's token from token_store.
+ *   3. the current account's token from token_store, for a set with no session.
  *
  * The session is checked first, and on purpose: with the custom sign-in the
  * bundle no longer acquires a token of its own, so step 2 only ever fires for a
  * client that still holds a legacy one.
  *
- * cachedAccessTokenFor is a memory read and cannot await. When it comes up empty -
- * first request after sign-in, or a token near expiry - the refresh is started in
- * the background and the request goes out anonymously. That is not a regression
- * from how the rest of this file already behaves (it never blocked on a refresh),
- * but it does mean the very first browse after a cold sign-in can be anonymous.
+ * For a signed-in viewer this AWAITS the refresh when the cached token is
+ * missing or inside its expiry margin. Falling through to the token_store token
+ * there was what left Subscriptions intermittently empty: token_store caches a
+ * bearer with no local expiry (expiresAt 0) and keeps handing it back after it
+ * dies, YouTube answers 401, and the 2016 client does not retry - the page just
+ * stays blank until a later request happens to find the refreshed token. The
+ * await is bounded so a hung token endpoint degrades to an anonymous request
+ * rather than a stalled one.
  */
-function bearerOf(req) {
+const REFRESH_WAIT_MS = 10000;
+function boundedRefresh(promise) {
+    let timer = null;
+    return Promise.race([
+        promise,
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), REFRESH_WAIT_MS); }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+async function bearerOf(req) {
     const sub = currentSub(req);
     if (sub) {
         const own = viewerAccounts.cachedAccessTokenFor(sub);
         if (own) return own;
-        void viewerAccounts.accessTokenFor(sub);
+        const fresh = await boundedRefresh(viewerAccounts.accessTokenFor(sub));
+        if (fresh) return fresh;
+        // Signed in but no usable token: go out anonymously rather than with a
+        // stale bearer, which can only come back 401 and blank the page.
+        return null;
     }
 
     const h = req.headers.authorization || req.headers.Authorization;
@@ -827,7 +843,7 @@ app.post('/api/browse', async (req, res) => {
     }
 
     try {
-        const browseData = await fetchBrowseData(browseId, bearerOf(req), ytCookieOf(req), historyAccount(req) || DEFAULT_PROFILE_ID, continuation);
+        const browseData = await fetchBrowseData(browseId, await bearerOf(req), ytCookieOf(req), historyAccount(req) || DEFAULT_PROFILE_ID, continuation);
 
         res.json(browseData);
     } catch (error) {
@@ -845,7 +861,7 @@ async function handleGuideRequest(req, res) {
 
     // Same fallback as /api/browse: without a usable token the guide would
     // silently drop every account-only row.
-    const authToken = bearerOf(req);
+    const authToken = await bearerOf(req);
 
     try {
         const guideData = await fetchGuideData(authToken);
