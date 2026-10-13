@@ -404,11 +404,12 @@ async function enrichBareTitles(items) {
    a shared deadline, and whatever is missing stays blank - those rows are
    still playable, and the cache keeps filling for later answers. */
 async function fromMix(mixId) {
-    const { queue, identity, head } = await resolvePlaylist(mixId);
-    // The head track is what is already playing (the watch flow started it);
-    // the chain must begin with the row after it or it would replay the head.
+    const { queue, identity } = await resolvePlaylist(mixId);
+    // The queue starts with the head track, so the whole playlist is present -
+    // the panel lists every entry and the viewer can jump back to the first.
+    // The chain itself skips the track already playing (pickChainItem), so
+    // keeping the head here does not replay it.
     const items = queue
-        .filter(row => !head || row.id !== head.id)
         .map(row => ({
         id: row.id,
         title: row.title,

@@ -1708,7 +1708,7 @@
                                 for (var j = 0; j < items.length; j++) {
                                     if (items[j] && items[j].id === meta.id) { have = true; break; }
                                 }
-                                if (!have) items.unshift({ id: meta.id, title: meta.title || '' });
+                                if (!have) items.unshift({ id: meta.id, title: meta.title || '', thumb: meta.thumbnail || relThumbOf(meta.id) });
                             }
                             var h3 = (global.location && global.location.hash) || '';
                             if (getVideoId() || h3.indexOf('/watch') < 0) { if (playlistHeadFor === want) playlistHeadFor = null; return; }
@@ -3059,7 +3059,9 @@
        waking up again */
     function relPanelRefresh() {
         if (!relOpenNow()) return;
-        var keep = relItems[relIdx] && relItems[relIdx].id;
+        // Playlist mode: the highlight tracks playback (renderRelPanel), so the
+        // previous cursor is not restored; the related feed keeps it.
+        var keep = radioActive() ? '' : (relItems[relIdx] && relItems[relIdx].id);
         renderRelPanel();
         if (keep) {
             for (var i = 0; i < relItems.length; i++) {
@@ -3424,13 +3426,37 @@
     var relIdx = 0;
     var relOpen = false;
     var relBtn = null;         // our transport button
+    var relCurId = '';         // last playing id the panel highlighted
     var REL_MAX = 20;
 
     function relOpenNow() { return !!(relPanel && relPanel.style.display !== 'none'); }
 
+    function relCurrentId() { return (active && active.id) || getVideoId() || ''; }
+
     function relCandidates() {
-        var cur = active ? active.id : getVideoId();
+        var cur = relCurrentId();
         var out = [], seen = {}, i, it;
+        // While a playlist/radio queue drives playback the panel is the playlist
+        // itself: the whole thing, in play order, the currently playing track
+        // included (unlike the related feed, which drops the video you watch).
+        if (radioActive()) {
+            for (i = 0; i < chainItems.length; i++) {
+                it = chainItems[i];
+                if (!it || !it.id || seen[it.id]) continue;
+                seen[it.id] = true;
+                out.push(it);
+            }
+            // A moving playlist can answer the head and the queue with different
+            // snapshots, so the track on air is occasionally missing from the
+            // list. Pin it to the top with a deterministically derivable still
+            // and let the metadata fetch fill the title shortly after.
+            if (cur && seen[cur] !== true) {
+                var m = histMetaFor[cur];
+                out.unshift({ id: cur, title: (m && m.title) || '', thumb: (m && m.thumbnail) || relThumbOf(cur) });
+                relPinFill(cur);
+            }
+            return out;
+        }
         for (i = 0; i < chainItems.length && out.length < REL_MAX; i++) {
             it = chainItems[i];
             if (!it || !it.id || it.id === cur || seen[it.id]) continue;
@@ -3438,6 +3464,16 @@
             out.push(it);
         }
         return out;
+    }
+
+    function relThumbOf(id) { return 'https://i.ytimg.com/vi/' + id + '/mqdefault.jpg'; }
+
+    /* If the racing queue lost the track that is playing, backfill its title
+       once the journal metadata lands and repaint the panel. */
+    function relPinFill(id) {
+        whenMeta(id, function (meta) {
+            if (meta && meta.title && relOpenNow()) relPanelRefresh();
+        });
     }
 
     function relPanelStyle() {
@@ -3638,6 +3674,18 @@
         }
         if (relIdx >= items.length) relIdx = items.length - 1;
         if (relIdx < 0) relIdx = 0;
+        // Playlist mode: the highlight marks what is on air and walks down the
+        // list as playback advances. Snap it only when the playing video
+        // changed, otherwise it would fight the viewer's own cursor.
+        if (radioActive()) {
+            var now = relCurrentId();
+            if (now && now !== relCurId) {
+                for (var k = 0; k < items.length; k++) {
+                    if (items[k].id === now) { relIdx = k; break; }
+                }
+                relCurId = now;
+            }
+        }
         highlightRelRow();
     }
 
@@ -3684,6 +3732,7 @@
         relOpen = true;
         relPanel.style.display = 'flex';
         relIdx = 0;
+        relCurId = '';   // a freshly opened panel snaps onto the playing track
         renderRelPanel();
         // the ranking may still be in flight when the panel is summoned
         var cur = active ? active.id : getVideoId();

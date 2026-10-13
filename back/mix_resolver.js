@@ -28,10 +28,23 @@
 const axios = require('axios');
 const logger = require('./logger');
 
-// Same TVHTML5 key/client the rest of the project already talks to.
+// Same API key the rest of the project already talks to.
 const API_KEY = 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8';
 const API_ROOT = 'https://www.googleapis.com/youtubei/v1';
+
+// The TV client only hands the radio queue back as a flat id list
+// (mdxExpandedVideoList.videoIds) - no titles, no thumbnails - which is why the
+// playlist panel used to show bare ids and empty tiles. The WEB client answers
+// the same /next with a full playlistPanelVideoRenderer row per track (title,
+// length, artwork), so the queue is fetched with WEB and TVHTML5 is kept only
+// as a fallback for the flat id list.
 const CLIENT = {
+    clientName: 'WEB',
+    clientVersion: '2.20240401.00.00',
+    hl: 'en',
+    gl: 'US',
+};
+const CLIENT_FALLBACK = {
     clientName: 'TVHTML5',
     clientVersion: '7.20250205.16.00',
     hl: 'en',
@@ -41,7 +54,7 @@ const CLIENT = {
 const INNERTUBE_TIMEOUT_MS = 12000;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_CACHE = 64;
-const MAX_QUEUE = 50;
+const MAX_QUEUE = 500;
 
 // A real videoId is exactly 11 chars; playlist ids are longer and start with a
 // type prefix. The module originally resolved only radio feeds (RD…/UL…), but
@@ -248,44 +261,98 @@ function radioIdentity(root) {
     };
 }
 
-async function fetchMixQueue(mixId) {
+/* The track the /next request was anchored on: the endpoint names it, and the
+   TV response also carries it as videoMetadataRenderer. */
+function currentVideoId(root) {
+    let out = '';
+    const walk = (node, depth) => {
+        if (out || !node || typeof node !== 'object' || depth > 12) return;
+        if (Array.isArray(node)) {
+            for (const item of node) walk(item, depth + 1);
+            return;
+        }
+        for (const key of Object.keys(node)) {
+            const child = node[key];
+            if (key === 'currentVideoEndpoint' && child && typeof child === 'object') {
+                out = (child.videoId || (child.watchEndpoint && child.watchEndpoint.videoId) || '');
+                if (out) return;
+            }
+            if (key === 'videoMetadataRenderer' && child && isVideoId(child.videoId)) {
+                out = child.videoId;
+                return;
+            }
+            if (child && typeof child === 'object') walk(child, depth + 1);
+        }
+    };
+    walk(root, 0);
+    return out;
+}
+
+/* A deterministically derivable still for a queue row that named no artwork. It
+   is an i.ytimg URL, so the response rewriter swaps it for the /img/ proxy. */
+function thumbFor(id) {
+    return isVideoId(id) ? `https://i.ytimg.com/vi/${id}/mqdefault.jpg` : '';
+}
+
+function withThumb(row) {
+    return row.thumb ? row : { ...row, thumb: thumbFor(row.id) };
+}
+
+async function nextPost(client, playlistId) {
     const url = `${API_ROOT}/next?key=${API_KEY}`;
     const resp = await axios.post(url, {
-        context: { client: CLIENT },
-        playlistId: mixId,
+        context: { client },
+        playlistId,
     }, {
         headers: { 'Content-Type': 'application/json' },
         timeout: INNERTUBE_TIMEOUT_MS,
     });
-    const data = resp.data;
+    return resp.data;
+}
+
+async function fetchMixQueue(mixId) {
+    // WEB first: it labels every row (title/length/artwork). If it ever comes
+    // back without usable rows, fall back to the TV client for the flat ids.
+    let data = null;
+    try {
+        data = await nextPost(CLIENT, mixId);
+    } catch (e) {
+        data = null;
+    }
+    let walked = data ? collectQueue(data) : [];
+    let ids = data ? flatQueueIds(data) : [];
+    if (!walked.length && !ids.length) {
+        data = await nextPost(CLIENT_FALLBACK, mixId);
+        walked = collectQueue(data);
+        ids = flatQueueIds(data);
+    }
 
     const identity = radioIdentity(data);
     const head = headMetadata(data);
+    const headId = (head && head.id) || currentVideoId(data) || (walked[0] && walked[0].id) || '';
 
-    // Whole session as a flat id list, head first; merge in any labelled rows
-    // the tree walk finds so a renamed wrapper degrades to fewer rows instead
-    // of an empty queue.
-    const ids = flatQueueIds(data);
-    const walked = collectQueue(data);
+    // Whole session in play order: head first, then the labelled rows, then any
+    // bare ids the tree walk still had to fall back on.
     const seen = new Set();
     const queue = [];
     const addRow = (row) => {
         if (!row || !isVideoId(row.id) || seen.has(row.id)) return;
         seen.add(row.id);
-        queue.push(row);
+        queue.push(withThumb(row));
     };
-    if (head) {
+    if (headId) {
+        const headRow = walked.find(r => r.id === headId) || head || { id: headId };
         addRow({
-            id: head.id,
-            title: head.title,
-            author: head.author,
-            authorId: head.authorId,
-            duration: '',
-            thumb: head.thumb,
+            id: headId,
+            title: headRow.title || '',
+            author: headRow.author || '',
+            authorId: headRow.authorId || '',
+            duration: headRow.duration || '',
+            thumb: headRow.thumb || '',
         });
     }
-    for (const id of ids) addRow({ id, title: '', author: '', authorId: '', duration: '', thumb: '' });
     for (const row of walked) addRow(row);
+    for (const id of ids) addRow({ id, title: '', author: '', authorId: '', duration: '', thumb: '' });
 
     if (!queue.length) {
         throw new Error('mix queue came back empty');
@@ -294,6 +361,7 @@ async function fetchMixQueue(mixId) {
         mix_id: mixId,
         count: queue.length,
         head: queue[0].id,
+        labelled: walked.length,
         radio: identity && identity.title || '',
         kind: identity && identity.kind || '',
     });
