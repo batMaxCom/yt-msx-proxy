@@ -506,6 +506,27 @@ const AD_RENDERER_KEYS = [
     'adHoverTextButtonRenderer',
 ];
 
+/* The 2016 channel header component (app-prod.js class `oi`) reads its
+   subscribe button from
+       channelHeaderRenderer.subscribeButton.subscribeButtonRenderer
+   and hides the button when that path is missing. Modern InnerTube ships the
+   same button inside channelHeaderRenderer.buttons[] instead, so the native
+   "Subscribe" button on a channel page never appears. Lift it to the shape the
+   client looks for; the subscribed state, label texts and channelId ride along
+   unchanged in the renderer itself. */
+function adaptChannelHeaderRenderer(header) {
+    if (!header || typeof header !== 'object' || Array.isArray(header)) return;
+    if (header.subscribeButton && header.subscribeButton.subscribeButtonRenderer) return;
+    const buttons = header.buttons;
+    if (!Array.isArray(buttons)) return;
+    for (const b of buttons) {
+        if (b && b.subscribeButtonRenderer) {
+            header.subscribeButton = { subscribeButtonRenderer: b.subscribeButtonRenderer };
+            return;
+        }
+    }
+}
+
 /* The 2016 client has no ad renderers at all (grep app-prod.js for adSlot ->
    zero hits). YouTube TV HTML5 now ships them inline: the home "Recommended"
    shelf routinely starts with adSlotRenderer among the videos. An unknown
@@ -562,6 +583,7 @@ function convertTileRenderers(node) {
         }
         const value = node[key];
         if (!value || typeof value !== 'object') continue;
+        if (key === 'channelHeaderRenderer') adaptChannelHeaderRenderer(value);
         if (!Array.isArray(value) && value.tileRenderer) {
             const grid = tileRendererToGridVideoRenderer(value.tileRenderer);
             if (grid) node[key] = { gridVideoRenderer: grid };

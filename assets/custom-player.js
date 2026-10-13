@@ -205,6 +205,7 @@
     var HIST_PROFILE_KEY = 'yt_profile_id';
     var HIST_HEARTBEAT_SECONDS = 60;
     var histMetaFor = {};           // videoId -> metadata, so a heartbeat is cheap
+    var metaWaiters = {};           // videoId -> callbacks waiting on /api/video-meta
     var histSession = null;         // the session in progress, null when idle
 
     /* One backend serves several viewers, so the journal is keyed by profile.
@@ -324,12 +325,30 @@
         if (!id || histMetaFor[id]) return;
         histMetaFor[id] = null;                 // in flight
         xhrText(base + '/api/video-meta/' + encodeURIComponent(id), function (t) {
-            if (!t) { delete histMetaFor[id]; return; }
+            if (!t) { delete histMetaFor[id]; flushMetaWaiters(id); return; }
             try {
                 var m = JSON.parse(t);
                 histMetaFor[id] = (m && m.id) ? m : {};
             } catch (e) { histMetaFor[id] = {}; }
+            flushMetaWaiters(id);
         });
+    }
+
+    /* Callbacks queued while /api/video-meta is in flight. The subscribe button
+       needs the channelId from that same response, so it must not start a second
+       request just to learn what the journal is already fetching. */
+    function flushMetaWaiters(id) {
+        var w = metaWaiters[id];
+        delete metaWaiters[id];
+        if (!w) return;
+        for (var i = 0; i < w.length; i++) { try { w[i](histMetaFor[id] || null); } catch (e) { } }
+    }
+
+    function whenMeta(id, cb) {
+        var m = histMetaFor[id];
+        if (m) { cb(m); return; }
+        (metaWaiters[id] = metaWaiters[id] || []).push(cb);
+        if (m === undefined) histLoadMeta(id);
     }
 
     function histBegin(id) {
@@ -338,6 +357,7 @@
         histEnd();
         histSession = { id: id, watched: 0, reported: 0, lastAt: Date.now() };
         histLoadMeta(id);
+        subRefresh(id);
     }
 
     /* Report everything watched since the last post and zero the counter, so a
@@ -1783,6 +1803,7 @@
     var TR_SPEC = [
         { zone: TR_ZONE_TOP, id: 'yt-cp-infobtn', icon: 'icon-player-info', label: 'Инфо', act: 'info' },
         { zone: TR_ZONE_TOP, id: 'yt-cp-qbtn', icon: 'icon-player-settings', label: 'Качество', act: 'quality' },
+        { zone: TR_ZONE_TOP, id: 'yt-cp-subbtn', icon: 'icon-logo-lozenge', label: 'Подписаться', act: 'sub' },
         { zone: TR_ZONE_ACTIONS, id: 'yt-cp-prevbtn', icon: 'icon-player-prev', label: 'Предыдущее', act: 'prev' },
         { zone: TR_ZONE_ACTIONS, id: 'yt-cp-rewbtn', icon: 'icon-player-rew', label: 'Назад', act: 'rew' },
         { zone: TR_ZONE_ACTIONS, id: 'yt-cp-playbtn', icon: 'icon-player-play', label: 'Играть', act: 'play' },
@@ -1795,6 +1816,7 @@
         switch (name) {
             case 'info': return toggleInfoPanel();
             case 'quality': return toggleQualityMenu();
+            case 'sub': return toggleSubscribe();
             case 'prev': return chainSkipPrev();
             case 'next': return chainSkipNext();
             case 'rel': return toggleRelPanel();
@@ -1946,6 +1968,86 @@
         return trAct(sp.act);
     }
 
+    /* ---- subscribe control ----
+       The transport's own Subscribe button. The 2016 client has the whole feature
+       (subscribeButtonRenderer, /api/subscription/*) but it lives in the More
+       Actions menu this player replaces, and with the custom sign-in the bundle
+       holds no bearer of its own. So the button is ours and the request is
+       authorized by the yt_sess session cookie on the server.
+
+       State is per channel and comes from /api/subscription/status, fetched when
+       the channelId arrives with the journal metadata. Signed out is a normal
+       answer: the button shows "Подписаться" dimmed and does nothing. */
+    var SUB_ICON_OFF = 'icon-logo-lozenge';
+    var SUB_ICON_ON = 'icon-check';
+    var subState = { channelId: '', subscribed: false, known: false, signed: null };
+
+    function subBtnEl() { return trBtnEls && trBtnEls['yt-cp-subbtn']; }
+
+    function applySubButton() {
+        var el = subBtnEl();
+        if (!el) return;
+        var signed = subState.signed === true;
+        var subscribed = !!subState.subscribed;
+        var label = subscribed ? 'Вы подписаны' : 'Подписаться';
+        var icon = subscribed ? SUB_ICON_ON : SUB_ICON_OFF;
+        try {
+            if (!el.classList.contains(icon)) {
+                el.classList.remove(SUB_ICON_ON, SUB_ICON_OFF);
+                el.classList.add(icon);
+            }
+            el.setAttribute('aria-label', label);
+            el.setAttribute('title', label);
+            var lab = el.querySelector('.label');
+            if (lab) lab.textContent = label;
+            el.style.opacity = signed ? '' : '0.4';
+        } catch (e) { }
+        try {
+            if (signed) el.removeAttribute('data-yt-cp-disabled');
+            else el.setAttribute('data-yt-cp-disabled', '1');
+        } catch (e) { }
+    }
+
+    function subRefresh(id) {
+        subState = { channelId: '', subscribed: false, known: false, signed: null };
+        applySubButton();
+        if (!id) return;
+        whenMeta(id, function (meta) {
+            if (!active || active.id !== id) return;      // video changed while loading
+            var ch = meta && meta.channelId;
+            if (!ch) { subState.known = true; applySubButton(); return; }
+            subState.channelId = ch;
+            authRequest('GET', '/api/subscription/status?channelId=' + encodeURIComponent(ch), null, function (r) {
+                if (!active || active.id !== id) return;
+                subState.known = true;
+                if (!r || r.error) { applySubButton(); return; }
+                subState.signed = !!r.signed_in;
+                subState.subscribed = !!r.subscribed;
+                applySubButton();
+            });
+        });
+    }
+
+    function toggleSubscribe() {
+        if (subState.signed === false) { beacon('CP_SUB_SIGNEDOUT', {}); return false; }
+        var ch = subState.channelId;
+        if (!ch) { beacon('CP_SUB_NOCHANNEL', { known: subState.known ? 1 : 0 }); return false; }
+        var action = subState.subscribed ? 'unsubscribe' : 'subscribe';
+        subState.subscribed = !subState.subscribed;      // optimistic
+        applySubButton();
+        authRequest('POST', '/api/subscription/' + action, { channelIds: [ch] }, function (r) {
+            if (r && !r.error) {
+                beacon('CP_SUB', { id: active && active.id, ch: ch, action: action });
+                return;
+            }
+            subState.subscribed = !subState.subscribed;  // revert
+            if (r && r.status === 401) subState.signed = false;
+            applySubButton();
+            beacon('CP_SUB_ERR', { ch: ch, action: action, status: r && r.status });
+        });
+        return true;
+    }
+
     /* Our transport, in two rows around the app's own seek bar:
            row 1  info, quality
            seek   the app's own #progress-bar
@@ -2039,6 +2141,7 @@
                 }
             }
         }
+        applySubButton();
         return act;
     }
 

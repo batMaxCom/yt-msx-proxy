@@ -135,6 +135,23 @@ async function listSubscriptions(accessToken, limit) {
 }
 
 /*
+ * Whether the viewer is subscribed to one channel. Data API subscriptions.list
+ * supports forChannelId, which returns the subscription resource only when one
+ * exists - one request, no paging, no dependence on the account having fewer
+ * than MAX_CHANNELS subscriptions.
+ */
+async function isSubscribed(accessToken, channelId) {
+    if (!accessToken || !CHANNEL_RE.test(String(channelId || ''))) return false;
+    const response = await axios.get(SUBSCRIPTIONS_URL, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { part: 'id', mine: true, forChannelId: channelId, maxResults: 1 },
+        timeout: 20000,
+    });
+    const items = (response.data && response.data.items) || [];
+    return items.length > 0;
+}
+
+/*
  * YouTube has moved channel uploads off gridVideoRenderer and onto
  * tileRenderer, which is a different animal: the id is `contentId`, every
  * string lives under `metadata.tileMetadataRenderer`, and the duration is an
@@ -400,6 +417,7 @@ async function subscriptionsHome(accessToken, opts) {
 module.exports = {
     subscriptionsHome,
     listSubscriptions,
+    isSubscribed,
     fetchChannelVideos,
     // exported for tests
     collectVideoRenderers,
