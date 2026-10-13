@@ -2353,6 +2353,12 @@
         return false;
     }
 
+    /* True while a playlist/mix queue is in charge of the chain: this is what
+       the related UI flips its "Похожие" label to "Плейлист" on. */
+    function radioActive() {
+        return !!(radioSeed && radioQueue.length);
+    }
+
     function readStoredQuality() {
         storedHeight = 0;
         try {
@@ -3469,7 +3475,7 @@
         var title = doc.createElement('div');
         title.id = 'yt-cp-related-title';
         title.style.cssText = 'flex:1 1 auto;font-size:22px;font-weight:500;';
-        title.textContent = 'Похожие видео';
+        title.textContent = radioActive() ? 'Плейлист' : 'Похожие видео';
         var close = doc.createElement('div');
         close.className = 'yt-cp-rel-close';
         close.style.cssText = 'flex:0 0 auto;padding:4px 12px;border:1px solid #555;border-radius:3px;' +
@@ -4232,12 +4238,21 @@
     }
 
     function relLabelSync() {
-        var b = relBtn;
-        if (!b) return;
+        // A live playlist queue turns the ranking into the playlist's own
+        // order, so the row stops being "Похожие" and becomes the "Плейлист".
+        var playlist = radioActive();
         var n = relCandidates().length;
-        var t = n ? 'Похожие (' + n + ')' : 'Похожие';
-        var lab = b.querySelector('.label');
-        if (lab && lab.textContent !== t) lab.textContent = t;
+        var t = (playlist ? 'Плейлист' : 'Похожие') + (n ? ' (' + n + ')' : '');
+        var b = relBtn;
+        if (b) {
+            var lab = b.querySelector('.label');
+            if (lab && lab.textContent !== t) lab.textContent = t;
+        }
+        var title = global.document && global.document.getElementById('yt-cp-related-title');
+        if (title) {
+            var h = playlist ? 'Плейлист' : 'Похожие видео';
+            if (title.textContent !== h) title.textContent = h;
+        }
     }
 
     /* The quality button carries the level in effect, so the row answers the
